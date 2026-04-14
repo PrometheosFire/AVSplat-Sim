@@ -1,3 +1,6 @@
 [submodule "external/gsplat"]
 	path = external/gsplat
 	url = git@github.com:PrometheosFire/gsplat.git
+[submodule "external/Difix3D+"]
+	path = external/Difix3D+
+	url = git@github.com:nv-tlabs/Difix3D.git
