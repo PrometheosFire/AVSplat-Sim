@@ -85,8 +85,61 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
+    """Initialize 3D Gaussian Splatting parameters and their optimizers.
+    
+    This function creates the parameters for all Gaussians (positions, scales, rotations,
+    opacities, and colors/features) and sets up separate optimizers for each parameter
+    type with their respective learning rates. It handles both SfM initialization (from
+    COLMAP 3D points) and random initialization.
+    
+    Args:
+        parser (Parser): Dataset parser containing 3D points and RGB colors from COLMAP.
+        init_type (str): How to initialize Gaussian positions. Options:
+            - "sfm": Use 3D points from COLMAP structure-from-motion (recommended)
+            - "lidar": Use LIDAR point cloud initialization
+            - "random": Randomly initialize within a bounded volume
+        init_num_pts (int): Only used when init_type="random". Number of random Gaussians.
+        init_extent (float): Only used when init_type="random". Size of initialization volume.
+        init_opacity (float): Initial opacity value for all Gaussians (in [0, 1]). Lower
+            values (e.g., 0.1) start with more transparent Gaussians.
+        init_scale (float): Scale multiplier for initial Gaussian sizes. Computed as the
+            average distance to 3 nearest neighbors.
+        means_lr (float): Learning rate for Gaussian position (means) optimization.
+        scales_lr (float): Learning rate for Gaussian scale (size) optimization.
+        opacities_lr (float): Learning rate for Gaussian opacity optimization.
+        quats_lr (float): Learning rate for Gaussian rotation (quaternions) optimization.
+        sh0_lr (float): Learning rate for spherical harmonics band 0 (brightness/DC component).
+        shN_lr (float): Learning rate for higher-order spherical harmonics (detail/view-dependence).
+        scene_scale (float): Global scene scale multiplier for position learning rate adjustment.
+        sh_degree (int): Maximum spherical harmonics degree (0-3). Higher = more view-dependent colors.
+        sparse_grad (bool): If True, use sparse gradients (memory efficient but slower). Requires packed=True.
+        visible_adam (bool): If True, use Selective Adam optimizer (only update visible Gaussians).
+        batch_size (int): Training batch size (used to scale learning rates by sqrt(batch_size)).
+        feature_dim (Optional[int]): If provided, adds learnable feature embeddings for appearance
+            variation (e.g., 32D features for per-camera appearance). If None, uses SH colors only.
+        device (str): PyTorch device (e.g., "cuda:0", "cpu").
+        world_rank (int): Rank in distributed training (0 if single GPU). Used to distribute
+            Gaussians across GPUs (each GPU gets every world_size-th Gaussian).
+        world_size (int): Total number of GPUs in distributed training.
+    
+    Returns:
+        Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
+            - splats: ParameterDict containing all learnable Gaussian parameters:
+                - "means": [N, 3] - Gaussian 3D positions
+                - "scales": [N, 3] - Log-space scale parameters (exp(scales) = actual sizes)
+                - "quats": [N, 4] - Rotation quaternions (normalized during rasterization)
+                - "opacities": [N] - Log-odds opacity values (sigmoid applied during rendering)
+                - "sh0": [N, 1, 3] - SH band 0 (RGB brightness)
+                - "shN": [N, (sh_degree+1)^2-1, 3] - Higher SH bands (if feature_dim is None)
+                - "features": [N, feature_dim] - Appearance features (if feature_dim is not None)
+                - "colors": [N, 3] - Additional bias colors (if feature_dim is not None)
+            - optimizers: Dict mapping parameter names to their optimizers:
+                - Keys: "means", "scales", "quats", "opacities", "sh0", "shN"/"features"/"colors"
+                - Each optimizer uses learning rates scaled by sqrt(batch_size * world_size)
+    """
+    
     if init_type == "sfm" or init_type == "lidar":
-        points = torch.from_numpy(parser.points).float()
+        points = torch.from_numpy(parser.points).float() #Load points from COLMAP SfM or LIDAR to tensors
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
@@ -106,10 +159,13 @@ def create_splats_with_optimizers(
 
     N = points.shape[0]
     quats = torch.rand((N, 4))  # [N, 4]
+    # Logit is the inverse of sigmoid, maps (0, 1) to (-inf, +inf). 
+    # This way we can optimize in unconstrained space and apply sigmoid during rendering to get valid opacity values.
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
     params = [
         # name, value, lr
+        # torch.nn.Parameter treats it as a learnable parameter that requires gradients and can be optimized by an optimizer.
         ("means", torch.nn.Parameter(points), means_lr * scene_scale),
         ("scales", torch.nn.Parameter(scales), scales_lr),
         ("quats", torch.nn.Parameter(quats), quats_lr),
@@ -137,11 +193,12 @@ def create_splats_with_optimizers(
     BS = batch_size * world_size
     optimizer_class = None
     if sparse_grad:
-        optimizer_class = torch.optim.SparseAdam
+        optimizer_class = torch.optim.SparseAdam #SparseAdam: efficient for sparse gradient tensors
     elif visible_adam:
-        optimizer_class = SelectiveAdam
+        optimizer_class = SelectiveAdam #SelectiveAdam: efficient when only visible Gaussians should be updated
+
     else:
-        optimizer_class = torch.optim.Adam
+        optimizer_class = torch.optim.Adam #Adam: simplest, updates everything
     optimizers = {
         name: optimizer_class(
             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
@@ -161,6 +218,23 @@ class Runner:
     def __init__(
         self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
+        """Initialize the training runner for 3D Gaussian Splatting.
+        
+        Args:
+            local_rank (int): Rank of the current GPU/process on the local machine (0-indexed).
+                In single-GPU training, this is 0. In multi-GPU training on one machine,
+                if you have 4 GPUs, local_rank ranges from 0-3.
+                Used to select which GPU this process will use (e.g., cuda:local_rank).
+            world_rank (int): Rank of the current process across ALL machines/GPUs in the
+                distributed training setup (0-indexed). For example, in distributed training
+                across 2 machines with 4 GPUs each, world_rank ranges from 0-7.
+                Used to synchronize and coordinate training across multiple machines.
+            world_size (int): Total number of GPUs/processes across all machines.
+                For distributed training on 2 machines with 4 GPUs each, world_size = 8.
+                Used to divide batch sizes and determine when to synchronize.
+            cfg (Config): Configuration dataclass containing all hyperparameters and settings
+                for training (learning rates, strategy, dataset paths, etc.).
+        """
         set_random_seed(42 + local_rank)
 
         self.cfg = cfg
@@ -182,7 +256,15 @@ class Runner:
         self.ply_dir = f"{cfg.result_dir}/ply"
         os.makedirs(self.ply_dir, exist_ok=True)
 
-        # Tensorboard
+        # === Tensorboard Setup ===
+        # TensorBoard is a visualization tool that tracks training metrics over time.
+        # It creates interactive graphs/dashboards showing:
+        #   - Loss curves (how loss decreases during training)
+        #   - Learning rates (how they change over time)
+        #   - Memory usage, number of Gaussians, evaluation metrics (PSNR, SSIM, LPIPS)
+        #   - Training images (rendered outputs vs ground truth)
+        # Later in training, we'll log values using: self.writer.add_scalar("name", value, step)
+        # View results with: tensorboard --logdir results/garden/tb
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
@@ -218,6 +300,8 @@ class Runner:
                     "[NCore] Warning: FTheta cameras detected; pass --with-eval3d True for correct results."
                 )
         else:
+            # read the scene once and build all metadata needed by training:
+            # camera poses, intrinsics, image paths, points/colors camera indexing info, masks, exif exposure.
             self.parser = Parser(
                 data_dir=cfg.data_dir,
                 factor=cfg.data_factor,
@@ -225,12 +309,14 @@ class Runner:
                 test_every=cfg.test_every,
                 load_exposure=cfg.load_exposure,
             )
+            # create the training sample iterator on top of parser metadata
             self.trainset = Dataset(
                 self.parser,
                 split="train",
                 patch_size=cfg.patch_size,
                 load_depths=cfg.depth_loss,
             )
+            # validation dataset used every test_every-th image
             self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)

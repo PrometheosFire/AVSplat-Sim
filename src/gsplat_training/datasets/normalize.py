@@ -17,12 +17,29 @@ import numpy as np
 
 
 def similarity_from_cameras(c2w, strict_scaling=False, center_method="focus"):
-    """
-    reference: nerf-factory
-    Get a similarity transform to normalize dataset
-    from c2w (OpenCV convention) cameras
-    :param c2w: (N, 4)
-    :return T (4,4) , scale (float)
+    """Compute a similarity transform that normalizes a camera rig.
+
+    This function estimates a single 4x4 transform that:
+    1. Aligns the average camera up direction to a canonical up axis.
+    2. Recenters the scene around either camera-ray focus points or camera positions.
+    3. Uniformly rescales the scene so camera distances are near unit scale.
+
+    The returned matrix is intended to be applied to camera-to-world poses and
+    3D points so training is numerically more stable.
+
+    Args:
+        c2w: Camera-to-world transforms with shape (N, 4, 4), using OpenCV
+            camera convention.
+        strict_scaling: If True, use the maximum camera distance for scaling
+            (guarantees all cameras are within unit radius). If False, use the
+            median distance (more robust to outliers).
+        center_method: Method for recentering:
+            - "focus": center using nearest points along camera forward rays.
+            - "poses": center using median camera position.
+
+    Returns:
+        A 4x4 similarity transform matrix (rotation + translation + uniform scale).
+        The scale factor is encoded directly in the matrix.
     """
     t = c2w[:, :3, 3]
     R = c2w[:, :3, :3]
@@ -70,7 +87,7 @@ def similarity_from_cameras(c2w, strict_scaling=False, center_method="focus"):
     transform[:3, 3] = translate
     transform[:3, :3] = R_align
 
-    # (3) Rescale the scene using camera distances
+    # (3) Rescale the scene using camera distances              Is this needed when using a set of camera Rig?
     scale_fn = np.max if strict_scaling else np.median
     scale = 1.0 / scale_fn(np.linalg.norm(t + translate, axis=-1))
     transform[:3, :] *= scale
@@ -79,6 +96,24 @@ def similarity_from_cameras(c2w, strict_scaling=False, center_method="focus"):
 
 
 def align_principal_axes(point_cloud):
+    """Build a rigid transform that aligns a point cloud to its principal axes.
+
+    The function uses PCA on the centered point cloud covariance matrix to find
+    the dominant geometric directions. It then constructs a 4x4 SE(3) transform
+    that:
+    1. Translates the cloud median to the origin.
+    2. Rotates points so principal directions become the canonical axes.
+
+    A right-handed orientation is enforced by flipping one eigenvector if needed.
+
+    Args:
+        point_cloud: Array of shape (N, 3) containing 3D points.
+
+    Returns:
+        A 4x4 SE(3) matrix where:
+        - ``transform[:3, :3]`` is the rotation into principal-axis frame.
+        - ``transform[:3, 3]`` is the translation that recenters the cloud.
+    """
     # Compute centroid
     centroid = np.median(point_cloud, axis=0)
 
@@ -146,6 +181,19 @@ def transform_cameras(matrix, camtoworlds):
 
 
 def normalize(camtoworlds, points=None):
+    """Normalize cameras, and optionally points, by composing helper transforms.
+
+    This is a thin wrapper around:
+    - ``similarity_from_cameras`` for global up/center/scale normalization, and
+    - ``align_principal_axes`` for optional point-cloud axis alignment.
+
+    Args:
+        camtoworlds: Camera-to-world poses, shape (N, 4, 4).
+        points: Optional 3D points, shape (M, 3).
+
+    Returns:
+        Normalized camtoworlds, and optionally normalized points and the combined transform.
+    """
     T1 = similarity_from_cameras(camtoworlds)
     camtoworlds = transform_cameras(T1, camtoworlds)
     if points is not None:

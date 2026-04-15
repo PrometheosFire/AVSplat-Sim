@@ -38,7 +38,17 @@ from .normalize import (
 
 
 def _get_rel_paths(path_dir: str) -> List[str]:
-    """Recursively get relative paths of files in a directory."""
+    """Return all file paths under a directory, relative to that directory.
+
+    The directory is walked recursively, and every file discovered anywhere
+    under ``path_dir`` is returned as a path relative to ``path_dir``.
+
+    Args:
+        path_dir: Root directory to scan.
+
+    Returns:
+        A list of relative file paths using the platform path separator.
+    """
     paths = []
     for dp, dn, fn in os.walk(path_dir):
         for f in fn:
@@ -47,7 +57,23 @@ def _get_rel_paths(path_dir: str) -> List[str]:
 
 
 def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
-    """Resize image folder."""
+    """Downscale all images in a folder and save them to a new directory.
+
+    The function scans ``image_dir`` recursively, resizes every image by the
+    given factor, and writes the result as PNG files into ``resized_dir`` while
+    preserving the relative directory structure.
+
+    Existing resized files are skipped so the operation can be resumed without
+    recomputing already processed images.
+
+    Args:
+        image_dir: Source directory containing the original images.
+        resized_dir: Target directory for the resized PNG images.
+        factor: Downscaling factor applied to width and height.
+
+    Returns:
+        The path to ``resized_dir``.
+    """
     print(f"Downscaling images by {factor}x from {image_dir} to {resized_dir}.")
     os.makedirs(resized_dir, exist_ok=True)
 
@@ -55,7 +81,7 @@ def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
     for image_file in tqdm(image_files):
         image_path = os.path.join(image_dir, image_file)
         resized_path = os.path.join(
-            resized_dir, os.path.splitext(image_file)[0] + ".png"
+            resized_dir, os.path.splitext(image_file)[0] + ".png" #save as PNG to preserve quality (lossless compression)
         )
         if os.path.isfile(resized_path):
             continue
@@ -82,6 +108,34 @@ class Parser:
         test_every: int = 8,
         load_exposure: bool = False,
     ):
+        """Load a COLMAP scene, image metadata, and optional exposure values.
+
+        The initializer reads the COLMAP reconstruction, camera intrinsics,
+        image list, and 3D points, then prepares the data needed by the
+        training dataset:
+
+        - per-image camera poses in camera-to-world form,
+        - per-camera intrinsics and distortion parameters,
+        - image paths aligned with COLMAP image names,
+        - optional world-space normalization,
+        - optional EXIF exposure values.
+
+        The ``factor`` argument controls the image scale used by the dataset.
+        When greater than 1, the parser looks for a matching downsampled image
+        directory and adjusts intrinsics accordingly. The ``normalize`` flag
+        recenters and reorients the reconstruction into a more stable world
+        frame. The ``test_every`` value defines the train/test split pattern
+        used by :class:`Dataset`. If ``load_exposure`` is enabled, exposure is
+        read from the original JPEG images and stored relative to the dataset
+        mean.
+
+        Args:
+            data_dir: Root directory of the COLMAP dataset.
+            factor: Image downscaling factor.
+            normalize: Whether to normalize camera poses and 3D points.
+            test_every: Hold out every Nth image for the test split.
+            load_exposure: Whether to extract EXIF exposure metadata.
+        """
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
@@ -95,7 +149,10 @@ class Parser:
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
 
-        manager = SceneManager(colmap_dir)
+        # pycolmap is a Python wrapper for reading COLMAP reconstructions. 
+        # It provides convenient access to cameras, images, and 3D points stored in COLMAP's binary format. 
+        # We use it to load the scene metadata needed for training.
+        manager = SceneManager(colmap_dir) 
         manager.load_cameras()
         manager.load_images()
         manager.load_points3D()
@@ -103,18 +160,18 @@ class Parser:
         # Extract extrinsic matrices in world-to-camera format.
         imdata = manager.images
         w2c_mats = []
-        camera_ids = []
-        Ks_dict = dict()
-        params_dict = dict()
-        imsize_dict = dict()  # width, height
-        mask_dict = dict()
+        camera_ids = [] 
+        Ks_dict = dict() # camera_id -> intrinsic matrix K
+        params_dict = dict() # camera_id -> distortion parameters (empty if no distortion)
+        imsize_dict = dict()  # camera_id -> width, height
+        mask_dict = dict() # camera_id -> optional binary mask (I think this mask is ROI Mask, used for to undistort images, not to mask out parts of the image during training)
         bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
         for k in imdata:
             im = imdata[k]
             rot = im.R()
             trans = im.tvec.reshape(3, 1)
             w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
-            w2c_mats.append(w2c)
+            w2c_mats.append(w2c) # Build world-to-camera matrices 
 
             # support different camera intrinsics
             camera_id = im.camera_id
@@ -123,8 +180,8 @@ class Parser:
             # camera intrinsics
             cam = manager.cameras[camera_id]
             fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
-            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-            K[:2, :] /= factor
+            K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]]) # Build intrinsic matrix K
+            K[:2, :] /= factor # Adjust intrinsics if images are downsampled by factor
             Ks_dict[camera_id] = K
 
             # Get distortion parameters.
@@ -152,8 +209,8 @@ class Parser:
             ), f"Only perspective and fisheye cameras are supported, got {type_}"
 
             params_dict[camera_id] = params
-            imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
-            mask_dict[camera_id] = None
+            imsize_dict[camera_id] = (cam.width // factor, cam.height // factor) # Adjust image size if downsampled by factor
+            mask_dict[camera_id] = None     # TODO support proper Masks
         print(
             f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
         )
@@ -163,7 +220,7 @@ class Parser:
         if not (type_ == 0 or type_ == 1):
             print("Warning: COLMAP Camera is not PINHOLE. Images have distortion.")
 
-        w2c_mats = np.stack(w2c_mats, axis=0)
+        w2c_mats = np.stack(w2c_mats, axis=0) # Stack world-to-camera matrices into a single array of shape (num_images, 4, 4)
 
         # Convert extrinsics to camera-to-world.
         camtoworlds = np.linalg.inv(w2c_mats)
@@ -197,7 +254,7 @@ class Parser:
 
         # Load images.
         if factor > 1 and not self.extconf["no_factor_suffix"]:
-            image_dir_suffix = f"_{factor}"
+            image_dir_suffix = f"_{factor}" # images_2, images_4, etc. 
         else:
             image_dir_suffix = ""
         colmap_image_dir = os.path.join(data_dir, "images")
@@ -210,7 +267,7 @@ class Parser:
         # so we need to map between the two sorted lists of files.
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
         image_files = sorted(_get_rel_paths(image_dir))
-        if factor > 1 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
+        if factor > 1 and os.path.splitext(image_files[0])[1].lower() in {".jpg", ".jpeg", ".png",}:
             image_dir = _resize_image_folder(
                 colmap_image_dir, image_dir + "_png", factor=factor
             )
@@ -224,7 +281,7 @@ class Parser:
         points_rgb = manager.point3D_colors.astype(np.uint8)
         point_indices = dict()
 
-        image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
+        image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()} # invert COLMAP's image name to ID mapping for easy lookup
         for point_id, data in manager.point3D_id_to_images.items():
             for image_id, _ in data:
                 image_name = image_id_to_name[image_id]
@@ -232,7 +289,7 @@ class Parser:
                 point_indices.setdefault(image_name, []).append(point_idx)
         point_indices = {
             k: np.array(v).astype(np.int32) for k, v in point_indices.items()
-        }
+        } # convert lists of point indices to numpy arrays for efficient indexing
 
         # Normalize the world space.
         if normalize:
@@ -249,6 +306,8 @@ class Parser:
             # Fix for up side down. We assume more points towards
             # the bottom of the scene which is true when ground floor is
             # present in the images.
+            # PCA-like alignment, axis sign is still ambiguous, 
+            # so we check the depth distribution to see if flipping is needed. 
             if np.median(points[:, 2]) > np.mean(points[:, 2]):
                 # rotate 180 degrees around x axis such that z is flipped
                 T3 = np.array(
@@ -280,7 +339,7 @@ class Parser:
         self.transform = transform  # np.ndarray, (4, 4)
 
         # Create 0-based contiguous camera indices from COLMAP camera_ids.
-        # This is useful for camera-based embeddings/modules.
+        # This is useful for camera-based embeddings/modules. (0, 1, 2, ... instead of arbitrary camera IDs like 3, 5, 7)
         unique_camera_ids = sorted(set(camera_ids))
         self.camera_id_to_idx = {cid: idx for idx, cid in enumerate(unique_camera_ids)}
         self.camera_indices = [self.camera_id_to_idx[cid] for cid in camera_ids]
@@ -295,6 +354,7 @@ class Parser:
                 exposure_values.append(compute_exposure_from_exif(original_path))
 
             # Compute mean across all valid exposures and subtract
+            # valid if every exposure value is positive and finite, otherwise invalid.
             valid_exposures = [e for e in exposure_values if e is not None]
             if valid_exposures:
                 exposure_mean = sum(valid_exposures) / len(valid_exposures)
@@ -312,6 +372,7 @@ class Parser:
         else:
             self.exposure_values = [None] * len(image_paths)
 
+        # Specific case, prob won't be needed in general
         # load one image to check the size. In the case of tanksandtemples dataset, the
         # intrinsics stored in COLMAP corresponds to 2x upsampled images.
         actual_image = imageio.imread(self.image_paths[0])[..., :3]
@@ -340,7 +401,7 @@ class Parser:
             K = self.Ks_dict[camera_id]
             width, height = self.imsize_dict[camera_id]
 
-            if camtype == "perspective":
+            if camtype == "perspective":        # TODO Start here tomorrow. Need to check what mask rly is after all
                 K_undist, roi_undist = cv2.getOptimalNewCameraMatrix(
                     K, params, (width, height), 0
                 )
