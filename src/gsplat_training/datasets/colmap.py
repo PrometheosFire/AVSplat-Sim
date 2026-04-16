@@ -387,9 +387,9 @@ class Parser:
             self.imsize_dict[camera_id] = (int(width * s_width), int(height * s_height))
 
         # undistortion
-        self.mapx_dict = dict()
-        self.mapy_dict = dict()
-        self.roi_undist_dict = dict()
+        self.mapx_dict = dict() #camera_id -> mapx
+        self.mapy_dict = dict() #camera_id -> mapy
+        self.roi_undist_dict = dict() #camera_id -> roi of the undistorted image (x_min, y_min, width, height)
         for camera_id in self.params_dict.keys():
             params = self.params_dict[camera_id]
             if len(params) == 0:
@@ -401,50 +401,52 @@ class Parser:
             K = self.Ks_dict[camera_id]
             width, height = self.imsize_dict[camera_id]
 
-            if camtype == "perspective":        # TODO Start here tomorrow. Need to check what mask rly is after all
-                K_undist, roi_undist = cv2.getOptimalNewCameraMatrix(
-                    K, params, (width, height), 0
+            if camtype == "perspective":        
+                K_undist, roi_undist = cv2.getOptimalNewCameraMatrix(   # Computes a new camera matrix after undistortion.
+                    K, params, (width, height), 0                       # alpha=0 means we want all pixels in the undistorted image to be valid (no black borders),
+                                                                        # which may result in some cropping (but keep rectangular image)
                 )
-                mapx, mapy = cv2.initUndistortRectifyMap(
+                mapx, mapy = cv2.initUndistortRectifyMap(                       # Computes the undistortion and rectification transformation map.
                     K, params, None, K_undist, (width, height), cv2.CV_32FC1
                 )
-                mask = None
+                mask = None # no need for mask since getOptimalNewCameraMatrix already crops the image to valid region
+                
             elif camtype == "fisheye":
                 fx = K[0, 0]
                 fy = K[1, 1]
                 cx = K[0, 2]
                 cy = K[1, 2]
-                grid_x, grid_y = np.meshgrid(
+                grid_x, grid_y = np.meshgrid(               # Create a grid of pixel coordinates (x, y) for the original image size.
                     np.arange(width, dtype=np.float32),
                     np.arange(height, dtype=np.float32),
                     indexing="xy",
                 )
-                x1 = (grid_x - cx) / fx
-                y1 = (grid_y - cy) / fy
-                theta = np.sqrt(x1**2 + y1**2)
-                r = (
+                x1 = (grid_x - cx) / fx         # Normalize pixel coordinates to camera space (x1, y1) 
+                y1 = (grid_y - cy) / fy         # where the principal point is at the origin and focal lengths are 1.
+                theta = np.sqrt(x1**2 + y1**2)  # radius from the optical axis, used by the fisheye distortion model
+                r = (                           # Fisheye polynomial model: r(theta) = theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8)
                     1.0
                     + params[0] * theta**2
                     + params[1] * theta**4
                     + params[2] * theta**6
                     + params[3] * theta**8
                 )
-                mapx = (fx * x1 * r + width // 2).astype(np.float32)
-                mapy = (fy * y1 * r + height // 2).astype(np.float32)
+                mapx = (fx * x1 * r + width // 2).astype(np.float32)    # Map the normalized distorted coordinates back to pixel coordinates in the undistorted image, 
+                mapy = (fy * y1 * r + height // 2).astype(np.float32)   # centering the principal point at (width/2, height/2).
 
                 # Use mask to define ROI
-                mask = np.logical_and(
-                    np.logical_and(mapx > 0, mapy > 0),
+                mask = np.logical_and(                                      # Validity mask for the undistorted image: 
+                    np.logical_and(mapx > 0, mapy > 0),                     # only pixels that map back to valid coordinates in the original image are kept.
                     np.logical_and(mapx < width - 1, mapy < height - 1),
                 )
-                y_indices, x_indices = np.nonzero(mask)
+                y_indices, x_indices = np.nonzero(mask)                 # Finds bounding box of the valid region in the undistorted image
                 y_min, y_max = y_indices.min(), y_indices.max() + 1
                 x_min, x_max = x_indices.min(), x_indices.max() + 1
-                mask = mask[y_min:y_max, x_min:x_max]
+                mask = mask[y_min:y_max, x_min:x_max]                   # Crop the mask to the bounding box to save memory and align with the cropped undistorted image.
                 K_undist = K.copy()
                 K_undist[0, 2] -= x_min
                 K_undist[1, 2] -= y_min
-                roi_undist = [x_min, y_min, x_max - x_min, y_max - y_min]
+                roi_undist = [x_min, y_min, x_max - x_min, y_max - y_min] # ROI = Region of Interest, defined as the bounding box of valid pixels in the undistorted image. 
             else:
                 assert_never(camtype)
 
@@ -459,11 +461,19 @@ class Parser:
         camera_locations = camtoworlds[:, :3, 3]
         scene_center = np.mean(camera_locations, axis=0)
         dists = np.linalg.norm(camera_locations - scene_center, axis=1)
-        self.scene_scale = np.max(dists)
+        self.scene_scale = np.max(dists) # Scene sclae is the smalest radius of a sphere centered at the scene center that can enclose all cameras. 
+                                         # This is used to normalize the scale of the scene for better training stability.
 
 
 class Dataset:
-    """A simple dataset class."""
+    """Dataset wrapper that serves COLMAP images and optional supervision signals.
+
+    The dataset uses the parsed COLMAP metadata to load per-image camera
+    parameters, the corresponding image tensors, and optional extras such as
+    masks, EXIF exposure offsets, and sparse depth points.
+    
+    Use case: Call two dataset instances with the same parser but different splits ("train" vs "test") to get separate training and test sets.
+    """
 
     def __init__(
         self,
@@ -472,6 +482,21 @@ class Dataset:
         patch_size: Optional[int] = None,
         load_depths: bool = False,
     ):
+        """Create a dataset view over the parsed COLMAP scene.
+
+        The ``split`` argument selects either the training subset or the held-
+        out test subset using the parser's ``test_every`` pattern. When
+        ``patch_size`` is set, samples are randomly cropped to that square
+        size and the intrinsics are updated accordingly. If ``load_depths`` is
+        enabled, each sample also includes sparse 2D points and depths
+        projected from COLMAP's reconstructed 3D points.
+
+        Args:
+            parser: Parsed COLMAP scene metadata.
+            split: Either ``"train"`` or ``"test"``.
+            patch_size: Optional square crop size in pixels.
+            load_depths: Whether to include sparse depth supervision.
+        """
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
@@ -486,15 +511,29 @@ class Dataset:
         return len(self.indices)
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
-        index = self.indices[item]
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
-        camera_id = self.parser.camera_ids[index]
-        K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
-        params = self.parser.params_dict[camera_id]
-        camtoworlds = self.parser.camtoworlds[index]
-        mask = self.parser.mask_dict[camera_id]
+        """Build one training sample from the selected image index.
 
-        if len(params) > 0:
+        The method loads the image, applies undistortion and optional random
+        cropping, then returns a dictionary with the camera intrinsics,
+        camera-to-world pose, image tensor, compact camera index, optional ROI
+        mask, optional exposure value, and optional sparse depth supervision.
+
+        Args:
+            item: Index within the current split returned by ``__len__``.
+
+        Returns:
+            A dictionary containing the sample tensors and metadata needed by
+            the training loop.
+        """
+        index = self.indices[item]
+        image = imageio.imread(self.parser.image_paths[index])[..., :3] # Load the image and discard alpha channel if present.
+        camera_id = self.parser.camera_ids[index]                       # Get the camera ID for this image to look up intrinsics and other camera-specific data.
+        K = self.parser.Ks_dict[camera_id].copy()                       # undistorted K
+        params = self.parser.params_dict[camera_id]                     # distortion parameters, empty if no distortion
+        camtoworlds = self.parser.camtoworlds[index]                    # camera-to-world pose for this image
+        mask = self.parser.mask_dict[camera_id]                         # optional binary mask for this camera, used to crop the undistorted image to valid pixels (only for fisheye cameras in current implementation)
+
+        if len(params) > 0:                             # TODO this does not support 3dGUT !! always applies undistortion if any distortion parameters are present, but 3dGUT uses distortion parameters to represent a non-linear image crop without actual distortion. 
             # Images are distorted. Undistort them.
             mapx, mapy = (
                 self.parser.mapx_dict[camera_id],
@@ -557,6 +596,10 @@ class Dataset:
 
 
 if __name__ == "__main__":
+    # Small debug/demo entrypoint:
+    # 1) load a COLMAP scene,
+    # 2) build a training split dataset with sparse depth enabled,
+    # 3) render projected sparse points onto each frame and save a video.
     import argparse
 
     import imageio.v2 as imageio
@@ -566,19 +609,23 @@ if __name__ == "__main__":
     parser.add_argument("--factor", type=int, default=4)
     args = parser.parse_args()
 
-    # Parse COLMAP data.
+    # Parse COLMAP metadata (poses, intrinsics, points, image paths).
     parser = Parser(
         data_dir=args.data_dir, factor=args.factor, normalize=True, test_every=8
     )
+    # Build the training subset and request sparse depth projections.
     dataset = Dataset(parser, split="train", load_depths=True)
     print(f"Dataset: {len(dataset)} images.")
 
+    # Visualize sparse COLMAP correspondences by drawing point projections
+    # on each image and writing the result to a video file.
     writer = imageio.get_writer("results/points.mp4", fps=30)
     for data in tqdm(dataset, desc="Plotting points"):
         image = data["image"].numpy().astype(np.uint8)
         points = data["points"].numpy()
-        depths = data["depths"].numpy()
+        depths = data["depths"].numpy()  # loaded for completeness/debugging
         for x, y in points:
             cv2.circle(image, (int(x), int(y)), 2, (255, 0, 0), -1)
         writer.append_data(image)
+    # Finalize and flush video to disk.
     writer.close()
