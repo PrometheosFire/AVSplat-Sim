@@ -61,7 +61,21 @@ def _build_pinhole_K(
     model_params: ncore.data.OpenCVPinholeCameraModelParameters
     | ncore.data.OpenCVFisheyeCameraModelParameters,
 ) -> np.ndarray:
-    """Return a 3x3 pinhole intrinsic matrix. Caller guarantees focal_length and principal_point exist."""
+    """Build a 3x3 pinhole-style intrinsic matrix from NCore camera parameters.
+
+    This helper is used for both OpenCV pinhole and OpenCV fisheye models,
+    because the trainer expects a standard ``K`` matrix even when the actual
+    camera has additional distortion coefficients. The returned matrix uses
+    the model's focal length and principal point, and assumes zero skew with
+    the principal point stored in pixel coordinates.
+
+    Args:
+        model_params: NCore camera model parameters that expose
+            ``focal_length`` and ``principal_point``.
+
+    Returns:
+        A ``(3, 3)`` float32 intrinsic matrix in the usual pinhole form.
+    """
     fl = model_params.focal_length
     pp = model_params.principal_point
     fx = float(fl[0]) if hasattr(fl, "__getitem__") else float(fl)
@@ -73,7 +87,25 @@ def _build_pinhole_K(
 def _load_ego_mask(
     sensor: ncore.data.CameraSensorProtocol, n_dilation: int
 ) -> Optional[np.ndarray]:
-    """Return a dilated boolean ego mask (True = ego vehicle) or None."""
+    """Load and dilate the camera's ego-vehicle mask, if one exists.
+
+    The NCore camera sensor may expose named mask images through
+    ``sensor.get_mask_images()``. This helper looks for the ``"ego"`` mask,
+    which marks pixels belonging to the host vehicle. When present, the mask
+    is converted to a single-channel grayscale image, thresholded into a
+    boolean array, and expanded with morphological dilation so the final mask
+    is slightly more conservative.
+
+    Args:
+        sensor: NCore camera sensor that provides mask images via the
+            ``CameraSensorProtocol`` interface.
+        n_dilation: Number of binary dilation iterations to apply to the ego
+            mask. Larger values remove a wider region around the vehicle.
+
+    Returns:
+        A boolean array with ``True`` for ego-vehicle pixels, or ``None`` if
+        the sensor does not provide an ``"ego"`` mask.
+    """
     mask_images = sensor.get_mask_images()
     if "ego" not in mask_images:
         return None
@@ -82,7 +114,23 @@ def _load_ego_mask(
 
 
 def _parse_optional_coeffs(coeffs: Optional[Any]) -> Optional[np.ndarray]:
-    """Convert optional distortion coefficients to float32 array, mapping all-zero arrays to None."""
+    """Convert optional distortion coefficients to float32 array, mapping all zero-arrays to None.
+
+    NCore camera parameter objects expose different distortion coefficient
+    fields depending on the camera model. This helper turns any provided
+    coefficient sequence into a ``float32`` NumPy array so the rest of the
+    parser can treat the values uniformly. If the input is ``None`` or every
+    coefficient is zero, the function returns ``None`` to signal that the
+    camera should be treated as having no usable distortion parameters.
+
+    Args:
+        coeffs: Optional coefficient sequence read from an NCore camera
+            model object.
+
+    Returns:
+        A ``float32`` NumPy array with the coefficients, or ``None`` if the
+        coefficients are missing or all zero.
+    """
     if coeffs is None:
         return None
     coeffs_array = np.array(coeffs, dtype=np.float32)
@@ -143,6 +191,59 @@ class NCoreParser:
         lidar_color_generic_data_name: str = "rgb",
         normalize_world_space: bool = False,
     ) -> None:
+        """Parse an NCore sequence and precompute the metadata needed for training.
+
+        This initializer eagerly opens the NCore sequence file, resolves the
+        requested camera and lidar sensors, loads per-camera intrinsics and
+        masks, batches the frame poses into scene coordinates, and optionally
+        loads lidar points for Gaussian initialization. The resulting parser
+        stores the scene in a stable coordinate frame that the dataset can
+        query later without reopening the sequence metadata.
+
+        The NCore-specific arguments control which sensors and time span are
+        used:
+
+        - ``camera_ids`` and ``lidar_ids`` select which sensors to include.
+        - ``seek_offset_sec`` and ``duration_sec`` restrict the time window.
+        - ``poses_component_group``, ``intrinsics_component_group``, and
+          ``masks_component_group`` choose which metadata component groups are
+          read from the sequence file.
+        - ``n_camera_mask_dilation_iterations`` expands ego masks to make the
+          invalid region slightly more conservative.
+        - ``lidar_color_generic_data_name`` selects the per-point color field
+          used when lidar points provide RGB data.
+        - ``normalize_world_space`` applies the same camera-based
+          recentering, PCA alignment, and upside-down correction used by the
+          COLMAP parser.
+
+        Args:
+            meta_json_path: Path to the NCore single-sequence metadata JSON.
+            factor: Image downscaling factor applied to camera intrinsics and
+                loaded images.
+            test_every: Hold out every Nth frame for the test split.
+            camera_ids: Optional list of camera sensor IDs to load.
+            lidar_ids: Optional list of lidar sensor IDs to load.
+            seek_offset_sec: Optional offset, in seconds, applied to the start
+                of the loaded time window.
+            duration_sec: Optional maximum duration, in seconds, to load.
+            max_lidar_points: Maximum number of lidar points kept for
+                Gaussian initialization.
+            lidar_step_frame: Load every Nth lidar frame when building the
+                initial point cloud.
+            poses_component_group: Name of the NCore component group that
+                stores pose data.
+            intrinsics_component_group: Name of the NCore component group that
+                stores camera intrinsics.
+            masks_component_group: Name of the NCore component group that
+                stores camera masks.
+            open_consolidated: Whether to open consolidated component stores.
+            n_camera_mask_dilation_iterations: Number of dilation iterations
+                applied to ego masks.
+            lidar_color_generic_data_name: Generic-data key used to read RGB
+                colors from lidar frames.
+            normalize_world_space: Whether to normalize poses and points into
+                a centered, axis-aligned scene frame.
+        """
         self.test_every = test_every
         self.factor = factor
         self.normalize_world_space = normalize_world_space
@@ -153,7 +254,7 @@ class NCoreParser:
         self.lidar_color_generic_data_name = lidar_color_generic_data_name
 
         self.sequence_meta_file_path: Path = Path(meta_json_path)
-        sequence_loader = self._open_sequence_loader(self.sequence_meta_file_path)
+        sequence_loader = self._open_sequence_loader(self.sequence_meta_file_path) # load the sequence metadata and prepare to query cameras, poses, timestamps, etc.
 
         self.sequence_id: str = sequence_loader.sequence_id
 
@@ -168,18 +269,20 @@ class NCoreParser:
             time_range, start=start_us, stop=stop_us
         )
 
-        self._resolve_sensor_ids(sequence_loader, camera_ids, lidar_ids)
-        self._compute_world_global_transform(sequence_loader)
-
+        self._resolve_sensor_ids(sequence_loader, camera_ids, lidar_ids) # determine which camera and lidar sensors to use, either from user input or by auto-detection when only one sensor is available for a modality
+        self._compute_world_global_transform(sequence_loader) # compute the transform from the NCore world frame to the world_global frame, which is a globally-aligned reference frame provided by the pose graph when available; this transform is used to express subsequent poses in the global frame
+        
+        # Load camera sensors and derive per-camera metadata (intrinsics, ego masks, render parameters) for all selected cameras; store the results in parser attributes for later use by the dataset
         camera_sensors = self._load_camera_data(
             sequence_loader, factor, n_camera_mask_dilation_iterations
         )
+        # For each camera, determine which frames fall within the loaded time range and store the resulting frame lists in a dictionary
         camera_frame_ranges = {
             cid: self._get_sensor_frame_range(camera_sensors[cid].frames_timestamps_us)
             for cid in self.camera_ids
         }
         self._compute_scene_origin(camera_sensors, camera_frame_ranges)
-        self._load_poses(camera_sensors, camera_frame_ranges)
+        self._load_poses(camera_sensors, camera_frame_ranges) # Load camera poses in world frame
 
         # Stub attrs for render_traj compatibility
         self.bounds = np.array([0.01, 1.0])
@@ -211,7 +314,29 @@ class NCoreParser:
     # ------------------------------------------------------------------
 
     def _open_sequence_loader(self, path: Path) -> ncore.data.SequenceLoaderProtocol:
-        """Open and return a SequenceLoaderV4 for this parser's component groups."""
+        """Create an NCore ``SequenceLoaderV4`` for the selected component groups.
+
+        The input ``path`` must point to a single-sequence NCore v4 metadata
+        JSON. This method performs a lightweight schema check on the JSON and
+        then constructs:
+
+        1. ``SequenceComponentGroupsReader`` over that metadata file, and
+        2. ``SequenceLoaderV4`` configured with this parser's poses,
+           intrinsics, and masks component-group names.
+
+        In NCore terms, *component groups* select which synchronized data
+        stores are used for each modality (e.g., different pose sources or
+        calibration variants) while exposing a single loader interface to the
+        rest of the parser.
+
+        Args:
+            path: Path to a single-sequence NCore v4 metadata JSON file.
+
+        Returns:
+            A ``SequenceLoaderProtocol`` instance (backed by
+            ``SequenceLoaderV4``) ready to query cameras, lidars, timestamps,
+            and pose-graph data.
+        """
 
         assert path.is_file(), f"NCoreParser: path {path} is not a file"
         with open(path, "r") as fp:
@@ -241,7 +366,31 @@ class NCoreParser:
         camera_ids: Optional[List[str]],
         lidar_ids: Optional[List[str]],
     ) -> None:
-        """Auto-detect sensor IDs if not provided; set camera_ids and lidar_ids."""
+        """Resolve and validate which camera and lidar sensors to use.
+
+        This helper accepts optional user-provided sensor ID lists and falls
+        back to NCore auto-detection when those lists are omitted. To avoid
+        ambiguous training setups, auto-detection is only allowed when exactly
+        one sensor exists for that modality; otherwise the caller must provide
+        explicit IDs.
+
+        The selected IDs are validated against the sensors exposed by the
+        ``SequenceLoaderProtocol`` and then stored on the parser as
+        ``self.camera_ids``, ``self.lidar_ids``, and ``self.num_cameras``.
+
+        Args:
+            sequence_loader: Open NCore sequence loader used to query available
+                camera and lidar sensor IDs.
+            camera_ids: Optional list of camera sensor IDs requested by the
+                user/config.
+            lidar_ids: Optional list of lidar sensor IDs requested by the
+                user/config.
+
+        Raises:
+            ValueError: If auto-detection is requested but multiple sensors are
+                available for a modality.
+            AssertionError: If any requested ID is not present in the dataset.
+        """
 
         # Auto-detect _single_ sensors if not specified - sensors need to be specified explicitly
         # to avoid ambiguity (e.g., in case of multiple downscaled sensors)
@@ -283,7 +432,20 @@ class NCoreParser:
     def _compute_world_global_transform(
         self, sequence_loader: ncore.data.SequenceLoaderProtocol
     ) -> None:
-        """Set T_world_to_scene_world: transformation from NCore world -> world_global."""
+        """Compute the transform from NCore ``world`` into ``world_global``.
+
+        NCore pose graphs may provide an explicit edge between the local
+        ``world`` frame and a globally-aligned ``world_global`` frame. When
+        that edge exists, this method derives ``self.T_world_to_scene_world``
+        from it (using the inverse of the stored source-target transform) so
+        subsequent poses can be expressed in the global frame. If the edge is
+        missing, identity is used as a safe fallback, meaning local and global
+        frames are treated as equivalent.
+
+        Args:
+            sequence_loader: NCore sequence loader whose pose graph is queried
+                for the ``("world", "world_global")`` edge.
+        """
         if (
             edge := sequence_loader.pose_graph.get_edge("world", "world_global")
         ) is not None:
@@ -299,7 +461,47 @@ class NCoreParser:
         factor: float,
         n_dilation: int,
     ) -> Dict[str, ncore.data.CameraSensorProtocol]:
-        """Load intrinsics, K matrices, and ego masks for all cameras."""
+        """Load camera sensors and derive per-camera render metadata.
+
+        For each selected camera ID, this method:
+
+        1. Fetches the NCore camera sensor object from ``sequence_loader``.
+        2. Optionally rescales model parameters using ``factor``.
+        3. Builds a camera model object for resolution access.
+        4. Populates parser dictionaries used downstream by training:
+                ``Ks_dict``, ``imsize_dict``, ``mask_dict``, and
+                ``camera_render_data``.
+
+        Camera-model-specific handling:
+
+        - ``FThetaCameraModelParameters``:
+            Stores a minimal intrinsic matrix with principal point and exports
+            full f-theta polynomial coefficients in
+            ``CameraRenderData.ftheta_coeffs``.
+        - ``OpenCVFisheyeCameraModelParameters``:
+            Builds pinhole-style ``K`` via :func:`_build_pinhole_K` and stores
+            fisheye radial coefficients.
+        - ``OpenCVPinholeCameraModelParameters``:
+            Builds ``K`` and stores optional radial, tangential, and thin-prism
+            coefficients (cleaned by :func:`_parse_optional_coeffs`).
+        - Unknown camera types:
+            Falls back to a synthesized pinhole ``K`` from image resolution and
+            no distortion coefficients.
+
+        Ego masks are loaded via :func:`_load_ego_mask` and dilated by
+        ``n_dilation`` iterations.
+
+        Args:
+                sequence_loader: Open NCore sequence loader used to access camera
+                        sensors and their model parameters.
+                factor: Image-domain scale factor applied to camera model
+                        parameters before intrinsics extraction.
+                n_dilation: Number of dilation iterations for ego-mask loading.
+
+        Returns:
+                A mapping ``camera_id -> CameraSensorProtocol`` for all selected
+                cameras.
+        """
         camera_sensors = {
             cid: sequence_loader.get_camera_sensor(cid) for cid in self.camera_ids
         }
@@ -416,7 +618,25 @@ class NCoreParser:
         return camera_sensors
 
     def _get_sensor_frame_range(self, frames_timestamps_us: np.ndarray) -> range:
-        """Return the frame index range whose START and END timestamps fall in time_range_us."""
+        """Compute the contiguous frame-index range that overlaps the parser time window.
+
+        NCore sensors store per-frame timestamps for both ``START`` and
+        ``END`` timepoints. This helper first asks ``self.time_range_us`` for a
+        coarse coverage range using END timestamps, then refines the left
+        boundary with START timestamps so returned frames begin at or after the
+        requested start time.
+
+        This produces a Python ``range`` over frame indices that can be used
+        directly with NumPy slicing and NCore frame-access APIs.
+
+        Args:
+            frames_timestamps_us: Array of shape ``(N, 2)`` containing START
+                and END timestamps in microseconds for each frame.
+
+        Returns:
+            A contiguous ``range`` of valid frame indices inside
+            ``self.time_range_us``. May be empty when no frames overlap.
+        """
         cover = self.time_range_us.cover_range(
             frames_timestamps_us[:, ncore.data.FrameTimepoint.END]
         )
@@ -435,7 +655,25 @@ class NCoreParser:
         camera_sensors: Dict[str, ncore.data.CameraSensorProtocol],
         camera_frame_ranges: Dict[str, range],
     ) -> None:
-        """Set world_global_to_scene: translation that centres poses at the origin."""
+        """Estimate and store a scene-centering transform from camera trajectories.
+
+        This method gathers START-time camera positions for all selected
+        cameras within their valid frame ranges, maps those positions from
+        NCore ``world`` into ``world_global`` using
+        ``self.T_world_to_scene_world``, and computes the mean 3D position
+        across all samples.
+
+        That mean position is then used as the target origin for
+        ``self.world_global_to_scene`` (a :class:`FrameConversion`), which
+        recenters the scene so camera poses are numerically close to the
+        origin during training.
+
+        Args:
+            camera_sensors: Mapping from camera ID to NCore camera sensor
+                object used to query pose trajectories.
+            camera_frame_ranges: Mapping from camera ID to the frame-index
+                range selected for that camera.
+        """
         positions: List[np.ndarray] = []
         for camera_id in self.camera_ids:
             frame_range = camera_frame_ranges[camera_id]
@@ -467,7 +705,32 @@ class NCoreParser:
         camera_sensors: Dict[str, ncore.data.CameraSensorProtocol],
         camera_frame_ranges: Dict[str, range],
     ) -> None:
-        """Batch-load start/end poses for all frames; set camtoworlds and scene_scale."""
+        """Batch-load per-frame camera poses and build parser frame indexing.
+
+        For each selected camera, this method loads both START and END
+        timepoint poses from NCore (camera -> world), converts them into the
+        parser's scene frame via :meth:`_ncore_world_to_scene_poses`, and
+        appends the results into flat, multi-camera arrays.
+
+        It also builds two indexing structures used by :class:`NCoreDataset`:
+
+        - ``self.frame_list``: ``[(camera_id, frame_idx), ...]``
+        - ``self.camera_idx_per_frame``: integer camera index per flattened
+          frame.
+
+        Finally, START and END poses are stacked into:
+
+        - ``self.camtoworlds`` with shape ``(N, 4, 4)``
+        - ``self.camtoworlds_end`` with shape ``(N, 4, 4)``
+
+        where ``N`` is the total number of retained frames across cameras.
+
+        Args:
+            camera_sensors: Mapping from camera ID to NCore camera sensor
+                objects used to query pose trajectories.
+            camera_frame_ranges: Mapping from camera ID to selected frame
+                index ranges.
+        """
         self.frame_list: List[Tuple[str, int]] = []
         self.camera_idx_per_frame: List[int] = []
         starts: List[np.ndarray] = []
@@ -682,7 +945,7 @@ class NCoreDataset(torch.utils.data.Dataset):
 
     Returns batches compatible with gsplat trainers:
       {"K", "camtoworld", "image", "image_id", "camera_idx"}
-    plus optional "camtoworld_end" (END pose for rolling shutter) and "mask".
+    plus optional "camtoworld_end" (END pose for rolling shutter; camtoworld would be the START pose) and "mask".
 
     Images are loaded lazily per __getitem__. The underlying NCore sequence
     loader is (re-)opened per DataLoader worker to avoid sharing file handles.
@@ -711,8 +974,24 @@ class NCoreDataset(torch.utils.data.Dataset):
         self._current_worker_id: Optional[int] = None
 
     def _init_worker(self) -> None:
-        """Open (or reopen) the NCore sequence loader for the current worker process."""
-        worker_info = torch.utils.data.get_worker_info()
+        """Ensure this DataLoader worker has its own valid NCore loader resources.
+
+        PyTorch DataLoader workers run in separate processes, and NCore file
+        handles/readers should not be shared across workers. This method
+        lazily initializes a worker-local ``SequenceLoaderV4`` on first use,
+        caches the current worker ID, and reuses the loader when the worker is
+        unchanged.
+
+        If a loader already exists but the worker ID differs (e.g., after
+        worker context changes), it refreshes underlying resources via
+        ``reload_resources()``.
+
+        Side effects:
+            - Sets ``self._current_worker_id``.
+            - Initializes or refreshes ``self._sequence_loader``.
+            - Populates ``self._camera_sensors`` when first created.
+        """
+        worker_info = torch.utils.data.get_worker_info() # get worker info to determine if we're in a worker process
         current_worker_id: Optional[int] = (
             None if worker_info is None else worker_info.id
         )
@@ -745,6 +1024,38 @@ class NCoreDataset(torch.utils.data.Dataset):
         return len(self.indices)
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
+        """Build one training/evaluation sample from the flattened frame index.
+
+        The input ``item`` indexes this split-local list (train or test).
+        It is first mapped to the parser-global frame index via
+        ``self.indices``, then resolved to ``(camera_id, frame_idx)`` in
+        ``parser.frame_list``.
+
+        For that frame, this method loads:
+
+        - image pixels from the NCore camera sensor,
+        - intrinsic matrix ``K`` from parser metadata,
+        - START and END camera poses (``camtoworld`` and
+            ``camtoworld_end``) for rolling-shutter-aware rendering,
+        - camera/sample identifiers.
+
+        Optional masks are merged into a single boolean validity mask:
+
+        - static ego mask from parser calibration metadata (inverted so
+            ``True`` means valid pixel),
+        - per-frame generic ``"mask"`` from NCore, when present.
+
+        If both are available, the final mask is their logical AND.
+
+        Args:
+                item: Split-local sample index in ``[0, len(self))``.
+
+        Returns:
+                Dictionary with tensor-valued camera/image fields compatible with
+                gsplat training:
+                ``{"K", "camtoworld", "camtoworld_end", "image", "image_id", "camera_idx"}``
+                and optional ``"mask"`` when any valid-mask source exists.
+        """
         self._init_worker()
         assert self._camera_sensors is not None
 
