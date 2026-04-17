@@ -481,7 +481,8 @@ class Runner:
         else:
             raise ValueError(f"Unknown LPIPS network: {cfg.lpips_net}")
 
-        # Viewer
+        # Viewer 
+        # TODO looki into viewer
         if not self.cfg.disable_viewer:
             self.server = viser.ViserServer(port=cfg.port, verbose=False)
             self.viewer = GsplatViewer(
@@ -523,6 +524,45 @@ class Runner:
         exposure: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
+        """Rasterize 3D Gaussians into 2D image tensors using differentiable splatting.
+
+        This is the core rendering function that:
+        1. Extracts learnable Gaussian parameters (means, scales, rotations, opacities).
+        2. Computes per-Gaussian colors from either spherical harmonics (SH) or
+           appearance module features depending on training mode.
+        3. Optionally applies camera-specific distortion coefficients (radial, tangential,
+           thin-prism for OpenCV pinhole/fisheye; polynomial for f-theta).
+        4. Rasterizes Gaussians to image space, producing RGB + optional depth/alpha.
+        5. Applies pixel-level validity masks (ego vehicle, dynamic regions).
+        6. Optionally applies post-processing (bilateral grid or PPISP).
+
+        Args:
+            camtoworlds: Camera-to-world transformation matrices [B, 4, 4].
+            Ks: Camera intrinsic matrices [B, 3, 3].
+            width: Rendered image width in pixels.
+            height: Rendered image height in pixels.
+            masks: Optional pixel validity mask [B, H, W]; True = valid pixel.
+            rasterize_mode: Rasterization variant ("antialiased" or "classic").
+                If None, uses config default.
+            camera_model: Camera model type ("pinhole", "fisheye", "ftheta", etc.).
+                If None, uses config default.
+            frame_idcs: Frame indices for per-frame parameters (e.g., pose/appearance
+                adjustments). Used by post-processing modules.
+            camera_idcs: Camera indices for multi-camera setups. Used to select
+                camera-specific distortion coefficients from NCore data.
+            exposure: Optional per-frame EXIF exposure values [B,] for tonemapping.
+            **kwargs: Additional arguments passed to rasterization (sh_degree, near_plane,
+                far_plane, render_mode, etc.).
+
+        Returns:
+            Tuple[Tensor, Tensor, Dict]:
+                - render_colors: Rendered image [B, H, W, C] where C depends on render_mode
+                  (typically C=3 for RGB, C=4 for RGB+depth).
+                - render_alphas: Per-pixel alpha/opacity [B, H, W, 1].
+                - info: Dictionary with rasterization metadata including:
+                  - "radii": Gaussian projection radii for visibility checking.
+                  - "gaussian_ids": Visible Gaussian indices (for sparse gradient updates).
+        """
         means = self.splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
@@ -547,6 +587,7 @@ class Runner:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
+        # TODO FIX: setting coeffs to None while using wit_ut does not make sense!
         ftheta_coeffs = None
         radial_coeffs = None
         tangential_coeffs = None
@@ -603,7 +644,7 @@ class Runner:
             **kwargs,
         )
         if masks is not None:
-            render_colors[~masks] = 0
+            render_colors[~masks] = 0 # Mask out invalid pixels (e.g., ego vehicle, dynamic objects) by setting their color to black.
 
         if self.cfg.post_processing is not None:
             # Create pixel coordinates [H, W, 2] with +0.5 center offset
@@ -618,6 +659,7 @@ class Runner:
             rgb = render_colors[..., :3]
             extra = render_colors[..., 3:] if render_colors.shape[-1] > 3 else None
 
+            # Apply post-processing to RGB channels only, keep extra channels (e.g. depth) unchanged.
             if self.cfg.post_processing == "bilateral_grid":
                 if frame_idcs is not None:
                     grid_xy = (
@@ -641,6 +683,7 @@ class Runner:
                     exposure_prior=exposure,
                 )
 
+            # RGB [B, H, W, 3], extra (e.g. depth) [B, H, W, C-3] -> combined [B, H, W, C]
             render_colors = (
                 torch.cat([rgb, extra], dim=-1) if extra is not None else rgb
             )
@@ -648,6 +691,37 @@ class Runner:
         return render_colors, render_alphas, info
 
     def train(self):
+        """Run the full optimization loop for Gaussian Splatting.
+
+        This method performs end-to-end training, including:
+        1. Scheduler and dataloader setup.
+        2. Per-step forward rendering via ``rasterize_splats``.
+        3. Loss computation (L1 + SSIM, optional depth, optional post-processing regularization).
+        4. Backward pass and optimizer/scheduler updates.
+        5. Strategy hooks for densification/pruning before and after optimization.
+        6. Periodic logging, checkpointing, evaluation, trajectory rendering, and optional compression.
+
+        Training data fields consumed from each batch:
+            - ``camtoworld``: [B, 4, 4] camera-to-world poses.
+            - ``K``: [B, 3, 3] intrinsics.
+            - ``image``: [B, H, W, 3] uint8 ground-truth image (normalized to [0, 1]).
+            - ``image_id``: [B] frame id used by pose/app/post-processing modules.
+            - ``camera_idx``: [B] camera index (used for multi-camera distortion and PPISP).
+            - Optional ``mask``: [B, H, W] validity mask.
+            - Optional ``exposure``: [B] exposure prior.
+            - Optional depth supervision tensors when ``cfg.depth_loss`` is enabled.
+
+        Notes:
+            - Viewer integration (if enabled) can pause/resume training and receives step-rate stats.
+            - Sparse gradients and visible-only Adam paths are handled before optimizer steps.
+            - The rendered tensor can be RGB ([B, H, W, 3]) or RGB+depth ([B, H, W, 4])
+              depending on ``render_mode``.
+            - Post-processing modules (bilateral grid or PPISP) are optimized jointly when active.
+
+        Returns:
+            None. Side effects include model updates, TensorBoard logs, checkpoints/stat files,
+            rendered evaluation outputs, and optional exported PLY/compression artifacts.
+        """
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
@@ -699,20 +773,58 @@ class Runner:
             )
             schedulers.extend(ppisp_schedulers)
 
+        if cfg.ckpt is not None and cfg.resume:
+            if len(cfg.ckpt) != 1:
+                raise ValueError("Resume mode expects exactly one checkpoint path.")
+            ckpt = torch.load(cfg.ckpt[0], map_location=device)
+            for name in self.splats.keys():
+                self.splats[name].data = ckpt["splats"][name].to(device)
+            if cfg.pose_opt and "pose_adjust" in ckpt:
+                if world_size > 1:
+                    self.pose_adjust.module.load_state_dict(ckpt["pose_adjust"])
+                else:
+                    self.pose_adjust.load_state_dict(ckpt["pose_adjust"])
+            if cfg.app_opt and "app_module" in ckpt:
+                if world_size > 1:
+                    self.app_module.module.load_state_dict(ckpt["app_module"])
+                else:
+                    self.app_module.load_state_dict(ckpt["app_module"])
+            if self.post_processing_module is not None and "post_processing" in ckpt:
+                self.post_processing_module.load_state_dict(ckpt["post_processing"])
+            if "optimizers" in ckpt:
+                for name, optimizer in self.optimizers.items():
+                    optimizer.load_state_dict(ckpt["optimizers"][name])
+            if cfg.pose_opt and "pose_optimizers" in ckpt:
+                for optimizer, state in zip(self.pose_optimizers, ckpt["pose_optimizers"]):
+                    optimizer.load_state_dict(state)
+            if cfg.app_opt and "app_optimizers" in ckpt:
+                for optimizer, state in zip(self.app_optimizers, ckpt["app_optimizers"]):
+                    optimizer.load_state_dict(state)
+            if "post_processing_optimizers" in ckpt:
+                for optimizer, state in zip(self.post_processing_optimizers, ckpt["post_processing_optimizers"]):
+                    optimizer.load_state_dict(state)
+            if "schedulers" in ckpt:
+                for scheduler, state in zip(schedulers, ckpt["schedulers"]):
+                    scheduler.load_state_dict(state)
+            if "strategy_state" in ckpt:
+                self.strategy_state = ckpt["strategy_state"]
+            init_step = int(ckpt["step"]) + 1
+
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=4,              # Affects CPU data loading speed. Can maybe increase if lots of RAM/CPU core
             persistent_workers=True,
             pin_memory=True,
+            #prefetch_factor=2,           # Refetch factor for preloading data. Can maybe increase if data loading is bottleneck
         )
-        trainloader_iter = iter(trainloader)
+        trainloader_iter = iter(trainloader) 
 
         # Training loop.
         global_tic = time.time()
-        pbar = tqdm.tqdm(range(init_step, max_steps))
-        for step in pbar:
+        pbar = tqdm.tqdm(range(init_step, max_steps)) # Progress bar for training steps. Ranges from init_step to max_steps.
+        for step in pbar: #Training loop! Each iteration corresponds to one optimization step (forward + backward + update).
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
@@ -727,18 +839,19 @@ class Runner:
                 and step >= cfg.ppisp_controller_activation_num_steps
             ):
                 self.freeze_gaussians()
-
+            
+            # One frame per data dict (for batch_size = 1)
             try:
-                data = next(trainloader_iter)
-            except StopIteration:
+                data = next(trainloader_iter) # Fetch next batch of training data. 
+            except StopIteration:             # If the iterator is exhausted, it raises StopIteration, which we catch to reset the iterator for the next epoch.
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3] Normalize pixel values to [0, 1] range for loss computation.
             num_train_rays_per_step = (
-                pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
+                pixels.shape[0] * pixels.shape[1] * pixels.shape[2] #Number of pixels in the batch (B*H*W), used by viewer
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
@@ -776,7 +889,7 @@ class Runner:
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
             )
-            if renders.shape[-1] == 4:
+            if renders.shape[-1] == 4:  # If render includes depth (RGB+ED), split into colors and depths. Otherwise, treat all channels as colors.
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
@@ -785,6 +898,7 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
+            # Prep for backward pass
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -805,11 +919,13 @@ class Runner:
                 l1loss = F.l1_loss(colors, pixels)
                 colors_ssim = colors
                 pixels_ssim = pixels
+                
             ssimloss = 1.0 - fused_ssim(
                 colors_ssim.permute(0, 3, 1, 2),
                 pixels_ssim.permute(0, 3, 1, 2),
                 padding="valid",
             )
+            # Loss = (1 - ssim_lambda) * L1 + ssim_lambda * (1 - SSIM)
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
                 # query depths from depth map
@@ -826,8 +942,8 @@ class Runner:
                 )  # [1, 1, M, 1]
                 depths = depths.squeeze(3).squeeze(1)  # [1, M]
                 # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
+                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))    # Disparity is the inverse of depth. We compute loss in disparity space because it emphasizes errors in closer objects,
+                disp_gt = 1.0 / depths_gt  # [1, M]                                         #  which are more perceptually significant and often more important for downstream tasks.
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
             if cfg.post_processing == "bilateral_grid":
@@ -842,9 +958,9 @@ class Runner:
                 loss += post_processing_reg_loss
 
             # regularizations
-            if cfg.opacity_reg > 0.0:
+            if cfg.opacity_reg > 0.0: # penalizes Gaussians that stay too opaque
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
-            if cfg.scale_reg > 0.0:
+            if cfg.scale_reg > 0.0: # penalizes Gaussians that grow too large
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
             loss.backward()
@@ -867,6 +983,7 @@ class Runner:
             #         (canvas * 255).astype(np.uint8),
             #     )
 
+            # log to TensorBoard
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
@@ -890,7 +1007,7 @@ class Runner:
 
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
-                mem = torch.cuda.max_memory_allocated() / 1024**3
+                mem = torch.cuda.max_memory_allocated() / 1024**3 # Log GPU memory usage in GB for this checkpoint step.
                 stats = {
                     "mem": mem,
                     "ellipse_time": time.time() - global_tic,
@@ -915,9 +1032,34 @@ class Runner:
                         data["app_module"] = self.app_module.state_dict()
                 if self.post_processing_module is not None:
                     data["post_processing"] = self.post_processing_module.state_dict()
+                data["optimizers"] = {
+                    name: optimizer.state_dict()
+                    for name, optimizer in self.optimizers.items()
+                }
+                if cfg.pose_opt:
+                    data["pose_optimizers"] = [
+                        optimizer.state_dict() for optimizer in self.pose_optimizers
+                    ]
+                if cfg.app_opt:
+                    data["app_optimizers"] = [
+                        optimizer.state_dict() for optimizer in self.app_optimizers
+                    ]
+                if self.post_processing_optimizers:
+                    data["post_processing_optimizers"] = [
+                        optimizer.state_dict()
+                        for optimizer in self.post_processing_optimizers
+                    ]
+                data["schedulers"] = [scheduler.state_dict() for scheduler in schedulers]
+                data["strategy_state"] = self.strategy_state
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
+                
+            # checkpoint.pt saves step, splats, and optionally pose/app/post-processing modules. 
+            # If i want to resume training from a chekpoint, still missing optimizer states and schedulers states, which can cause issues.
+            # Done? need testing
+            
+            #TODO continue from here!
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
@@ -1370,7 +1512,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
 
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
-    if cfg.ckpt is not None:
+    if cfg.ckpt is not None and not cfg.resume:
         # run eval only
         ckpts = [
             torch.load(file, map_location=runner.device, weights_only=True)

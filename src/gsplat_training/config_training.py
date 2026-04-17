@@ -17,6 +17,8 @@ class Config:
     disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
+    # If True, load the checkpoint state and continue training instead of eval-only.
+    resume: bool = False
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path: "interp", "ellipse", "spiral", or "raw" (use captured poses as-is)
