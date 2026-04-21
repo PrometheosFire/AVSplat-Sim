@@ -4,3 +4,6 @@
 [submodule "external/Difix3D+"]
 	path = external/Difix3D+
 	url = git@github.com:nv-tlabs/Difix3D.git
+[submodule "external/ncore"]
+	path = external/ncore
+	url = https://github.com/NVIDIA/ncore.git
