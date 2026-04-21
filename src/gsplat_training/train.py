@@ -1059,7 +1059,6 @@ class Runner:
             # If i want to resume training from a chekpoint, still missing optimizer states and schedulers states, which can cause issues.
             # Done? need testing
             
-            #TODO continue from here!
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
@@ -1080,6 +1079,7 @@ class Runner:
                     sh0 = self.splats["sh0"]
                     shN = self.splats["shN"]
 
+                # save splats to .ply
                 means = self.splats["means"]
                 scales = self.splats["scales"]
                 quats = self.splats["quats"]
@@ -1126,7 +1126,7 @@ class Runner:
                     optimizer.step(visibility_mask)
                 else:
                     optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)   #Clears gradients after each update so next iteration starts clean
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1185,7 +1185,34 @@ class Runner:
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
-        """Entry for evaluation."""
+        """Run full-image evaluation on the validation split (or a named stage).
+
+        This method renders each sample in ``self.valset`` with the current Gaussian
+        parameters, compares predictions against ground-truth images, writes side-by-side
+        render outputs, and aggregates quality metrics.
+
+        Behavior summary:
+            1. Builds a deterministic dataloader over ``self.valset`` (batch size 1).
+            2. For each view, renders RGB with ``rasterize_splats``.
+            3. Saves comparison images (ground truth | prediction) to ``self.render_dir``.
+            4. Computes PSNR, SSIM, and LPIPS on rank 0.
+            5. Optionally computes color-corrected metrics if enabled by config.
+            6. Writes aggregated metrics to JSON and TensorBoard.
+
+        Args:
+            step: Global training step used for filenames/logging.
+            stage: Label used in output filenames and TensorBoard namespaces
+                (for example ``"val"`` or ``"compress"``).
+
+        Returns:
+            None. Side effects include writing rendered PNGs, stats JSON files,
+            and TensorBoard scalars.
+
+        Notes:
+            - ``@torch.no_grad()`` disables autograd tracking during this method,
+              reducing memory usage and avoiding accidental gradient updates.
+            - In distributed runs, metric aggregation/logging is performed on rank 0.
+        """
         print("Running evaluation...")
         cfg = self.cfg
         device = self.device
@@ -1225,7 +1252,7 @@ class Runner:
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
-            colors = torch.clamp(colors, 0.0, 1.0)
+            colors = torch.clamp(colors, 0.0, 1.0) # Clamp render colors to [0, 1] range for fair metric computation and visualization.
             canvas_list = [pixels, colors]
 
             if world_rank == 0:
@@ -1286,13 +1313,37 @@ class Runner:
 
     @torch.no_grad()
     def render_traj(self, step: int):
-        """Entry for trajectory rendering."""
+        """Render a trajectory video from the current Gaussian scene state.
+
+        This method synthesizes a camera path, renders each pose with the current
+        model, and writes an MP4 showing RGB and normalized expected-depth side by
+        side for quick qualitative inspection.
+
+        Behavior summary:
+            1. Exits early when ``cfg.disable_video`` is enabled.
+            2. Builds camera poses from parser poses using the configured path mode:
+               ``raw``, ``interp``, ``ellipse``, or ``spiral``.
+            3. Converts poses to homogeneous 4x4 transforms and moves them to device.
+            4. Renders each pose with ``render_mode="RGB+ED"``.
+            5. Normalizes depth per frame to [0, 1], concatenates RGB|depth, and
+               appends frames to an MP4 writer.
+
+        Args:
+            step: Global training step used to name the output file
+                (for example ``videos/traj_{step}.mp4``).
+
+        Returns:
+            None. Side effects include writing a trajectory video under
+            ``{cfg.result_dir}/videos``.
+        """
         if self.cfg.disable_video:
             return
         print("Running trajectory rendering...")
         cfg = self.cfg
         device = self.device
 
+        # TODO Prob good idea to refract this
+        
         camtoworlds_all = self.parser.camtoworlds[5:-5]
         if cfg.render_traj_path == "raw":
             # Use captured poses as-is
@@ -1413,6 +1464,42 @@ class Runner:
     def _viewer_render_fn(
         self, camera_state: CameraState, render_tab_state: RenderTabState
     ):
+        """Render one interactive viewer frame for the current camera state.
+
+        This callback is consumed by the viewer UI and is called repeatedly as the
+        user moves the camera or changes render settings. It converts UI state into
+        rasterization inputs, renders one frame, applies mode-specific visualization,
+        and returns an image array suitable for display.
+
+        Behavior summary:
+            1. Chooses preview or viewer resolution from ``render_tab_state``.
+            2. Converts camera pose/intrinsics from numpy to torch tensors on the
+               active device.
+            3. Maps UI render mode labels to rasterizer render modes
+               (RGB, accumulated depth, expected depth, alpha).
+            4. Calls ``rasterize_splats`` and updates viewer statistics
+               (total/rendered Gaussian counts).
+            5. Post-processes output for visualization:
+               - RGB: clamp to [0, 1]
+               - Depth modes: normalize depth and apply selected colormap
+               - Alpha: colormap over alpha channel
+
+        Args:
+            camera_state: Current viewer camera pose and helper methods for deriving
+                intrinsics at a target resolution.
+            render_tab_state: Viewer render controls (resolution, near/far planes,
+                mode, colormap, clipping, inversion, and related options).
+
+        Returns:
+            A numpy array representing the rendered frame for the viewer. Shape is
+            ``[H, W, 3]`` with values in [0, 1] for RGB/colormapped outputs.
+
+        Notes:
+            - ``@torch.no_grad()`` avoids autograd graph creation for interactive
+              rendering, which reduces memory pressure and improves responsiveness.
+            - For depth visualization, normalization can use either user-provided
+              near/far or per-frame min/max depending on UI settings.
+        """
         assert isinstance(render_tab_state, GsplatRenderTabState)
         if render_tab_state.preview_render:
             width = render_tab_state.render_width
@@ -1427,8 +1514,8 @@ class Runner:
 
         RENDER_MODE_MAP = {
             "rgb": "RGB",
-            "depth(accumulated)": "D",
-            "depth(expected)": "ED",
+            "depth(accumulated)": "D",  # Mixes depth and alpha to visualize where Gaussians contribute to the render, but depth values are not accurate. Useful for debugging.
+            "depth(expected)": "ED",    # Visualizes expected depth, which is the weighted average of Gaussian depths with alpha as weights. More accurate than accumulated depth, but can be blurry when many Gaussians overlap.
             "alpha": "RGB",
         }
 
