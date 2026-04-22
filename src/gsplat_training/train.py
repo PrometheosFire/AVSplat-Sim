@@ -854,6 +854,7 @@ class Runner:
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2] #Number of pixels in the batch (B*H*W), used by viewer
             )
             image_ids = data["image_id"].to(device)
+            #print("Masks exist?", "mask" in data)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
             exposure = (
                 data["exposure"].to(device) if "exposure" in data else None
@@ -1140,6 +1141,7 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
+            # Densification strategy!
             if isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
@@ -1312,7 +1314,7 @@ class Runner:
             self.writer.flush()
 
     @torch.no_grad()
-    def render_traj(self, step: int):
+    def render_traj_old(self, step: int):
         """Render a trajectory video from the current Gaussian scene state.
 
         This method synthesizes a camera path, renders each pose with the current
@@ -1411,6 +1413,280 @@ class Runner:
             writer.append_data(canvas)
         writer.close()
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
+        
+        
+    @torch.no_grad()
+    def render_traj(self, step: int):
+        """Render a trajectory video from the current Gaussian scene state."""
+        if self.cfg.disable_video:
+            return
+        print("Running trajectory rendering...")
+        cfg = self.cfg
+        device = self.device
+        video_dir = f"{cfg.result_dir}/videos"
+        os.makedirs(video_dir, exist_ok=True)
+        frames_root_dir = f"{video_dir}/frames"
+        os.makedirs(frames_root_dir, exist_ok=True)
+
+        print("Grouping original poses by camera...")
+        frames_by_camera = self._group_frames_by_camera()
+
+        # Persist the original grouped camera paths for debugging/reuse.
+        self._save_camera_paths(frames_by_camera)
+
+        # Map internal indices back to COLMAP/NCore camera IDs
+        idx_to_camera_id = None
+        if hasattr(self.parser, "camera_id_to_idx"):
+            idx_to_camera_id = {v: k for k, v in self.parser.camera_id_to_idx.items()}
+
+        processed_cameras = []
+
+        # Render each camera independently.
+        for cam_idx, frames in frames_by_camera.items():
+            safe_cam_name, cam_frames_dir = self._render_single_camera_trajectory(
+                cam_idx=cam_idx,
+                frames=frames,
+                idx_to_camera_id=idx_to_camera_id,
+                video_dir=video_dir,
+                frames_root_dir=frames_root_dir,
+                step=step,
+                cfg=cfg,
+                device=device,
+            )
+            processed_cameras.append((safe_cam_name, cam_frames_dir))
+
+        # 6. Build a single side-by-side video from all camera frame folders.
+        self._compose_side_by_side_video(processed_cameras, video_dir, step)
+
+    def _group_frames_by_camera(self) -> Dict[int, List[np.ndarray]]:
+        """Group parser camtoworld poses by contiguous camera index."""
+        frames_by_camera: Dict[int, List[np.ndarray]] = defaultdict(list)
+
+        if hasattr(self.parser, "camera_indices"):
+            camera_idx_per_frame = self.parser.camera_indices
+        elif hasattr(self.parser, "camera_idx_per_frame"):
+            camera_idx_per_frame = self.parser.camera_idx_per_frame
+        else:
+            raise ValueError(
+                "Parser must provide per-frame camera indices via "
+                "`camera_indices` or `camera_idx_per_frame`."
+            )
+
+        num_frames = len(self.parser.camtoworlds)
+        for i in range(num_frames):
+            cam_idx = camera_idx_per_frame[i]
+            if torch.is_tensor(cam_idx):
+                cam_idx = cam_idx.item()
+            frames_by_camera[cam_idx].append(self.parser.camtoworlds[i])
+
+        return frames_by_camera
+
+    def _save_camera_paths(
+        self,
+        frames_by_camera: Dict[int, List[np.ndarray]],
+    ) -> None:
+        """Save original per-camera pose sequences under result_dir/camera_paths."""
+        camera_paths_root = os.path.join(self.cfg.result_dir, "camera_paths")
+        os.makedirs(camera_paths_root, exist_ok=True)
+
+        for cam_idx, frames in frames_by_camera.items():
+            cam_dir = os.path.join(camera_paths_root, f"camera{cam_idx}")
+            os.makedirs(cam_dir, exist_ok=True)
+
+            c2ws = np.stack(frames, axis=0)
+            np.save(os.path.join(cam_dir, "camtoworlds.npy"), c2ws)
+
+            with open(os.path.join(cam_dir, "camtoworlds.json"), "w") as f:
+                json.dump({"camtoworlds": c2ws.tolist()}, f)
+
+    def _render_single_camera_trajectory(
+        self,
+        cam_idx: int,
+        frames: List[np.ndarray],
+        idx_to_camera_id: Optional[Dict[int, Union[int, str]]],
+        video_dir: str,
+        frames_root_dir: str,
+        step: int,
+        cfg: Config,
+        device: str,
+    ) -> Tuple[str, str]:
+        """Render one camera trajectory and save its video and frame images."""
+        if hasattr(self.parser, "camera_ids") and 0 <= cam_idx < len(self.parser.camera_ids):
+            cam_name = str(self.parser.camera_ids[cam_idx])
+        elif idx_to_camera_id is not None:
+            cam_name = f"camera_{idx_to_camera_id[cam_idx]}"
+        else:
+            cam_name = f"camera_{cam_idx}"
+
+        print(f"Generating trajectory for {cam_name}...")
+        safe_cam_name = str(cam_name).replace("/", "_")
+        cam_frames_dir = f"{frames_root_dir}/{safe_cam_name}"
+        os.makedirs(cam_frames_dir, exist_ok=True)
+
+        c2ws = np.stack(frames, axis=0)  # [N, 3, 4] or [N, 4, 4]
+        if c2ws.shape[-2] == 4:
+            c2ws_3x4 = c2ws[:, :3, :]
+        else:
+            c2ws_3x4 = c2ws
+
+        if cfg.render_traj_path == "raw":
+            pass
+        elif cfg.render_traj_path == "interp":
+            c2ws_3x4 = generate_interpolated_path(c2ws_3x4, 1)
+        elif cfg.render_traj_path == "ellipse":
+            height = c2ws_3x4[:, 2, 3].mean()
+            c2ws_3x4 = generate_ellipse_path_z(c2ws_3x4, height=height)
+        elif cfg.render_traj_path == "spiral":
+            c2ws_3x4 = generate_spiral_path(
+                c2ws_3x4,
+                bounds=self.parser.bounds * self.scene_scale,
+                spiral_scale_r=self.parser.extconf["spiral_radius_scale"],
+            )
+        else:
+            raise ValueError(f"Render trajectory type not supported: {cfg.render_traj_path}")
+
+        c2ws_4x4 = np.concatenate(
+            [c2ws_3x4, np.repeat(np.array([[[0.0, 0.0, 0.0, 1.0]]]), len(c2ws_3x4), axis=0)],
+            axis=1,
+        )
+        c2ws_tensor = torch.from_numpy(c2ws_4x4).float().to(device)
+
+        if idx_to_camera_id is not None:
+            camera_key = idx_to_camera_id[cam_idx]
+        elif hasattr(self.parser, "camera_ids") and 0 <= cam_idx < len(self.parser.camera_ids):
+            camera_key = self.parser.camera_ids[cam_idx]
+        else:
+            camera_key = cam_idx
+
+        K_np = self.parser.Ks_dict[camera_key]
+        w, h = self.parser.imsize_dict[camera_key]
+
+        K_tensor = torch.from_numpy(K_np).float().to(device).unsqueeze(0)
+        camera_idx_tensor = torch.tensor([cam_idx]).to(device)
+
+        writer = imageio.get_writer(f"{video_dir}/traj_{step}_{safe_cam_name}.mp4", fps=30)
+        for i in tqdm.trange(len(c2ws_tensor), desc=f"Rendering {cam_name}"):
+            c2w = c2ws_tensor[i : i + 1]
+            renders, _, _ = self.rasterize_splats(
+                camtoworlds=c2w,
+                Ks=K_tensor,
+                width=w,
+                height=h,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                render_mode="RGB",
+                camera_idcs=camera_idx_tensor,
+                frame_idcs=None,
+                image_ids=None,
+                masks=None,
+                exposure=None,
+            )
+
+            colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)
+            canvas = colors.squeeze(0).cpu().numpy()
+            canvas = (canvas * 255).astype(np.uint8)
+            writer.append_data(canvas)
+            imageio.imwrite(f"{cam_frames_dir}/frame_{i:05d}.png", canvas)
+
+        writer.close()
+        print(f"Saved {video_dir}/traj_{step}_{safe_cam_name}.mp4")
+        print(f"Saved frames to {cam_frames_dir}")
+        return safe_cam_name, cam_frames_dir
+
+    def _compose_side_by_side_video(
+        self,
+        processed_cameras: List[Tuple[str, str]],
+        video_dir: str,
+        step: int,
+    ) -> None:
+        """Compose all per-camera frame folders into one grid video."""
+        if len(processed_cameras) <= 1:
+            return
+
+        print("Composing multi-camera grid video...")
+        frame_file_lists = []
+        for _, cam_frames_dir in processed_cameras:
+            frame_files = sorted(
+                [
+                    f
+                    for f in os.listdir(cam_frames_dir)
+                    if f.startswith("frame_") and f.endswith(".png")
+                ]
+            )
+            frame_file_lists.append(frame_files)
+
+        min_frames = min(len(files) for files in frame_file_lists)
+        if min_frames == 0:
+            print("Skipping combined video: one or more cameras have no saved frames.")
+            return
+
+        num_cameras = len(processed_cameras)
+        grid_cols = int(math.ceil(math.sqrt(num_cameras)))
+        grid_rows = int(math.ceil(num_cameras / grid_cols))
+
+        # Determine a fixed cell size so all grid frames have consistent dimensions.
+        cell_h = 0
+        cell_w = 0
+        for (_, cam_frames_dir), frame_files in zip(processed_cameras, frame_file_lists):
+            sample_path = os.path.join(cam_frames_dir, frame_files[0])
+            sample = imageio.imread(sample_path)
+            if sample.ndim == 2:
+                sample = np.repeat(sample[..., None], 3, axis=2)
+            elif sample.shape[-1] == 4:
+                sample = sample[..., :3]
+            cell_h = max(cell_h, sample.shape[0])
+            cell_w = max(cell_w, sample.shape[1])
+
+        combined_path = f"{video_dir}/traj_{step}_all_cams.mp4"
+        combined_writer = imageio.get_writer(combined_path, fps=30)
+
+        for frame_i in tqdm.trange(min_frames, desc="Composing all cameras"):
+            panels = []
+
+            for (_, cam_frames_dir), frame_files in zip(processed_cameras, frame_file_lists):
+                frame_path = os.path.join(cam_frames_dir, frame_files[frame_i])
+                panel = imageio.imread(frame_path)
+                if panel.ndim == 2:
+                    panel = np.repeat(panel[..., None], 3, axis=2)
+                elif panel.shape[-1] == 4:
+                    panel = panel[..., :3]
+                pad_h = cell_h - panel.shape[0]
+                pad_w = cell_w - panel.shape[1]
+                if pad_h > 0 or pad_w > 0:
+                    panel = np.pad(
+                        panel,
+                        ((0, pad_h), (0, pad_w), (0, 0)),
+                        mode="constant",
+                        constant_values=0,
+                    )
+                panels.append(panel.astype(np.uint8))
+
+            grid_rows_list = []
+            for row in range(grid_rows):
+                row_panels = []
+                for col in range(grid_cols):
+                    idx = row * grid_cols + col
+                    if idx < len(panels):
+                        row_panels.append(panels[idx])
+                if row_panels:
+                    row_strip = np.concatenate(row_panels, axis=1)
+                else:
+                    row_strip = np.zeros((cell_h, 0, 3), dtype=np.uint8)
+
+                # Center each row in the full grid width when the row has fewer cameras.
+                full_row_w = grid_cols * cell_w
+                centered_row = np.zeros((cell_h, full_row_w, 3), dtype=np.uint8)
+                x0 = (full_row_w - row_strip.shape[1]) // 2
+                if row_strip.shape[1] > 0:
+                    centered_row[:, x0 : x0 + row_strip.shape[1], :] = row_strip
+                grid_rows_list.append(centered_row)
+
+            merged = np.concatenate(grid_rows_list, axis=0)
+            combined_writer.append_data(merged)
+
+        combined_writer.close()
+        print(f"Saved combined video to {combined_path}")
 
     @torch.no_grad()
     def export_ppisp_reports(self) -> None:
