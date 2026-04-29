@@ -1,0 +1,11 @@
+name: "wayve101"
+scene: "scene_001"
+# The base directory containing all sensor folders
+base_dir: "data/wayve101/${dataset.scene}"
+# List the camera folders you want to process
+cameras:
+  - "front-forward"
+  - "left-backward"
+  - "left-forward"
+  - "right-backward"
+  - "right-forward"

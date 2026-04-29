@@ -1,6 +1,7 @@
 data/
 results/
 envs/
+external_weights/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -209,3 +210,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+external_weights/sam

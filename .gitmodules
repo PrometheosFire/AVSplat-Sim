@@ -7,3 +7,6 @@
 [submodule "external/ncore"]
 	path = external/ncore
 	url = https://github.com/NVIDIA/ncore.git
+[submodule "external/sam3"]
+	path = external/sam3
+	url = git@github.com:facebookresearch/sam3.git

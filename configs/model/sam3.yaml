@@ -1,0 +1,7 @@
+_target_: src.model_wrappers.segmenters.sam3_wrapper.SAM3Wrapper
+
+name: "sam3"
+
+checkpoint_path: "external_weights/sam3/sam3.pt"
+chunk_size: 2
+

@@ -1,0 +1,15 @@
+# Master config
+defaults:
+  - dataset: wayve101
+  - model: sam3
+  - pipeline: extract_masks
+  - _self_
+
+scene_name: "${dataset.scene}"
+# Global fallback variables
+exp_name: "manual_debug_run"
+
+hydra:
+  run:
+    # Fallback directory if running scripts manually outside the orchestrator
+    dir: results/manual_runs/${dataset.name}/${scene_name}/${exp_name}_${now:%m%d_%H%M}
