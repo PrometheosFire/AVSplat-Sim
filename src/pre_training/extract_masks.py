@@ -42,6 +42,7 @@ def main(cfg: DictConfig):
         
         cam_input_dir = os.path.join(base_input_dir, camera_name)
         cam_output_dir = os.path.join(base_output_dir, camera_name)
+        cam_success_marker = os.path.join(cam_output_dir, ".success")
         
         if not os.path.exists(cam_input_dir):
             print(f"⚠️ WARNING: Directory not found -> {cam_input_dir}")
@@ -60,20 +61,22 @@ def main(cfg: DictConfig):
             )
             print(f"✅ Finished {camera_name}")
             
+            with open(cam_success_marker, "w") as f:
+                f.write("Extraction finished flawlessly for this camera.")
+            print(f"✅ .success marker written for {camera_name}")
+            
         except Exception as e:
             print(f"\n❌ FATAL ERROR processing {camera_name}: {e}")
-            pipeline_failed = True 
-            break  # 2. Stop immediately! Don't try the next camera.
-
-    # 3. Only write the success marker if the flag is still False
-    if not pipeline_failed:
-        print(f"\n🎉 Mask Extraction Complete! All data saved to:\n{base_output_dir}")
-        with open(os.path.join(base_output_dir, ".success"), "w") as f:
-            f.write("Extraction finished flawlessly.")
-    else:
-        print(f"\n💥 Pipeline aborted due to errors. The .success marker was NOT written.")
-        # 4. Exit with an error code so the orchestrator knows it failed
-        exit(1)
+            segmenter.predictor.shutdown()
+            exit(1)
+        
+    segmenter.predictor.shutdown()
+    
+    master_success_marker = os.path.join(base_output_dir, ".success")
+    with open(master_success_marker, "w") as f:
+        f.write("All cameras processed successfully.")
+    
+    print(f"\n✅ Worker finished assigned cameras. Exiting cleanly.")
 
 if __name__ == "__main__":
     main()

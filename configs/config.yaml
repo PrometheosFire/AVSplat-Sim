@@ -13,3 +13,6 @@ hydra:
   run:
     # Fallback directory if running scripts manually outside the orchestrator
     dir: results/manual_runs/${dataset.name}/${scene_name}/${exp_name}_${now:%m%d_%H%M}
+
+mask_processing:
+  dilation_percentage: 0.5
