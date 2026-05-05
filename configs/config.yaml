@@ -16,3 +16,4 @@ hydra:
 
 mask_processing:
   dilation_percentage: 0.5
+  dilate_ego: false

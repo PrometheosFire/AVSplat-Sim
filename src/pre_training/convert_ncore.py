@@ -68,9 +68,7 @@ def main(cfg: DictConfig):
     try:
         subprocess.run(cmd, env=os.environ.copy(), cwd=ncore_root, check=True)
         
-        # ==========================================
-        # 🧹 The Cleanup: Flatten the nested directory
-        # ==========================================
+        # Cleanup: Flatten the nested directory
         generated_nested_dir = os.path.join(final_output_dir, "staging_symlinks")
         
         if os.path.exists(generated_nested_dir):

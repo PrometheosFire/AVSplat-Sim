@@ -82,10 +82,18 @@ def main(cfg: DictConfig):
                 n_dilation = max(1, int(img_width * (dilation_pct / 100.0)))
 
                 # 6. Apply SciPy Dilation (Safely expands the white objects!)
-                dilated_mask_bool = ndimage.binary_dilation(fused_mask_bool, iterations=n_dilation)
+                #dilated_mask_bool = ndimage.binary_dilation(fused_mask_bool, iterations=n_dilation)
+                if cfg.mask_processing.dilate_ego:
+                    # Old Behavior: Fuse first, then dilate everything together
+                    fused_mask_bool = sam_mask_bool | ego_mask_bool
+                    final_mask_bool = ndimage.binary_dilation(fused_mask_bool, iterations=n_dilation)
+                else:
+                    # New Behavior: Dilate SAM objects only, THEN fuse with the exact ego mask
+                    dilated_sam_bool = ndimage.binary_dilation(sam_mask_bool, iterations=n_dilation)
+                    final_mask_bool = dilated_sam_bool | ego_mask_bool
 
                 # 7. Convert back to OpenCV format (0 and 255)
-                final_mask_img = (dilated_mask_bool.astype(np.uint8) * 255)
+                final_mask_img = (final_mask_bool.astype(np.uint8) * 255)
                 
                 # RE-INVERT: Put it back to Black Objects on White Background for 3D Splatting
                 final_saved_mask = cv2.bitwise_not(final_mask_img)
