@@ -1,0 +1,7 @@
+_target_: src.model_wrappers.diffusion.difix_wrapper.DifixWrapper
+
+name: "difix"
+model_id: "nvidia/difix"
+
+# The default noise level (199 is recommended for Difix3D+)
+default_timestep: 199

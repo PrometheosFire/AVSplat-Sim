@@ -1,0 +1,48 @@
+# Disable viewer
+#disable_viewer: false
+# Render trajectory path: "interp", "ellipse", "spiral", or "raw" (use captured poses as-is)
+render_traj_path: "raw"
+# Downsample factor for the dataset
+data_factor: 1
+
+# Port for the viewer server
+port: 8080
+
+# Batch size for training. Learning rates are scaled automatically
+batch_size: 1
+# A global factor to scale the number of training steps
+steps_scaler: 1.0
+
+# Number of training steps
+max_steps: 30_000
+# Steps to evaluate the model
+eval_steps: [7000, 30000]
+# Steps to save the model
+save_steps: [7000, 30000]
+
+# Near plane clipping distance
+near_plane: 0.01
+# Far plane clipping distance
+far_plane: 1e10
+
+# Strategy for GS densification, "default" or "mcmc"
+strategy_type: "mcmc"  
+
+# Use packed mode for rasterization, this leads to less memory usage but slightly slower.
+packed: false
+# Use sparse gradients for optimization. (experimental)
+sparse_grad: false
+# Use visible adam from Taming 3DGS. (experimental)
+visible_adam: false
+
+# Enable depth loss. (experimental)
+depth_loss: false
+
+# Every N images there is a test image 
+test_every: 8
+
+
+strategy:
+  cap_max: 1000000        # Default cap
+  min_opacity: 0.005        # Default pruning opacity
+

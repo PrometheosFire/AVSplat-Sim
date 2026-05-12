@@ -14,7 +14,7 @@ from gsplat.cuda._wrapper import CameraModel
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = False
+    disable_viewer: bool = True
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # If True, load the checkpoint state and continue training instead of eval-only.
@@ -25,7 +25,7 @@ class Config:
     render_traj_path: str = "interp"
 
     # Dataset backend: "colmap" or "ncore"
-    data_type: str = "colmap"
+    data_type: str = "ncore"
     # Path to the Mip-NeRF 360 dataset (colmap) or NCore v4 meta-JSON file (ncore)
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
@@ -78,7 +78,7 @@ class Config:
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to save ply file (storage size can be large)
-    save_ply: bool = False
+    save_ply: bool = True
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
     # Whether to disable video generation during training and evaluation
@@ -188,8 +188,8 @@ class Config:
     lpips_net: Literal["vgg", "alex"] = "alex"
 
     # 3DGUT (uncented transform + eval 3D)
-    with_ut: bool = False
-    with_eval3d: bool = False
+    with_ut: bool = True
+    with_eval3d: bool = True
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]

@@ -20,8 +20,8 @@ def main(cfg: DictConfig):
     
     # Resolve the config to standard dictionaries for hashing
     dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
-    model_cfg = OmegaConf.to_container(cfg.model, resolve=True)
-    pipeline_cfg = OmegaConf.to_container(cfg.pipeline, resolve=True)
+    segmenter_cfg = OmegaConf.to_container(cfg.segmenter, resolve=True) # 👈 Updated
+    seg_task_cfg = OmegaConf.to_container(cfg.seg_task, resolve=True)
     
     # Base directory for this specific dataset and scene
     base_results_dir = os.path.abspath(f"results/{dataset_cfg['name']}/{dataset_cfg['scene']}")
@@ -41,11 +41,11 @@ def main(cfg: DictConfig):
     # ==========================================
     print("\n" + "="*50)
     # Dynamically print the name of the wrapper being used
-    wrapper_name = cfg.model._target_.split('.')[-1]
+    wrapper_name = cfg.segmenter._target_.split('.')[-1]
     print(f"▶️ [STEP 1] Checking Pre-Training Extraction ({wrapper_name})...")
     
     # Create a fingerprint based on dataset, model, and pipeline configs
-    step1_params = {"dataset": dataset_cfg, "model": model_cfg, "pipeline": pipeline_cfg}
+    step1_params = {"dataset": dataset_cfg, "model": segmenter_cfg, "pipeline": seg_task_cfg}
     step1_hash = generate_config_hash(step1_params)
     
     masks_dir = os.path.join(base_results_dir, f"01_masks_{step1_hash}")
@@ -134,6 +134,91 @@ def main(cfg: DictConfig):
             ], env=env, check=True)            
                 
             print(f"✅ Conversion complete. Master marker written. Pipeline ready for GSplat Training!")
+            
+    # Dynamically load the auto-extracted camera list!
+    cam_list_path = os.path.join(ncore_workspace_dir, "ncore_dataset", "camera_list.yaml")
+    if os.path.exists(cam_list_path):
+        cam_config = OmegaConf.load(cam_list_path)
+        cam_list_str = ",".join(cam_config.ncore_camera_ids)
+        # Creates a string like: gaussian_splatting.ncore_camera_ids=[camera1,camera8,camera10]
+        cam_override = f"++gaussian_splatting.ncore_camera_ids=[{cam_list_str}]"
+    else:
+        cam_override = "++gaussian_splatting.ncore_camera_ids=[]"
+            
+    # ==========================================
+    # STEP 4: Gaussian Splatting Training
+    # ==========================================
+    gsplat_config_yaml = OmegaConf.to_yaml(cfg.gaussian_splatting)
+    gsplat_config_str = f"gsplat_{ncore_workspace_dir}_{gsplat_config_yaml}"
+    gsplat_hash = hashlib.md5(gsplat_config_str.encode()).hexdigest()[:8]
+    
+    # Define the isolated output directory for this specific training run
+    gsplat_workspace_dir = os.path.abspath(os.path.join(base_results_dir, f"04_gsplat_training_{gsplat_hash}"))
+    master_gsplat_success = os.path.join(gsplat_workspace_dir, ".success")
+
+    if os.path.exists(master_gsplat_success):
+             print(f"⏭️ Skipping Step 4: GSplat training already completed for this config at {gsplat_workspace_dir}")
+    else:
+            print(f"\n🚀 Running Step 4: Gaussian Splatting Training...")
+            
+            gsplat_script_path = os.path.abspath("src/gsplat_training/train_splats.py")
+            ncore_json_path = os.path.join(ncore_workspace_dir, "ncore_dataset", "staging_symlinks.json")
+            #gsplat_python_exec = os.path.abspath("envs/envs/env_gsplat/bin/python")
+            
+            
+            # Launch the training!
+            subprocess.run([
+                python_exec, 
+                gsplat_script_path, 
+                f"hydra.run.dir={gsplat_workspace_dir}",                  
+                f"++gaussian_splatting.data_dir={ncore_json_path}",         
+                f"++gaussian_splatting.result_dir={gsplat_workspace_dir}",  
+                cam_override,  
+                *overrides
+            ], env=env, check=True)
+                
+            print(f"\n Gaussian Splatting Training complete.")
+            print(f"📂 Results saved to: {gsplat_workspace_dir}")
+            
+            
+    # ==========================================
+    # STEP 5: Diffusion Post-Processing (Difix3D+)
+    # ==========================================
+    
+    diffusion_cfg = OmegaConf.to_container(cfg.diffusion, resolve=True)
+    diff_task_cfg = OmegaConf.to_container(cfg.diff_task, resolve=True)
+    
+    diff_config_str = f"diff_{gsplat_workspace_dir}_{diffusion_cfg}_{diff_task_cfg}"
+    diff_hash = hashlib.md5(diff_config_str.encode()).hexdigest()[:8]
+    
+    # 2. Define the isolated output directory for this specific cleanup run
+    difix_workspace_dir = os.path.abspath(os.path.join(base_results_dir, f"05_difix_cleaned_{diff_hash}"))
+    master_difix_success = os.path.join(difix_workspace_dir, ".success")
+
+    if os.path.exists(master_difix_success):
+            print(f"⏭️ Skipping Step 5: Diffusion already completed for this config at {difix_workspace_dir}")
+    else:
+            print(f"\n🚀 Running Step 5: Diffusion Post-Processing...")
+            
+            difix_script_path = os.path.abspath("src/post_processing/apply_diffusion.py")
+            
+            # Note: We reuse the gsplat python environment because Difix is installed there!
+            subprocess.run([
+                python_exec, 
+                difix_script_path, 
+                f"++diff_task.output_dir={difix_workspace_dir}",          # Force the output directory
+                f"++gaussian_splatting.result_dir={gsplat_workspace_dir}",  # Tell it where the renders are
+                cam_override,
+                *overrides
+            ], env=env, check=True)
+            
+            # The Orchestrator stamps the run as successful
+            with open(master_difix_success, "w") as f:
+                f.write("Diffusion post-processing completed successfully.")
+                
+            print(f"\n🎉 Veni, Vidi, Vici! Diffusion Post-Processing complete.")
+            print(f"📂 Cleaned renders saved to: {difix_workspace_dir}")
+    
 
 if __name__ == "__main__":
     main()

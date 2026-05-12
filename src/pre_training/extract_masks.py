@@ -20,17 +20,20 @@ def main(cfg: DictConfig):
     base_input_dir = to_absolute_path(cfg.dataset.base_dir)
     base_input_dir = os.path.join(base_input_dir, "images")
     
+    print(f"\n📁 Resolved Input Directory: {base_input_dir}")
+    print(f"📁 Resolved Output Directory: {base_output_dir}")
+    
     cameras = cfg.dataset.cameras
-    prompt = cfg.pipeline.prompt
+    prompt = cfg.seg_task.prompt
 
     # ==========================================
     # 2. Instantiate the Segmenter
     # ==========================================
-    print(f"\n🤖 Loading Segmenter: {cfg.model.name}...")
+    print(f"\n🤖 Loading Segmenter: {cfg.segmenter.name}...")
     
-    # Hydra reads cfg.model._target_, imports your wrapper class, 
+    # Hydra reads cfg.segmenter._target_, imports your wrapper class, 
     # and passes it the checkpoint path and chunk size automatically!
-    segmenter = instantiate(cfg.model)
+    segmenter = instantiate(cfg.segmenter)
 
     # ==========================================
     # 3. Multi-Camera Orchestration Loop
@@ -42,6 +45,8 @@ def main(cfg: DictConfig):
         
         cam_input_dir = os.path.join(base_input_dir, camera_name)
         cam_output_dir = os.path.join(base_output_dir, camera_name)
+        print(f"📁 Camera Input Directory: {cam_input_dir}")
+        print(f"📁 Camera Output Directory: {cam_output_dir}")
         cam_success_marker = os.path.join(cam_output_dir, ".success")
         
         if not os.path.exists(cam_input_dir):
@@ -49,6 +54,8 @@ def main(cfg: DictConfig):
             print("Skipping to the next camera...")
             continue
             
+            
+        
         # ==========================================
         # 4. Execute the Contract
         # ==========================================

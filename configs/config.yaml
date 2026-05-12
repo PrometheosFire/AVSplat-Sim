@@ -1,8 +1,15 @@
 # Master config
 defaults:
   - dataset: wayve101
-  - model: sam3
-  - pipeline: extract_masks
+  #  --- Models ---
+  - model@segmenter: sam3       # Loads model/sam3.yaml into cfg.segmenter
+  - model@diffusion: difix3d+      # Loads model/difix3d+.yaml into cfg.diffusion
+
+  # --- Pipeline Tasks ---
+  - pipeline@seg_task: extract_masks      # Loads pipeline/extract_masks.yaml into cfg.seg_task
+  - pipeline@diff_task: apply_diffusion   # Loads pipeline/apply_diffusion.yaml into cfg.diff_task
+
+  - gaussian_splatting: train
   - _self_
 
 scene_name: "${dataset.scene}"
@@ -15,5 +22,5 @@ hydra:
     dir: results/manual_runs/${dataset.name}/${scene_name}/${exp_name}_${now:%m%d_%H%M}
 
 mask_processing:
-  dilation_percentage: 0.5
+  dilation_percentage: 0.2
   dilate_ego: false

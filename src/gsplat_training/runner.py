@@ -1254,8 +1254,10 @@ class Runner:
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
+            pixels_masked = pixels * masks[..., None]
+            
             colors = torch.clamp(colors, 0.0, 1.0) # Clamp render colors to [0, 1] range for fair metric computation and visualization.
-            canvas_list = [pixels, colors]
+            canvas_list = [pixels_masked, colors]
 
             if world_rank == 0:
                 # write images
@@ -1266,7 +1268,7 @@ class Runner:
                     canvas,
                 )
 
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
+                pixels_p = pixels_masked.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 metrics["psnr"].append(self.psnr(colors_p, pixels_p))
                 metrics["ssim"].append(self.ssim(colors_p, pixels_p))

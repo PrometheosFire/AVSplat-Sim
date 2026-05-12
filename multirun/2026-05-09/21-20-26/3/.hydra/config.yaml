@@ -1,0 +1,54 @@
+dataset:
+  name: wayve101
+  scene: scene_007
+  base_dir: data/wayve101/${dataset.scene}
+  cameras:
+  - front-forward
+  - left-backward
+  - left-forward
+  - right-backward
+  - right-forward
+segmenter:
+  _target_: src.model_wrappers.segmenters.sam3_wrapper.SAM3Wrapper
+  name: sam3
+  checkpoint_path: external_weights/sam3/sam3.pt
+  chunk_size: 2
+diffusion:
+  _target_: src.model_wrappers.diffusion.difix_wrapper.DifixWrapper
+  name: difix
+  model_id: nvidia/difix
+  default_timestep: 199
+seg_task:
+  prompt: car, motorcycle, pedestrian, truck, vehicle
+diff_task:
+  prompt: remove degradation
+  generate_videos: true
+gaussian_splatting:
+  render_traj_path: raw
+  data_factor: 1
+  port: 8080
+  batch_size: 1
+  steps_scaler: 1.0
+  max_steps: 30000
+  eval_steps:
+  - 7000
+  - 30000
+  save_steps:
+  - 7000
+  - 30000
+  near_plane: 0.01
+  far_plane: 10000000000.0
+  strategy_type: mcmc
+  packed: false
+  sparse_grad: false
+  visible_adam: false
+  depth_loss: false
+  test_every: 8
+  strategy:
+    cap_max: 1000000
+    min_opacity: 0.005
+scene_name: ${dataset.scene}
+exp_name: manual_debug_run
+mask_processing:
+  dilation_percentage: 0.2
+  dilate_ego: false

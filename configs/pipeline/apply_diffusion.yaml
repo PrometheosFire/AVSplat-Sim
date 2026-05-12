@@ -1,0 +1,7 @@
+# configs/pipeline/apply_diffusion.yaml
+
+# The prompt driving the diffusion process
+prompt: "remove degradation"
+
+# Whether to stitch the cleaned frames back into a video for each camera
+generate_videos: true

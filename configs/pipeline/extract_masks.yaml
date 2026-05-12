@@ -1,2 +1,2 @@
 # This matches the prompt argument in extract_masks(self, input_dir, output_dir, prompt):
-prompt: "cars, vehicles, pedestrians" 
+prompt: "car, motorcycle, pedestrian, truck, vehicle"
