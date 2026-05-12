@@ -58,7 +58,7 @@ def main(cfg: DictConfig):
                 sam_mask_standard = cv2.bitwise_not(sam_mask)
 
                 # 2. Load Ego Mask 
-                if os.path.exists(ego_path):
+                if os.path.exists(ego_path) and cfg.mask_processing.use_ego_masks:
                     ego_mask_raw = cv2.imread(ego_path, cv2.IMREAD_GRAYSCALE)
                     # 🔄 INVERT EGO MASK: Make Ego=255 (White), Background=0 (Black)
                     ego_mask = cv2.bitwise_not(ego_mask_raw)

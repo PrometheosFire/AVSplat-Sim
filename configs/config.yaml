@@ -22,5 +22,6 @@ hydra:
     dir: results/manual_runs/${dataset.name}/${scene_name}/${exp_name}_${now:%m%d_%H%M}
 
 mask_processing:
-  dilation_percentage: 0.2
+  use_ego_masks: true
   dilate_ego: false
+  dilation_percentage: 0.2

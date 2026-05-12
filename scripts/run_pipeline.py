@@ -71,7 +71,7 @@ def main(cfg: DictConfig):
     # ==========================================
     
     # 1. Create a unique hash for the Fusion step
-    fuse_config_str = f"{masks_dir}_{cfg.mask_processing.dilation_percentage}_{cfg.mask_processing.dilate_ego}"
+    fuse_config_str = f"{masks_dir}_{cfg.mask_processing.dilation_percentage}_{cfg.mask_processing.dilate_ego}_{cfg.mask_processing.use_ego_masks}"
     fuse_hash = hashlib.md5(fuse_config_str.encode()).hexdigest()[:8]
     
     # Define the new, isolated output directory
