@@ -25,6 +25,11 @@ near_plane: 0.01
 # Far plane clipping distance
 far_plane: 1e10
 
+# Opacity regularization — pushes unsupervised Gaussians toward transparency
+opacity_reg: 0.01
+# Scale regularization — prevents Gaussians from growing too large
+scale_reg: 0.01
+
 # Strategy for GS densification, "default" or "mcmc"
 strategy_type: "mcmc"  
 
@@ -39,7 +44,7 @@ visible_adam: false
 depth_loss: false
 
 # Every N images there is a test image 
-test_every: 8
+test_every: 4
 
 
 strategy:

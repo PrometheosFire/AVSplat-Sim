@@ -179,45 +179,114 @@ def main(cfg: DictConfig):
                 
             print(f"\n Gaussian Splatting Training complete.")
             print(f"📂 Results saved to: {gsplat_workspace_dir}")
-            
-            
+
+    # ==========================================
+    # STEP 4.5: Standalone Rendering with Trajectory Shifts
+    # ==========================================
+
+    rendering_cfg = OmegaConf.to_container(cfg.rendering, resolve=True)
+
+    # Build hash from rendering config + gsplat workspace
+    render_config_str = f"render_{gsplat_workspace_dir}_{rendering_cfg}"
+    render_hash = hashlib.md5(render_config_str.encode()).hexdigest()[:8]
+
+    render_workspace_dir = os.path.abspath(os.path.join(base_results_dir, f"045_rendered_{render_hash}"))
+    master_render_success = os.path.join(render_workspace_dir, ".success")
+
+    if os.path.exists(master_render_success):
+        print(f"⏭️ Skipping Step 4.5: Rendering already completed for this config at {render_workspace_dir}")
+    else:
+        print(f"\n🚀 Running Step 4.5: Standalone Rendering with Trajectory Shifts...")
+
+        render_script_path = os.path.abspath("src/gsplat_training/render_standalone.py")
+
+        # Find the PLY file from training (use the highest-step ply)
+        ply_dir = os.path.join(gsplat_workspace_dir, "ply")
+        if os.path.exists(ply_dir):
+            def _ply_step(fname):
+                try:
+                    return int(fname.replace("point_cloud_", "").replace(".ply", ""))
+                except ValueError:
+                    return -1
+            ply_files = sorted(
+                [f for f in os.listdir(ply_dir) if f.endswith(".ply")],
+                key=_ply_step,
+            )
+        else:
+            ply_files = []
+        if ply_files:
+            ply_path = os.path.join(ply_dir, ply_files[-1])  # Use the latest
+        else:
+            # Fallback to checkpoint
+            ckpt_dir = os.path.join(gsplat_workspace_dir, "ckpts")
+            ckpt_files = sorted([f for f in os.listdir(ckpt_dir) if f.endswith(".pt")]) if os.path.exists(ckpt_dir) else []
+            if ckpt_files:
+                ply_path = None
+                checkpoint_path = os.path.join(ckpt_dir, ckpt_files[-1])
+            else:
+                raise RuntimeError(f"No PLY or checkpoint found in {gsplat_workspace_dir}")
+
+        # Camera paths from training
+        camera_paths_dir = os.path.join(gsplat_workspace_dir, "camera_paths")
+
+        # Build subprocess command
+        render_cmd = [
+            python_exec,
+            render_script_path,
+            f"hydra.run.dir={render_workspace_dir}",
+            f"++rendering.camera_paths_dir={camera_paths_dir}",
+            f"++rendering.output_dir={render_workspace_dir}",
+        ]
+
+        if ply_files:
+            render_cmd.append(f"++rendering.ply_path={ply_path}")
+        else:
+            render_cmd.append(f"++rendering.checkpoint_path={checkpoint_path}")
+
+        render_cmd.extend(overrides)
+
+        subprocess.run(render_cmd, env=env, check=True)
+
+        print(f"\n✅ Standalone Rendering complete.")
+        print(f"📂 Rendered frames saved to: {render_workspace_dir}")
+
     # ==========================================
     # STEP 5: Diffusion Post-Processing (Difix3D+)
     # ==========================================
-    
+
     diffusion_cfg = OmegaConf.to_container(cfg.diffusion, resolve=True)
     diff_task_cfg = OmegaConf.to_container(cfg.diff_task, resolve=True)
-    
-    diff_config_str = f"diff_{gsplat_workspace_dir}_{diffusion_cfg}_{diff_task_cfg}"
+
+    # Include render workspace in hash so diffusion re-runs when renders change
+    diff_config_str = f"diff_{render_workspace_dir}_{diffusion_cfg}_{diff_task_cfg}"
     diff_hash = hashlib.md5(diff_config_str.encode()).hexdigest()[:8]
-    
-    # 2. Define the isolated output directory for this specific cleanup run
+
     difix_workspace_dir = os.path.abspath(os.path.join(base_results_dir, f"05_difix_cleaned_{diff_hash}"))
     master_difix_success = os.path.join(difix_workspace_dir, ".success")
 
     if os.path.exists(master_difix_success):
-            print(f"⏭️ Skipping Step 5: Diffusion already completed for this config at {difix_workspace_dir}")
+        print(f"⏭️ Skipping Step 5: Diffusion already completed for this config at {difix_workspace_dir}")
     else:
-            print(f"\n🚀 Running Step 5: Diffusion Post-Processing...")
-            
-            difix_script_path = os.path.abspath("src/post_processing/apply_diffusion.py")
-            
-            # Note: We reuse the gsplat python environment because Difix is installed there!
-            subprocess.run([
-                python_exec, 
-                difix_script_path, 
-                f"++diff_task.output_dir={difix_workspace_dir}",          # Force the output directory
-                f"++gaussian_splatting.result_dir={gsplat_workspace_dir}",  # Tell it where the renders are
-                cam_override,
-                *overrides
-            ], env=env, check=True)
-            
-            # The Orchestrator stamps the run as successful
-            with open(master_difix_success, "w") as f:
-                f.write("Diffusion post-processing completed successfully.")
-                
-            print(f"\n🎉 Veni, Vidi, Vici! Diffusion Post-Processing complete.")
-            print(f"📂 Cleaned renders saved to: {difix_workspace_dir}")
+        print(f"\n🚀 Running Step 5: Diffusion Post-Processing...")
+
+        difix_script_path = os.path.abspath("src/post_processing/apply_diffusion.py")
+
+        # Point to rendered frames from Step 4.5
+        subprocess.run([
+            python_exec,
+            difix_script_path,
+            f"++diff_task.output_dir={difix_workspace_dir}",
+            f"++gaussian_splatting.result_dir={render_workspace_dir}",  # Use Step 4.5 output
+            cam_override,
+            *overrides
+        ], env=env, check=True)
+
+        # The Orchestrator stamps the run as successful
+        with open(master_difix_success, "w") as f:
+            f.write("Diffusion post-processing completed successfully.")
+
+        print(f"\n🎉 Veni, Vidi, Vici! Diffusion Post-Processing complete.")
+        print(f"📂 Cleaned renders saved to: {difix_workspace_dir}")
     
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ defaults:
   - pipeline@diff_task: apply_diffusion   # Loads pipeline/apply_diffusion.yaml into cfg.diff_task
 
   - gaussian_splatting: train
+  - rendering@rendering: render   # Loads rendering/render.yaml into cfg.rendering
   - _self_
 
 scene_name: "${dataset.scene}"
@@ -24,4 +25,4 @@ hydra:
 mask_processing:
   use_ego_masks: true
   dilate_ego: false
-  dilation_percentage: 0.2
+  dilation_percentage: 0.1

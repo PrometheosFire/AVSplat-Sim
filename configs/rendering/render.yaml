@@ -1,0 +1,47 @@
+# Standalone rendering configuration
+# Used by render_standalone.py for rendering trained models with trajectory shifts
+
+# Model source (one of these must be provided)
+ply_path: null             # Path to .ply file (primary, lightweight)
+checkpoint_path: null      # Fallback for app_opt/post_processing
+
+# Camera metadata directory (output from training: camera_paths/)
+camera_paths_dir: null     # Required, set via override
+
+# Output directory for rendered frames
+output_dir: null           # Required, set via override
+
+# Filter which cameras to render (empty = all cameras)
+cameras_to_render: []
+
+# Trajectory transformations
+trajectory:
+  shifts:
+    # Original trajectory (no shift)
+    - name: "original"
+      x_m: 0.0   # lateral (+ right, - left)
+      y_m: 0.0   # vertical (+ down, - up)
+      z_m: 0.0   # longitudinal (+ forward, - backward)
+
+    # Example lateral shifts (lane changes)
+    - name: "left_0.5m"
+      x_m: -0.5
+      y_m: 0.0
+      z_m: 0.0
+
+    - name: "right_0.5m"
+      x_m: 0.5
+      y_m: 0.0
+      z_m: 0.0
+
+  # Path interpolation mode (not yet implemented in standalone renderer)
+  # Options: raw, interp, ellipse, spiral
+  path_mode: "raw"
+
+# Rendering parameters
+render:
+  sh_degree: 3
+  near_plane: 0.01
+  far_plane: 1e10
+  save_video: true
+  fps: 30

@@ -1166,7 +1166,6 @@ class Runner:
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
-                self.render_traj(step)
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1184,6 +1183,21 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+        # Save camera metadata at the end of training for standalone rendering
+        self.save_camera_metadata()
+
+    def save_camera_metadata(self) -> None:
+        """Save per-camera pose sequences and metadata for standalone rendering.
+
+        This method groups frames by camera and saves complete metadata including
+        intrinsics and distortion coefficients. Called at the end of training to
+        enable standalone rendering without re-parsing the dataset.
+        """
+        print("Saving camera metadata for standalone rendering...")
+        frames_by_camera = self._group_frames_by_camera()
+        self._save_camera_paths(frames_by_camera)
+        print(f"Camera metadata saved to {self.cfg.result_dir}/camera_paths/")
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -1487,19 +1501,108 @@ class Runner:
         self,
         frames_by_camera: Dict[int, List[np.ndarray]],
     ) -> None:
-        """Save original per-camera pose sequences under result_dir/camera_paths."""
+        """Save per-camera pose sequences and metadata under result_dir/camera_paths.
+
+        For each camera, saves:
+        - camtoworlds.npy: [N, 4, 4] pose matrices
+        - camtoworlds.json: same as JSON (legacy format)
+        - camera_data.json: complete metadata including intrinsics and distortion
+        """
         camera_paths_root = os.path.join(self.cfg.result_dir, "camera_paths")
         os.makedirs(camera_paths_root, exist_ok=True)
 
+        # Build mapping from internal index to camera ID
+        idx_to_camera_id = None
+        if hasattr(self.parser, "camera_id_to_idx"):
+            idx_to_camera_id = {v: k for k, v in self.parser.camera_id_to_idx.items()}
+
         for cam_idx, frames in frames_by_camera.items():
-            cam_dir = os.path.join(camera_paths_root, f"camera{cam_idx}")
+            # Determine camera ID and directory name
+            if hasattr(self.parser, "camera_ids") and 0 <= cam_idx < len(self.parser.camera_ids):
+                camera_id = self.parser.camera_ids[cam_idx]
+            elif idx_to_camera_id is not None:
+                camera_id = idx_to_camera_id[cam_idx]
+            else:
+                camera_id = str(cam_idx)
+
+            safe_cam_name = str(camera_id).replace("/", "_")
+            cam_dir = os.path.join(camera_paths_root, safe_cam_name)
             os.makedirs(cam_dir, exist_ok=True)
 
+            # Save poses
             c2ws = np.stack(frames, axis=0)
             np.save(os.path.join(cam_dir, "camtoworlds.npy"), c2ws)
 
+            # Legacy JSON format (poses only)
             with open(os.path.join(cam_dir, "camtoworlds.json"), "w") as f:
                 json.dump({"camtoworlds": c2ws.tolist()}, f)
+
+            # Build complete camera metadata
+            camera_data = {
+                "camera_id": camera_id,
+                "camera_index": cam_idx,
+                "camtoworlds": c2ws.tolist(),
+            }
+
+            # Save the normalization scale so the renderer can convert real-meter shifts
+            if hasattr(self.parser, "transform") and self.parser.transform is not None:
+                norm_scale = float(np.linalg.norm(self.parser.transform[:3, 0]))
+                camera_data["world_to_normalized_scale"] = norm_scale
+
+            # Add intrinsics if available
+            camera_key = camera_id if camera_id in self.parser.Ks_dict else cam_idx
+            if hasattr(self.parser, "Ks_dict") and camera_key in self.parser.Ks_dict:
+                K = self.parser.Ks_dict[camera_key]
+                width, height = self.parser.imsize_dict[camera_key]
+                camera_data["intrinsics"] = {
+                    "K": K.tolist() if isinstance(K, np.ndarray) else K,
+                    "width": int(width),
+                    "height": int(height),
+                }
+
+            # Add distortion coefficients if available (NCore datasets)
+            if hasattr(self.parser, "camera_render_data") and camera_id in self.parser.camera_render_data:
+                render_data = self.parser.camera_render_data[camera_id]
+                distortion = {
+                    "camera_model": render_data.camera_model,
+                }
+
+                # Serialize radial coefficients
+                if render_data.radial_coeffs is not None:
+                    distortion["radial_coeffs"] = render_data.radial_coeffs.tolist()
+                else:
+                    distortion["radial_coeffs"] = None
+
+                # Serialize tangential coefficients
+                if render_data.tangential_coeffs is not None:
+                    distortion["tangential_coeffs"] = render_data.tangential_coeffs.tolist()
+                else:
+                    distortion["tangential_coeffs"] = None
+
+                # Serialize thin prism coefficients
+                if render_data.thin_prism_coeffs is not None:
+                    distortion["thin_prism_coeffs"] = render_data.thin_prism_coeffs.tolist()
+                else:
+                    distortion["thin_prism_coeffs"] = None
+
+                # Serialize ftheta coefficients (complex structure)
+                if render_data.ftheta_coeffs is not None:
+                    ftheta = render_data.ftheta_coeffs
+                    distortion["ftheta_coeffs"] = {
+                        "reference_poly": ftheta.reference_poly.name if hasattr(ftheta.reference_poly, "name") else str(ftheta.reference_poly),
+                        "pixeldist_to_angle_poly": list(ftheta.pixeldist_to_angle_poly),
+                        "angle_to_pixeldist_poly": list(ftheta.angle_to_pixeldist_poly),
+                        "max_angle": ftheta.max_angle,
+                        "linear_cde": list(ftheta.linear_cde),
+                    }
+                else:
+                    distortion["ftheta_coeffs"] = None
+
+                camera_data["distortion"] = distortion
+
+            # Save complete camera metadata
+            with open(os.path.join(cam_dir, "camera_data.json"), "w") as f:
+                json.dump(camera_data, f, indent=2)
 
     def _render_single_camera_trajectory(
         self,
@@ -1891,7 +1994,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
                 runner.post_processing_module.load_state_dict(pp_state)
         step = ckpts[0]["step"]
         runner.eval(step=step)
-        runner.render_traj(step=step)
+        runner.save_camera_metadata()  # Save metadata for standalone rendering
         if cfg.compression is not None:
             runner.run_compression(step=step)
     else:
