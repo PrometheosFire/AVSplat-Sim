@@ -348,13 +348,13 @@ class StandaloneRenderer:
             List of saved frame paths
         """
         safe_cam_name = str(camera.camera_id).replace("/", "_")
-        frames_dir = os.path.join(output_dir, "frames", safe_cam_name, shift_name)
+        frames_dir = os.path.join(output_dir, "frames", shift_name, safe_cam_name)
         os.makedirs(frames_dir, exist_ok=True)
 
         frame_paths = []
         video_frames = []
 
-        desc = f"Rendering {safe_cam_name}/{shift_name}"
+        desc = f"Rendering {shift_name}/{safe_cam_name}"
         for i in tqdm.trange(len(camtoworlds), desc=desc):
             frame = self.render_frame(
                 camtoworld=camtoworlds[i],
@@ -377,7 +377,7 @@ class StandaloneRenderer:
         if save_video:
             video_dir = os.path.join(output_dir, "videos")
             os.makedirs(video_dir, exist_ok=True)
-            video_path = os.path.join(video_dir, f"{safe_cam_name}_{shift_name}.mp4")
+            video_path = os.path.join(video_dir, f"{shift_name}_{safe_cam_name}.mp4")
             imageio.mimwrite(video_path, video_frames, fps=fps)
             print(f"Video saved to {video_path}")
 
@@ -401,8 +401,29 @@ def load_all_cameras(camera_paths_dir: str) -> List[CameraMetadata]:
     return cameras
 
 
+def _shift_name(x: float, y: float, z: float) -> str:
+    """Auto-generate a filename-safe name from shift values.
+
+    Examples: (0,0,0) -> "original", (-0.5,0,0) -> "X_-0.5", (0.5,0,-1) -> "X_0.5_Z_-1"
+    Dots in decimals are kept (valid on Linux/macOS/Windows file systems).
+    """
+    if abs(x) < 1e-9 and abs(y) < 1e-9 and abs(z) < 1e-9:
+        return "original"
+    parts = []
+    for axis, val in (("X", x), ("Y", y), ("Z", z)):
+        if abs(val) > 1e-9:
+            # Format: strip trailing zeros, e.g. 0.50 -> 0.5, 1.0 -> 1
+            formatted = f"{val:g}"
+            parts.append(f"{axis}_{formatted}")
+    return "_".join(parts)
+
+
 def parse_shifts_from_config(cfg: DictConfig) -> List[TrajectoryShift]:
     """Parse trajectory shifts from Hydra config.
+
+    Accepts either:
+    - List of [x, y, z] vectors (names auto-generated)
+    - Legacy list of {name, x_m, y_m, z_m} dicts
 
     Args:
         cfg: Hydra config with trajectory.shifts list
@@ -411,15 +432,20 @@ def parse_shifts_from_config(cfg: DictConfig) -> List[TrajectoryShift]:
         List of TrajectoryShift objects
     """
     shifts = []
-    for shift_cfg in cfg.trajectory.shifts:
-        shifts.append(
-            TrajectoryShift(
-                name=shift_cfg.name,
-                x_m=shift_cfg.get("x_m", 0.0),
-                y_m=shift_cfg.get("y_m", 0.0),
-                z_m=shift_cfg.get("z_m", 0.0),
+    for entry in cfg.trajectory.shifts:
+        if isinstance(entry, (list, tuple)) or hasattr(entry, "__iter__") and not hasattr(entry, "keys"):
+            x, y, z = float(entry[0]), float(entry[1]), float(entry[2])
+            shifts.append(TrajectoryShift(name=_shift_name(x, y, z), x_m=x, y_m=y, z_m=z))
+        else:
+            # Legacy dict format
+            shifts.append(
+                TrajectoryShift(
+                    name=entry.name,
+                    x_m=float(entry.get("x_m", 0.0)),
+                    y_m=float(entry.get("y_m", 0.0)),
+                    z_m=float(entry.get("z_m", 0.0)),
+                )
             )
-        )
     return shifts
 
 

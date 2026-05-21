@@ -15,28 +15,17 @@ output_dir: null           # Required, set via override
 cameras_to_render: []
 
 # Trajectory transformations
+# Each shift is [x_m, y_m, z_m] in real-world meters:
+#   x: lateral  (+ right, - left)
+#   y: vertical (+ down,  - up)
+#   z: longitudinal (+ forward, - backward)
+# Names are auto-generated: [0.5,0,0] -> "X_0.5", [-0.5,0,0] -> "X_-0.5"
+# All-zero entry -> "original"
 trajectory:
   shifts:
-    # Original trajectory (no shift)
-    - name: "original"
-      x_m: 0.0   # lateral (+ right, - left)
-      y_m: 0.0   # vertical (+ down, - up)
-      z_m: 0.0   # longitudinal (+ forward, - backward)
-
-    # Example lateral shifts (lane changes)
-    - name: "left_0.5m"
-      x_m: -0.5
-      y_m: 0.0
-      z_m: 0.0
-
-    - name: "right_0.5m"
-      x_m: 0.5
-      y_m: 0.0
-      z_m: 0.0
-
-  # Path interpolation mode (not yet implemented in standalone renderer)
-  # Options: raw, interp, ellipse, spiral
-  path_mode: "raw"
+    - [0, 0, 0]
+    - [-3, 0, 0]
+    - [3, 0, 0]
 
 # Rendering parameters
 render:

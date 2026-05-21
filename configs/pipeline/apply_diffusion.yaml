@@ -5,3 +5,8 @@ prompt: "remove degradation"
 
 # Whether to stitch the cleaned frames back into a video for each camera
 generate_videos: true
+
+# Cameras to run diffusion on (matched against folder names in frames/{shift}/).
+# Empty list = all cameras. Default: front camera only to save time.
+cameras_to_process:
+  - "camera1"
