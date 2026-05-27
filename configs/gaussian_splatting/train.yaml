@@ -44,7 +44,7 @@ visible_adam: false
 depth_loss: false
 
 # Every N images there is a test image 
-test_every: 4
+test_every: 16
 
 
 strategy:

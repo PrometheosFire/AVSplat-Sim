@@ -24,13 +24,15 @@ if str(difix_submodule_path) not in sys.path:
 from pipeline_difix import DifixPipeline
 
 class DifixWrapper(BaseDiffusionModel):
-    def __init__(self, model_id: str = "nvidia/difix", name: str = "difix", torch_dtype=torch.float16, default_timestep: int = 199):
+    def __init__(self, model_id: str = "nvidia/difix", name: str = "difix", torch_dtype=torch.float16, default_timestep: int = 199, max_width: int = 1280, max_height: int = 720):
         """
         Initializes the Difix3D+ model once when the class is instantiated.
         """
         self.model_id = model_id
         self.name = name
-        self.default_timestep = default_timestep # Store it in the class state
+        self.default_timestep = default_timestep
+        self.max_width = max_width
+        self.max_height = max_height
         print(f"Initializing {self.name} Wrapper from {self.model_id} (Default Timestep/Noise: {self.default_timestep})...")
         
         self.pipe = DifixPipeline.from_pretrained(
@@ -78,14 +80,16 @@ class DifixWrapper(BaseDiffusionModel):
                     save_path = out_path / rel_path
                     save_path.parent.mkdir(parents=True, exist_ok=True)
                     
-                    # Keeping original resolution, ensuring divisible by 8 for the VAE
                     input_image = load_image(str(img_path))
-                    #w, h = input_image.size
-                    #w, h = (w // 8) * 8, (h // 8) * 8
-                    #input_image = input_image.resize((w, h))
-                    
-                    # 2. Downscale to 720p for the 8GB GPU limits
-                    input_image = input_image.resize((1280, 720))
+                    w, h = input_image.size
+                    scale = min(self.max_width / w, self.max_height / h)
+                    if scale < 1.0:
+                        # Snap to nearest multiple of 8 (VAE requirement)
+                        new_w = (int(w * scale) // 8) * 8
+                        new_h = (int(h * scale) // 8) * 8
+                        input_image = input_image.resize((new_w, new_h))
+                    elif (w % 8 != 0) or (h % 8 != 0):
+                        input_image = input_image.resize((w // 8 * 8, h // 8 * 8))
                     
                     output = self.pipe(
                         prompt, 

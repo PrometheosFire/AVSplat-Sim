@@ -5,3 +5,9 @@ model_id: "nvidia/difix"
 
 # The default noise level (199 is recommended for Difix3D+)
 default_timestep: 199
+
+# Maximum resolution the model/GPU can handle. Frames larger than this are
+# downscaled to fit; smaller frames are kept as-is (no upscaling).
+# Dimensions are snapped to the nearest multiple of 8 (VAE requirement).
+max_width: 1280
+max_height: 720
