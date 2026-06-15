@@ -40,6 +40,11 @@ sparse_grad: false
 # Use visible adam from Taming 3DGS. (experimental)
 visible_adam: false
 
+# Initialization strategy: "sfm" (COLMAP/lidar points), "random" (random volume)
+init_type: "sfm"
+# Number of random points (only used when init_type=random)
+init_num_pts: 100_001
+
 # Enable depth loss. (experimental)
 depth_loss: false
 

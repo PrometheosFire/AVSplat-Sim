@@ -303,6 +303,32 @@ class NCoreParser:
         dists = np.linalg.norm(camera_locations - scene_center, axis=1)
         self.scene_scale = float(np.max(dists))
 
+        # Load point visibility for depth supervision (optional).
+        self.depth_points: Optional[np.ndarray] = None
+        self.depth_visibility: Optional[Dict[str, Any]] = None
+        vis_path = self.sequence_meta_file_path.parent / "point_visibility.npz"
+        if vis_path.exists():
+            vis_data = np.load(str(vis_path))
+            depth_points = vis_data["points_3d"].astype(np.float64)
+            # Apply the same normalization transform used for cameras/lidar
+            if self.normalize_world_space and hasattr(self, "transform"):
+                depth_points = transform_points(self.transform, depth_points)
+            self.depth_points = depth_points.astype(np.float32)
+            # Store per-camera offsets and indices
+            self.depth_visibility = {}
+            for camera_id in self.camera_ids:
+                offsets_key = f"{camera_id}_offsets"
+                indices_key = f"{camera_id}_indices"
+                if offsets_key in vis_data and indices_key in vis_data:
+                    self.depth_visibility[camera_id] = {
+                        "offsets": vis_data[offsets_key],
+                        "indices": vis_data[indices_key],
+                    }
+            print(f"[NCoreParser] Loaded depth visibility: {len(self.depth_points)} points, "
+                  f"{len(self.depth_visibility)} cameras")
+        else:
+            print("[NCoreParser] No point_visibility.npz found — depth loss unavailable")
+
         print(
             f"[NCoreParser] Loaded sequence '{self.sequence_id}': "
             f"{len(self.frame_list)} frames across {self.num_cameras} cameras, "
@@ -955,9 +981,11 @@ class NCoreDataset(torch.utils.data.Dataset):
         self,
         parser: NCoreParser,
         split: str = "train",
+        load_depths: bool = False,
     ) -> None:
         self.parser = parser
         self.split = split
+        self.load_depths = load_depths
 
         # Build train/val split indices over the flat frame list.
         all_indices = np.arange(len(parser.frame_list))
@@ -1115,5 +1143,43 @@ class NCoreDataset(torch.utils.data.Dataset):
 
         if valid_mask is not None:
             data["mask"] = torch.from_numpy(valid_mask).bool()
+
+        # Depth supervision: project visible COLMAP points into this frame
+        if self.load_depths and self.parser.depth_points is not None:
+            vis = self.parser.depth_visibility
+            if vis and camera_id in vis:
+                cam_vis = vis[camera_id]
+                offsets = cam_vis["offsets"]
+                indices = cam_vis["indices"]
+                # frame_idx is the NCore sensor frame index; use it directly as offset index
+                if frame_idx < len(offsets) - 1:
+                    start = offsets[frame_idx]
+                    end = offsets[frame_idx + 1]
+                    if end > start:
+                        point_indices = indices[start:end]
+                        points_world = self.parser.depth_points[point_indices]
+
+                        camtoworld = self.parser.camtoworlds[index]
+                        worldtocam = np.linalg.inv(camtoworld)
+                        K = self.parser.Ks_dict[camera_id]
+
+                        points_cam = (worldtocam[:3, :3] @ points_world.T + worldtocam[:3, 3:4]).T
+                        points_proj = (K @ points_cam.T).T
+                        points_2d = points_proj[:, :2] / points_proj[:, 2:3]
+                        depths = points_cam[:, 2]
+
+                        # Filter to visible points (in front of camera + inside image)
+                        valid = (
+                            (depths > 0)
+                            & (points_2d[:, 0] >= 0)
+                            & (points_2d[:, 0] < width)
+                            & (points_2d[:, 1] >= 0)
+                            & (points_2d[:, 1] < height)
+                        )
+                        points_2d = points_2d[valid]
+                        depths = depths[valid]
+
+                        data["points"] = torch.from_numpy(points_2d).float()
+                        data["depths"] = torch.from_numpy(depths).float()
 
         return data

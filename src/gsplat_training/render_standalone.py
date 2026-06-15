@@ -205,19 +205,21 @@ def load_splats_from_ply(ply_path: str, device: str = "cuda") -> Dict[str, torch
 
 def load_splats_from_checkpoint(
     ckpt_path: str, device: str = "cuda"
-) -> Dict[str, torch.Tensor]:
-    """Load Gaussian parameters from a checkpoint file.
+) -> Tuple[Dict[str, torch.Tensor], Optional[dict]]:
+    """Load Gaussian parameters and optional post-processing from a checkpoint.
 
     Args:
         ckpt_path: Path to the .pt checkpoint file
         device: Target device for tensors
 
     Returns:
-        Dictionary containing Gaussian parameters
+        Tuple of (splats dict, post_processing state dict or None)
     """
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     splats = ckpt["splats"]
-    return {k: v.to(device) for k, v in splats.items()}
+    splats = {k: v.to(device) for k, v in splats.items()}
+    pp_state = ckpt.get("post_processing", None)
+    return splats, pp_state
 
 
 class StandaloneRenderer:
@@ -231,6 +233,7 @@ class StandaloneRenderer:
         far_plane: float = 1e10,
         with_ut: bool = True,
         with_eval3d: bool = True,
+        ppisp_state: Optional[dict] = None,
         device: str = "cuda",
     ):
         self.splats = splats
@@ -240,6 +243,18 @@ class StandaloneRenderer:
         self.with_ut = with_ut
         self.with_eval3d = with_eval3d
         self.device = device
+
+        self.ppisp_module = None
+        if ppisp_state is not None:
+            try:
+                from ppisp import PPISP
+                self.ppisp_module = PPISP.from_state_dict(ppisp_state)
+                self.ppisp_module.to(device)
+                self.ppisp_module.eval()
+                print(f"PPISP loaded: {self.ppisp_module.num_cameras} cameras, "
+                      f"{self.ppisp_module.num_frames} frames")
+            except ImportError:
+                print("WARNING: ppisp package not available — rendering without post-processing")
 
     @torch.no_grad()
     def render_frame(
@@ -253,6 +268,7 @@ class StandaloneRenderer:
         tangential_coeffs: Optional[np.ndarray] = None,
         thin_prism_coeffs: Optional[np.ndarray] = None,
         ftheta_coeffs: Optional[FThetaCameraDistortionParameters] = None,
+        camera_idx: Optional[int] = None,
     ) -> np.ndarray:
         """Render a single frame.
 
@@ -266,6 +282,7 @@ class StandaloneRenderer:
             tangential_coeffs: Tangential distortion coefficients
             thin_prism_coeffs: Thin prism distortion coefficients
             ftheta_coeffs: F-theta camera parameters
+            camera_idx: Integer camera index for PPISP (None disables per-camera effects)
 
         Returns:
             Rendered RGB image as uint8 numpy array [H, W, 3]
@@ -320,8 +337,26 @@ class StandaloneRenderer:
             thin_prism_coeffs=thin_prism,
         )
 
-        # Convert to numpy
-        colors_np = render_colors[0, ..., :3].clamp(0, 1).cpu().numpy()
+        # Apply PPISP post-processing if available
+        if self.ppisp_module is not None and camera_idx is not None:
+            rgb = render_colors[0, ..., :3]  # [H, W, 3]
+            pixel_x = torch.arange(width, device=self.device).float()
+            pixel_y = torch.arange(height, device=self.device).float()
+            pixel_coords = torch.stack(
+                torch.meshgrid(pixel_x, pixel_y, indexing="xy"), dim=-1
+            )  # [H, W, 2]
+            rgb = self.ppisp_module(
+                rgb=rgb,
+                pixel_coords=pixel_coords,
+                resolution=(width, height),
+                camera_idx=camera_idx,
+                frame_idx=None,
+                exposure_prior=None,
+            )
+            colors_np = rgb.clamp(0, 1).cpu().numpy()
+        else:
+            colors_np = render_colors[0, ..., :3].clamp(0, 1).cpu().numpy()
+
         colors_np = (colors_np * 255).astype(np.uint8)
         return colors_np
 
@@ -333,6 +368,7 @@ class StandaloneRenderer:
         shift_name: str = "original",
         save_video: bool = True,
         fps: int = 30,
+        camera_idx: Optional[int] = None,
     ) -> List[str]:
         """Render a full camera trajectory.
 
@@ -343,6 +379,7 @@ class StandaloneRenderer:
             shift_name: Name of the shift configuration
             save_video: Whether to save an MP4 video
             fps: Video frame rate
+            camera_idx: Integer camera index for PPISP post-processing
 
         Returns:
             List of saved frame paths
@@ -366,6 +403,7 @@ class StandaloneRenderer:
                 tangential_coeffs=camera.tangential_coeffs,
                 thin_prism_coeffs=camera.thin_prism_coeffs,
                 ftheta_coeffs=camera.ftheta_coeffs,
+                camera_idx=camera_idx,
             )
 
             frame_path = os.path.join(frames_dir, f"frame_{i:05d}.png")
@@ -470,12 +508,13 @@ def main(cfg: DictConfig):
     print(f"Using device: {device}")
 
     # Load Gaussians
+    ppisp_state = None
     if ply_path and os.path.exists(ply_path):
         print(f"Loading Gaussians from PLY: {ply_path}")
         splats = load_splats_from_ply(ply_path, device)
     elif checkpoint_path and os.path.exists(checkpoint_path):
         print(f"Loading Gaussians from checkpoint: {checkpoint_path}")
-        splats = load_splats_from_checkpoint(checkpoint_path, device)
+        splats, ppisp_state = load_splats_from_checkpoint(checkpoint_path, device)
     else:
         raise ValueError(
             "Either ply_path or checkpoint_path must be specified and exist"
@@ -506,6 +545,7 @@ def main(cfg: DictConfig):
         far_plane=render_cfg.get("render", {}).get("far_plane", 1e10),
         with_ut=render_cfg.get("render", {}).get("with_ut", True),
         with_eval3d=render_cfg.get("render", {}).get("with_eval3d", True),
+        ppisp_state=ppisp_state,
         device=device,
     )
 
@@ -535,6 +575,7 @@ def main(cfg: DictConfig):
                 shift_name=shift.name,
                 save_video=render_cfg.get("render", {}).get("save_video", True),
                 fps=render_cfg.get("render", {}).get("fps", 30),
+                camera_idx=camera.camera_index,
             )
 
     # Write success marker

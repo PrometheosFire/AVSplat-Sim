@@ -286,7 +286,7 @@ class Runner:
                 masks_component_group=cfg.ncore_masks_component_group,
                 normalize_world_space=cfg.normalize_world_space,
             )
-            self.trainset = NCoreDataset(self.parser, split="train")
+            self.trainset = NCoreDataset(self.parser, split="train", load_depths=cfg.depth_loss)
             self.valset = NCoreDataset(self.parser, split="val")
             self.ncore_camera_data = [
                 self.parser.camera_render_data[cam_id]
@@ -860,8 +860,14 @@ class Runner:
                 data["exposure"].to(device) if "exposure" in data else None
             )  # [B,]
             if cfg.depth_loss:
-                points = data["points"].to(device)  # [1, M, 2]
-                depths_gt = data["depths"].to(device)  # [1, M]
+                if "points" in data and "depths" in data:
+                    points = data["points"].to(device)  # [1, M, 2]
+                    depths_gt = data["depths"].to(device)  # [1, M]
+                    points_px = points.clone()  # preserve pixel coords for debug viz
+                else:
+                    points = None
+                    depths_gt = None
+                    points_px = None
 
             height, width = pixels.shape[1:3]
 
@@ -928,8 +934,8 @@ class Runner:
             )
             # Loss = (1 - ssim_lambda) * L1 + ssim_lambda * (1 - SSIM)
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
-            if cfg.depth_loss:
-                # query depths from depth map
+            if cfg.depth_loss and points is not None and depths_gt is not None:
+                # query rendered depths at COLMAP point locations
                 points = torch.stack(
                     [
                         points[:, :, 0] / (width - 1) * 2 - 1,
@@ -942,11 +948,16 @@ class Runner:
                     depths.permute(0, 3, 1, 2), grid, align_corners=True
                 )  # [1, 1, M, 1]
                 depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))    # Disparity is the inverse of depth. We compute loss in disparity space because it emphasizes errors in closer objects,
-                disp_gt = 1.0 / depths_gt  # [1, M]                                         #  which are more perceptually significant and often more important for downstream tasks.
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
-                loss += depthloss * cfg.depth_lambda
+                # only supervise where Gaussians actually render (depth > 0)
+                # and GT depth is not too close (prevents extreme disparities)
+                valid_depth_mask = (depths > 0.0) & (depths_gt > 0.1)
+                if valid_depth_mask.sum() > 0:
+                    disp = 1.0 / depths[valid_depth_mask]
+                    disp_gt = 1.0 / depths_gt[valid_depth_mask]
+                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                    loss += depthloss * cfg.depth_lambda
+                else:
+                    depthloss = torch.tensor(0.0, device=device)
             if cfg.post_processing == "bilateral_grid":
                 post_processing_reg_loss = 10 * total_variation_loss(
                     self.post_processing_module.grids
@@ -967,7 +978,7 @@ class Runner:
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
-            if cfg.depth_loss:
+            if cfg.depth_loss and points is not None:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
@@ -992,7 +1003,7 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
-                if cfg.depth_loss:
+                if cfg.depth_loss and points is not None:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.post_processing is not None:
                     self.writer.add_scalar(
@@ -1004,6 +1015,18 @@ class Runner:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
+                if cfg.depth_loss and points_px is not None:
+                    depth_viz = (pixels[0].detach().cpu().numpy() * 255).astype(np.uint8).copy()
+                    pts = points_px[0].detach().cpu().numpy().astype(np.int32)
+                    for x, y in pts[:500]:
+                        if 0 <= x < width and 0 <= y < height:
+                            depth_viz[max(0,y-1):y+2, max(0,x-1):x+2] = [255, 0, 0]
+                    self.writer.add_image(
+                        "train/depth_points",
+                        depth_viz,
+                        step,
+                        dataformats="HWC",
+                    )
                 self.writer.flush()
 
             # save checkpoint before updating the model
@@ -1800,17 +1823,30 @@ class Runner:
             return
         print("Exporting PPISP reports...")
 
+        # Resolve per-frame camera indices (COLMAP vs NCore naming)
+        if hasattr(self.parser, "camera_indices"):
+            camera_idx_per_frame = self.parser.camera_indices
+        elif hasattr(self.parser, "camera_idx_per_frame"):
+            camera_idx_per_frame = self.parser.camera_idx_per_frame
+        else:
+            print("WARNING: Cannot export PPISP reports — no camera index mapping found")
+            return
+
         # Compute frames per camera from training dataset
         num_cameras = self.parser.num_cameras
         frames_per_camera = [0] * num_cameras
         for idx in self.trainset.indices:
-            cam_idx = self.parser.camera_indices[idx]
+            cam_idx = camera_idx_per_frame[idx]
             frames_per_camera[cam_idx] += 1
 
-        # Generate camera names from COLMAP camera IDs
-        # camera_id_to_idx maps COLMAP ID -> 0-based index
-        idx_to_camera_id = {v: k for k, v in self.parser.camera_id_to_idx.items()}
-        camera_names = [f"camera_{idx_to_camera_id[i]}" for i in range(num_cameras)]
+        # Generate camera names
+        if hasattr(self.parser, "camera_id_to_idx"):
+            idx_to_camera_id = {v: k for k, v in self.parser.camera_id_to_idx.items()}
+            camera_names = [f"camera_{idx_to_camera_id[i]}" for i in range(num_cameras)]
+        elif hasattr(self.parser, "camera_ids"):
+            camera_names = list(self.parser.camera_ids[:num_cameras])
+        else:
+            camera_names = [f"camera_{i}" for i in range(num_cameras)]
 
         # Export reports
         output_dir = Path(self.cfg.result_dir) / "ppisp_reports"

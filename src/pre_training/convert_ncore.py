@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import sys
 import hydra
+import numpy as np
 import pycolmap
 from hydra.core.hydra_config import HydraConfig
 from hydra.utils import to_absolute_path
@@ -133,6 +134,66 @@ def main(cfg: DictConfig):
         OmegaConf.save({"ncore_camera_ids": sorted_camera_names}, cam_list_path)
         
         print(f"\n✅ Saved {len(sorted_camera_names)} cameras in optimal order: {sorted_camera_names}")
+
+        # ==========================================
+        # 🎯 Extract Point Visibility for Depth Loss
+        # ==========================================
+        print("\n--- 🎯 Extracting COLMAP Point Visibility ---")
+
+        try:
+            sm = pycolmap.SceneManager(str(sparse_path_to_read))
+            sm.load_cameras()
+            sm.load_images()
+            sm.load_points3D()
+        except Exception:
+            sm = None
+
+        if sm is not None and sm.points3D is not None and len(sm.points3D) > 0:
+            INVALID_ID = np.iinfo(np.uint64).max
+            points_3d = sm.points3D.astype(np.float32)
+
+            # Group images by ncore camera name, sorted by filename (= timestamp order)
+            images_by_cam = {}
+            for _, image in sm.images.items():
+                ncore_cam = f"camera{image.camera_id}"
+                images_by_cam.setdefault(ncore_cam, []).append(image)
+
+            for cam in images_by_cam:
+                images_by_cam[cam].sort(key=lambda img: img.name)
+
+            # Build CSR-style visibility per camera:
+            # offsets[i] = start index for frame i, offsets[i+1] = end
+            # indices = concatenated point indices for all frames
+            save_dict = {"points_3d": points_3d}
+
+            for ncore_cam, images in images_by_cam.items():
+                offsets = [0]
+                all_indices = []
+
+                for image in images:
+                    point3d_ids = np.array(image.point3D_ids, dtype=np.uint64)
+                    valid_mask = point3d_ids != INVALID_ID
+                    valid_ids = point3d_ids[valid_mask]
+
+                    frame_indices = []
+                    for pid in valid_ids:
+                        pid_int = int(pid)
+                        if pid_int in sm.point3D_id_to_point3D_idx:
+                            frame_indices.append(sm.point3D_id_to_point3D_idx[pid_int])
+
+                    all_indices.extend(frame_indices)
+                    offsets.append(len(all_indices))
+
+                save_dict[f"{ncore_cam}_offsets"] = np.array(offsets, dtype=np.int32)
+                save_dict[f"{ncore_cam}_indices"] = np.array(all_indices, dtype=np.int32)
+                print(f"  {ncore_cam}: {len(images)} frames, {len(all_indices)} total visible points")
+
+            vis_path = os.path.join(final_output_dir, "point_visibility.npz")
+            np.savez_compressed(vis_path, **save_dict)
+            print(f"✅ Point visibility saved to {vis_path}")
+        else:
+            print("⚠️ Could not extract point visibility (no points3D found)")
+
         print(f"🎉 Conversion Worker Finished! Final ncore dataset ready at:\n{final_output_dir}")
         
         

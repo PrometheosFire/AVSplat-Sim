@@ -159,7 +159,7 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Post-processing method for appearance correction (experimental)
-    post_processing: Optional[Literal["bilateral_grid", "ppisp"]] = None
+    post_processing: Optional[Literal["bilateral_grid", "ppisp"]] = "ppisp"
     # Use fused implementation for bilateral grid (only applies when post_processing="bilateral_grid")
     bilateral_grid_fused: bool = False
     # Shape of the bilateral grid (X, Y, W)
