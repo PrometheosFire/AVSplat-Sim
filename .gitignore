@@ -3,6 +3,7 @@ results/
 envs/
 external_weights/
 multirun/
+vis4d-workspace/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
