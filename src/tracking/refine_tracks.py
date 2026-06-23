@@ -132,6 +132,8 @@ def fuse_tracks(
     merge_dist: float = 2.0,
     persistent_overlap_frames: int = 15,
     persistent_merge_dist: float = 3.5,
+    containment_frac: float = 0.7,
+    divergence_cap: float = 6.0,
 ) -> dict[int, int]:
     """Return a mapping ``track_id -> canonical_track_id`` after fusion."""
     ids = list(tracks)
@@ -142,6 +144,48 @@ def fuse_tracks(
     span_of = {
         tid: (min(tr), max(tr)) if tr else (0, -1) for tid, tr in tracks.items()
     }
+
+    # Precompute the max co-present distance between every pair of tracks that
+    # share at least one frame. Two fragments of one object stay close (<~6 m
+    # even under depth jitter); two distinct vehicles that briefly coincide
+    # diverge far. This drives a divergence guard that stops transitive chains
+    # from pulling distinct cars into one group through a long "hub" track.
+    co_max: dict[tuple[int, int], float] = {}
+    frame_boxes: dict[int, list[tuple[int, np.ndarray]]] = defaultdict(list)
+    for tid, tr in tracks.items():
+        for f, box in tr.items():
+            frame_boxes[f].append((tid, box_center_ground(box)))
+    for lst in frame_boxes.values():
+        for p in range(len(lst)):
+            ta, ca = lst[p]
+            for q in range(p + 1, len(lst)):
+                tb, cb = lst[q]
+                key = (ta, tb) if ta < tb else (tb, ta)
+                dd = float(np.linalg.norm(ca - cb))
+                if dd > co_max.get(key, 0.0):
+                    co_max[key] = dd
+
+    group_members: dict[int, set[int]] = {tid: {tid} for tid in ids}
+
+    def guarded_union(a: int, b: int) -> None:
+        """Union a and b unless it would group two divergent co-present tracks."""
+        ra, rb = uf.find(a), uf.find(b)
+        if ra == rb:
+            return
+        ma = group_members.get(ra, {ra})
+        mb = group_members.get(rb, {rb})
+        for x in ma:
+            for y in mb:
+                key = (x, y) if x < y else (y, x)
+                if co_max.get(key, 0.0) > divergence_cap:
+                    return  # refuse: distinct cars would be chained together
+        uf.union(a, b)
+        nr = uf.find(a)
+        merged = ma | mb
+        group_members[nr] = merged
+        for r in (ra, rb):
+            if r != nr and r in group_members:
+                del group_members[r]
 
     for i in range(len(ids)):
         a = ids[i]
@@ -157,8 +201,9 @@ def fuse_tracks(
                 # Signal 1: co-present overlap. Mean BEV IoU catches well-aligned
                 # duplicates; a small min centroid distance catches depth-jitter
                 # duplicates whose footprints miss in many frames (dragging the
-                # mean down) but repeatedly coincide. Distinct vehicles never get
-                # within merge_dist, so this stays safe.
+                # mean down) but repeatedly coincide. The divergence guard in
+                # guarded_union keeps single-frame coincidences of distinct cars
+                # from merging.
                 shared_dists = [
                     float(
                         np.linalg.norm(
@@ -171,11 +216,19 @@ def fuse_tracks(
                 ious = [bev_iou(tracks[a][f], tracks[b][f]) for f in shared]
                 min_centroid = min(shared_dists)
                 # Signal 1b: persistent proximity. Two tracks that stay close
-                # for a long co-present stretch are the same object split by
-                # depth error (distinct vehicles drift apart). Requires a long
-                # overlap so brief coincidences of real neighbors don't trigger.
+                # over a long stretch, OR where the shorter is mostly nested
+                # inside the longer (a fragment of it), are the same object
+                # split by depth error. The median-distance guard keeps real
+                # vehicles that merely pass each other (close once, then
+                # diverge -> high median) from merging.
+                containment = len(shared) / max(
+                    1, min(len(frames_of[a]), len(frames_of[b]))
+                )
                 persistent = (
-                    len(shared) >= persistent_overlap_frames
+                    (
+                        len(shared) >= persistent_overlap_frames
+                        or containment >= containment_frac
+                    )
                     and float(np.median(shared_dists)) <= persistent_merge_dist
                 )
                 if (
@@ -183,7 +236,7 @@ def fuse_tracks(
                     or min_centroid <= merge_dist
                     or persistent
                 ):
-                    uf.union(a, b)
+                    guarded_union(a, b)
                 continue
 
             # Signal 2: velocity-predicted gap handoff (disjoint in time). Accept
@@ -210,7 +263,7 @@ def fuse_tracks(
             pred_dist = float(np.linalg.norm(pred - actual))
             raw_dist = float(np.linalg.norm(end_center - actual))
             if min(pred_dist, raw_dist) <= gap_dist:
-                uf.union(a, b)
+                guarded_union(a, b)
 
     # Canonical id per group = member with the most frames.
     groups: dict[int, list[int]] = defaultdict(list)
@@ -286,18 +339,33 @@ def filter_static(
     displacement_percentile: float,
     displacement_mode: str = "net",
     displacement_smooth: int = 3,
+    min_rel_displacement: float = 0.0,
 ) -> tuple[dict[int, dict[int, dict]], list[dict]]:
-    """Drop static / too-short tracks. Returns (kept, dropped_report)."""
+    """Drop static / too-short tracks. Returns (kept, dropped_report).
+
+    A track is kept only if it both travels >= ``min_displacement`` meters and,
+    when ``min_rel_displacement`` > 0, travels >= that fraction of its distance
+    from the origin (ego start). The relative gate removes far objects whose
+    apparent motion is depth-estimation jitter (which scales with range): a
+    static object 200 m away can "move" ~10 m radially yet only ~5% of its
+    range, while real movers exceed ~45%.
+    """
     kept: dict[int, dict[int, dict]] = {}
     dropped: list[dict] = []
     for tid, track in tracks.items():
         disp = track_displacement(
             track, displacement_percentile, displacement_mode, displacement_smooth
         )
+        centers = np.array([box_center_ground(b) for b in track.values()])
+        rng = float(np.linalg.norm(centers.mean(axis=0))) if len(centers) else 0.0
+        rel = disp / rng if rng > 1e-6 else 0.0
         if len(track) < min_track_length:
             dropped.append({"id": tid, "reason": "short", "frames": len(track), "disp": disp})
-        elif disp < min_displacement:
-            dropped.append({"id": tid, "reason": "static", "frames": len(track), "disp": disp})
+        elif disp < min_displacement or rel < min_rel_displacement:
+            dropped.append(
+                {"id": tid, "reason": "static", "frames": len(track),
+                 "disp": disp, "rel": round(rel, 3)}
+            )
         else:
             kept[tid] = track
     return kept, dropped
@@ -340,6 +408,8 @@ def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
         merge_dist=float(cfg.get("merge_dist", 2.0)),
         persistent_overlap_frames=int(cfg.get("persistent_overlap_frames", 15)),
         persistent_merge_dist=float(cfg.get("persistent_merge_dist", 3.5)),
+        containment_frac=float(cfg.get("containment_frac", 0.7)),
+        divergence_cap=float(cfg.get("divergence_cap", 6.0)),
     )
     fused = apply_fusion(tracks, mapping)
     n_fused = len(fused)
@@ -351,6 +421,7 @@ def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
         displacement_percentile=float(cfg.get("displacement_percentile", 90.0)),
         displacement_mode=str(cfg.get("displacement_mode", "net")),
         displacement_smooth=int(cfg.get("displacement_smooth", 3)),
+        min_rel_displacement=float(cfg.get("min_rel_displacement", 0.0)),
     )
 
     report = {
