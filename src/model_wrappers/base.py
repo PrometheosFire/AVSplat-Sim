@@ -44,4 +44,34 @@ class BaseDiffusionModel(ABC):
             NotImplementedError: If the child class fails to define this method.
         """
         pass
+
+
+class BaseTracker(ABC):
+    """
+    The absolute contract for all tracking models in AVSplat-Sim.
+    Any new tracker added to the project MUST inherit from this class
+    and implement the run_tracking method.
+    """
+
+    @abstractmethod
+    def run_tracking(
+        self,
+        data_root: str,
+        output_dir: str,
+        cameras: list[str],
+        task_cfg: dict,
+    ) -> None:
+        """
+        Runs multi-camera tracking for a dataset scene.
+
+        Args:
+            data_root (str): Absolute path to the scene root directory.
+            output_dir (str): Absolute path where tracking outputs are written.
+            cameras (list[str]): Camera names to include in tracking.
+            task_cfg (dict): Task-level runtime settings (mode, image_size, vis, etc).
+
+        Raises:
+            NotImplementedError: If the child class fails to define this method.
+        """
+        pass
     

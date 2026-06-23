@@ -1,0 +1,87 @@
+# Step 1.5: track refinement (fuse split tracks, then filter static objects).
+# Consumes the tracker's COLMAP-frame predictions and writes a refined JSON
+# used for 4DGS training.
+enabled: true
+
+# Input resolution (the orchestrator sets input_dir to the tracking step dir).
+#   input_dir:  <tracking_dir> -> reads eval/track_3d_predictions_colmap.json
+#   input_json: explicit path (takes precedence if set)
+input_dir: ""
+input_json: ""
+
+# Optional; used only to reconstruct the ego path for visualization.
+data_root: ""
+
+# --- Fusion (merge ID switches of the same physical object) ---
+# Co-present overlap: two tracks sharing frames merge when their mean bird's
+# eye IoU over the shared frames is >= iou_thr (distinct cars never overlap),
+# OR when their centroids come within merge_dist meters in some shared frame
+# (catches depth-jitter duplicates whose footprints miss but repeatedly
+# coincide; distinct vehicles never get this close).
+iou_thr: 0.3
+merge_dist: 2.0
+min_overlap_frames: 1
+# Persistent proximity: tracks co-present for >= persistent_overlap_frames whose
+# median centroid distance stays <= persistent_merge_dist are the same object
+# split by depth error (real neighbors drift apart over a long overlap).
+persistent_overlap_frames: 15
+persistent_merge_dist: 3.5
+# Gap handoff: a track that ends merges with one that starts within max_gap
+# frames if the velocity-predicted position lands within gap_dist meters.
+max_gap: 5
+gap_dist: 2.0
+# Class groups that may fuse together (handles e.g. pickups flickering between
+# car/truck). Set to null for fully unrestricted cross-class fusion.
+class_groups:
+  - [car, truck, bus, trailer, construction_vehicle]
+  - [bicycle, motorcycle]
+  - [pedestrian]
+  - [traffic_cone]
+  - [barrier]
+
+# --- Static filtering (drop parked / non-moving objects) ---
+# Kept only if net ground displacement >= min_displacement meters and the track
+# spans >= min_track_length frames.
+#   displacement_mode: "net" = net travel (smoothed start->end), robust to box
+#                      jitter so wobbling parked cars read ~0; "span" = legacy
+#                      point-cloud diameter (jitter-inflated, keeps more).
+#   displacement_smooth: frames averaged at each end for the net metric.
+min_displacement: 3.0
+min_track_length: 3
+displacement_mode: "net"
+displacement_smooth: 3
+displacement_percentile: 90.0
+
+# --- Visualization (BEV qualitative validation) ---
+# The orchestrator renders raw and/or refined predictions per these toggles.
+visualize:
+  raw: true        # render BEV of the raw tracker output (pre-refinement)
+  refined: true    # render BEV of the refined output (post-refinement)
+  project: true    # project refined boxes back onto the camera frames
+viz:
+  ids: []          # empty = all tracks; else only these tracking ids
+  classes: []      # empty = all; else only these class names
+  color_by: "time" # time | id
+  show_ego: true
+  reference_camera: "front-forward"
+  figsize: 14.0    # longer figure side (inches); short side follows data aspect
+  margin: 5.0      # meters of padding around auto-fit bounds
+  max_aspect: 4.0  # cap on figure long:short ratio (keeps elongated scenes legible)
+  bounds: []       # optional [xmin, xmax, zmin, zmax] crop in COLMAP meters
+
+# Set by the visualization entrypoint (orchestrator passes these per render).
+viz_input_json: ""
+viz_output_path: ""
+
+# --- Projection onto frames (refined boxes drawn on the original images) ---
+project:
+  cameras: []       # empty = dataset.cameras; else subset to render
+  box_width: 2      # cuboid line width in pixels
+  subdiv: 12        # points per cuboid edge (higher = smoother fisheye curve)
+  max_frames: 0     # 0 = every frame; else evenly subsample to this many
+  max_view_angle: 80.0  # skip boxes with corners beyond this angle (deg) from
+                        # the optical axis (too close/wide -> fisheye garbage)
+
+# Set by the projection entrypoint (orchestrator passes these).
+project_input_json: ""
+project_output_dir: ""

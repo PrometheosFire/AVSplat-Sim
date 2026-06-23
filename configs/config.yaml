@@ -4,10 +4,13 @@ defaults:
   #  --- Models ---
   - model@segmenter: sam3       # Loads model/sam3.yaml into cfg.segmenter
   - model@diffusion: difix3d+      # Loads model/difix3d+.yaml into cfg.diffusion
+  - model@tracker: cc3dt        # Loads model/cc3dt.yaml into cfg.tracker
 
   # --- Pipeline Tasks ---
   - pipeline@seg_task: extract_masks      # Loads pipeline/extract_masks.yaml into cfg.seg_task
   - pipeline@diff_task: apply_diffusion   # Loads pipeline/apply_diffusion.yaml into cfg.diff_task
+  - pipeline@track_task: run_tracking     # Loads pipeline/run_tracking.yaml into cfg.track_task
+  - pipeline@refine_task: refine_tracks   # Loads pipeline/refine_tracks.yaml into cfg.refine_task
 
   - gaussian_splatting: train
   - rendering@rendering: render   # Loads rendering/render.yaml into cfg.rendering

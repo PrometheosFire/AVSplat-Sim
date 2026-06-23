@@ -1,0 +1,46 @@
+_target_: src.model_wrappers.trackers.cc3dt_wrapper.CC3DTWrapper
+
+name: "cc3dt"
+backbone: "r101"  # r50 | r101
+
+# If empty, wrapper picks a backbone-specific default checkpoint.
+checkpoint_path: ""
+vis4d_config_path: "src/model_wrappers/trackers/cc3dt_vis_config.py"
+
+# Core tracker behavior
+pure_det: false
+motion_model: "KF3D"  # KF3D | VeloLSTM
+fps: 10
+
+# Track graph memory behavior
+memory_size: 15
+memory_momentum: 0.8
+backdrop_memory_size: 1
+nms_backdrop_iou_thr: 0.3
+update_3d_score: true
+add_backdrops: true
+use_velocities: false
+
+# 3D association thresholds
+assoc_init_score_thr: 0.8
+assoc_obj_score_thr: 0.5
+assoc_match_score_thr: 0.4
+assoc_nms_backdrop_iou_thr: 0.3
+assoc_nms_class_iou_thr: 0.7
+assoc_nms_conf_thr: 0.5
+assoc_with_cats: true
+assoc_with_velocities: false
+bbox_affinity_weight: 0.5
+
+# Label mapping for visualizer overlays only (does not filter tracked classes).
+cat_mapping:
+  bicycle: 0
+  motorcycle: 1
+  pedestrian: 2
+  bus: 3
+  car: 4
+  trailer: 5
+  truck: 6
+  construction_vehicle: 7
+  traffic_cone: 8
+  barrier: 9

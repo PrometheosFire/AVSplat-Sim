@@ -1,0 +1,31 @@
+enabled: true
+mode: "vis"           # vis | infer
+reference_camera: "front-forward"
+image_size: [900, 1600] # [H, W]
+samples_per_gpu: 1
+workers_per_gpu: 1
+vis: true
+
+# Optional override; if empty, uses dataset.base_dir.
+data_root: ""
+
+# Optional override; if empty, uses dataset.cameras.
+cameras: []
+
+# Fisheye rectification (Wayve cameras are OPENCV_FISHEYE).
+#   undistort: rectify frames to a pinhole model before tracking.
+#   undistort_mode: "balance" keeps the wide FOV (OpenCV picks the focal from
+#                   undistort_balance); "virtual" fixes a nuScenes-like focal
+#                   (virtual_focal_px) and crops FOV so monocular depth/size and
+#                   cross-camera track fusion behave like the training data.
+#   undistort_balance: only used in "balance" mode. 0 = crop edges, no black
+#                      borders; 1 = keep full FOV but with black borders.
+#   virtual_focal_px: only used in "virtual" mode. Target focal length in pixels
+#                     at the model input resolution (nuScenes ~ 1266).
+undistort: true
+undistort_mode: "virtual"  # balance | virtual
+undistort_balance: 0.0
+virtual_focal_px: 1266.0
+
+# Optional run name suffix
+experiment_suffix: ""
