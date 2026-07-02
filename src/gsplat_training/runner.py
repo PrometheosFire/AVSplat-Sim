@@ -61,6 +61,9 @@ from nerfview import CameraState, RenderTabState, apply_float_colormap
 # My imports
 from config_training import Config
 
+# Dynamic rigid-object (vehicle) support for the 4D extension.
+RIGID_GAUSS_KEYS = ["means", "scales", "quats", "opacities", "sh0", "shN"]
+
 
 def create_splats_with_optimizers(
     parser: Parser,
@@ -379,6 +382,11 @@ class Runner:
         else:
             assert_never(self.cfg.strategy)
 
+        # Dynamic rigid objects (vehicles). Sets up self.rigid_nodes /
+        # self.rigid_tracks / self.rigid_densifier and their optimizers, or
+        # leaves them None when cfg.enable_dynamic is False.
+        self._setup_dynamic_rigid()
+
         # Compression Strategy
         self.compression_method = None
         if cfg.compression is not None:
@@ -510,6 +518,115 @@ class Runner:
         self._gaussians_frozen = True
         print("[Distillation] Gaussian parameters frozen")
 
+    def _setup_dynamic_rigid(self) -> None:
+        """Build rigid-object nodes, poses, optimizers and densifier.
+
+        Loads refined 3D vehicle tracks, aligns them from the COLMAP world into
+        the trainer's normalized frame, initializes a :class:`RigidNodes` module
+        (local Gaussians + per-frame SE(3) poses), and sets up its Gaussian /
+        pose optimizers plus a :class:`RigidDensifier`. When ``enable_dynamic``
+        is False, all rigid attributes are set to ``None`` so the rest of the
+        pipeline runs background-only.
+        """
+        self.rigid_nodes = None
+        self.rigid_tracks = None
+        self.rigid_densifier = None
+        self.rigid_gauss_optimizers = {}
+        self.rigid_pose_optimizers = {}
+
+        cfg = self.cfg
+        if not getattr(cfg, "enable_dynamic", False):
+            return
+
+        from dynamic import (
+            RigidDensifier,
+            RigidNodes,
+            compute_colmap_to_training,
+            load_rigid_tracks,
+            resolve_colmap_sparse_dir,
+        )
+
+        if cfg.data_type != "ncore":
+            raise ValueError(
+                "Dynamic rigid objects currently require data_type='ncore'."
+            )
+        if not cfg.dynamic_tracks_json or not cfg.dynamic_scene_root:
+            raise ValueError(
+                "enable_dynamic=True requires dynamic_tracks_json and "
+                "dynamic_scene_root to be set."
+            )
+
+        # COLMAP world -> training frame similarity (validated by fit residual).
+        colmap_dir = resolve_colmap_sparse_dir(cfg.dynamic_scene_root)
+        transform = compute_colmap_to_training(self.parser, colmap_dir)
+
+        # Load and align rigid vehicle tracks to per-frame SE(3) poses.
+        self.rigid_tracks = load_rigid_tracks(
+            cfg.dynamic_tracks_json,
+            transform,
+            self.parser.frame_timestamps_us,
+            rigid_classes=cfg.dynamic_rigid_classes,
+            min_score=cfg.dynamic_min_track_score,
+        )
+        self.rigid_nodes = RigidNodes(
+            self.rigid_tracks,
+            init_points_per_instance=cfg.rigid_init_points_per_instance,
+            sh_degree=cfg.sh_degree,
+            device=self.device,
+        )
+
+        # Split optimizers into Gaussian (densified) and pose (fixed-size) groups.
+        all_optimizers = self.rigid_nodes.create_optimizers(
+            batch_size=cfg.batch_size,
+            means_lr=cfg.means_lr,
+            scales_lr=cfg.scales_lr,
+            quats_lr=cfg.quats_lr,
+            opacities_lr=cfg.opacities_lr,
+            sh0_lr=cfg.sh0_lr,
+            shN_lr=cfg.shN_lr,
+            pose_trans_lr=cfg.rigid_pose_trans_lr,
+            pose_quats_lr=cfg.rigid_pose_quats_lr,
+        )
+        self.rigid_gauss_optimizers = {k: all_optimizers[k] for k in RIGID_GAUSS_KEYS}
+        self.rigid_pose_optimizers = {
+            k: all_optimizers[k] for k in ("pose_trans", "pose_quats")
+        }
+
+        self.rigid_densifier = RigidDensifier(
+            grow_grad_thresh=cfg.rigid_grow_grad_thresh,
+            grow_scale3d=cfg.rigid_grow_scale3d,
+            prune_opacity=cfg.rigid_prune_opacity,
+            prune_scale3d=cfg.rigid_prune_scale3d,
+            refine_start_iter=cfg.rigid_refine_start_iter,
+            refine_stop_iter=cfg.rigid_refine_stop_iter,
+            refine_every=cfg.rigid_refine_every,
+            warmup_for_big_prune=cfg.rigid_warmup_for_big_prune,
+            cull_out_of_bound=cfg.rigid_cull_out_of_bound,
+            verbose=True,
+        )
+        self.rigid_densifier.initialize_state()
+        print(
+            f"[Dynamic] Rigid objects enabled: {self.rigid_nodes.num_instances} "
+            f"instances, {self.rigid_nodes.num_points} initial Gaussians across "
+            f"{self.rigid_nodes.num_frames} frames."
+        )
+
+    def _resolve_rigid_frame_idx(self, data: Dict) -> Optional[int]:
+        """Map a sample's capture timestamp to a global rigid-track frame index.
+
+        Returns ``None`` when dynamic rigid objects are not configured or the
+        sample carries no timestamp, in which case rendering stays background-only.
+        """
+        tracks = getattr(self, "rigid_tracks", None)
+        if tracks is None or "timestamp_us" not in data:
+            return None
+        ts = data["timestamp_us"]
+        if torch.is_tensor(ts):
+            ts = int(ts.flatten()[0].item())
+        else:
+            ts = int(ts)
+        return tracks.frame_index_from_timestamp(ts)
+
     def rasterize_splats(
         self,
         camtoworlds: Tensor,
@@ -522,6 +639,7 @@ class Runner:
         frame_idcs: Optional[Tensor] = None,
         camera_idcs: Optional[Tensor] = None,
         exposure: Optional[Tensor] = None,
+        rigid_frame_idx: Optional[int] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         """Rasterize 3D Gaussians into 2D image tensors using differentiable splatting.
@@ -615,6 +733,32 @@ class Runner:
                     .unsqueeze(0)
                 )
 
+        # --- Dynamic rigid objects: append world-space Gaussians for this frame ---
+        # Background Gaussians live in ``self.splats`` (densified by MCMC). Rigid
+        # instances live in a separate ``self.rigid_nodes`` module and are placed
+        # into world space per frame via their learnable SE(3) poses, then simply
+        # concatenated so a single rasterization pass composites both. The split
+        # index ``n_background`` is recorded on ``info`` so the rigid densifier can
+        # slice the rigid range out of the per-Gaussian rasterization outputs.
+        n_background = means.shape[0]
+        n_rigid = 0
+        rigid_nodes = getattr(self, "rigid_nodes", None)
+        if rigid_nodes is not None and rigid_frame_idx is not None:
+            if self.cfg.app_opt:
+                raise NotImplementedError(
+                    "Dynamic rigid nodes are incompatible with app_opt: backgrounds "
+                    "use precomputed per-camera RGB while rigid nodes use SH "
+                    "coefficients, which cannot share one rasterization call."
+                )
+            rigid = rigid_nodes.get_world_gaussians(int(rigid_frame_idx))
+            if rigid is not None:
+                means = torch.cat([means, rigid["means"]], dim=0)
+                quats = torch.cat([quats, rigid["quats"]], dim=0)
+                scales = torch.cat([scales, rigid["scales"]], dim=0)
+                opacities = torch.cat([opacities, rigid["opacities"]], dim=0)
+                colors = torch.cat([colors, rigid["colors"]], dim=0)
+                n_rigid = rigid["means"].shape[0]
+
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -643,6 +787,9 @@ class Runner:
             thin_prism_coeffs=thin_prism_coeffs,
             **kwargs,
         )
+        # Record the background/rigid split (useful for logging / future use).
+        info["n_background"] = n_background
+        info["n_rigid"] = n_rigid
         if masks is not None:
             render_colors[~masks] = 0 # Mask out invalid pixels (e.g., ego vehicle, dynamic objects) by setting their color to black.
 
@@ -791,6 +938,28 @@ class Runner:
                     self.app_module.load_state_dict(ckpt["app_module"])
             if self.post_processing_module is not None and "post_processing" in ckpt:
                 self.post_processing_module.load_state_dict(ckpt["post_processing"])
+            if self.rigid_nodes is not None and "rigid_nodes" in ckpt:
+                # Rigid Gaussian count changes with densification: the module
+                # resizes its tensors to the checkpoint before loading, then we
+                # rebuild the rigid optimizers (fresh Adam state) to match.
+                self.rigid_nodes.load_state_dict(ckpt["rigid_nodes"])
+                all_optimizers = self.rigid_nodes.create_optimizers(
+                    batch_size=cfg.batch_size,
+                    means_lr=cfg.means_lr,
+                    scales_lr=cfg.scales_lr,
+                    quats_lr=cfg.quats_lr,
+                    opacities_lr=cfg.opacities_lr,
+                    sh0_lr=cfg.sh0_lr,
+                    shN_lr=cfg.shN_lr,
+                    pose_trans_lr=cfg.rigid_pose_trans_lr,
+                    pose_quats_lr=cfg.rigid_pose_quats_lr,
+                )
+                self.rigid_gauss_optimizers = {
+                    k: all_optimizers[k] for k in RIGID_GAUSS_KEYS
+                }
+                self.rigid_pose_optimizers = {
+                    k: all_optimizers[k] for k in ("pose_trans", "pose_quats")
+                }
             if "optimizers" in ckpt:
                 for name, optimizer in self.optimizers.items():
                     optimizer.load_state_dict(ckpt["optimizers"][name])
@@ -880,6 +1049,10 @@ class Runner:
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
+            # Resolve the dynamic frame index so rigid objects are placed with the
+            # pose that matches this training image's capture time.
+            rigid_frame_idx = self._resolve_rigid_frame_idx(data)
+
             # forward
             renders, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
@@ -895,6 +1068,7 @@ class Runner:
                 frame_idcs=image_ids,
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
+                rigid_frame_idx=rigid_frame_idx,
             )
             if renders.shape[-1] == 4:  # If render includes depth (RGB+ED), split into colors and depths. Otherwise, treat all channels as colors.
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -975,7 +1149,22 @@ class Runner:
             if cfg.scale_reg > 0.0: # penalizes Gaussians that grow too large
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
+            # Rigid-object temporal smoothness (2nd-order on per-frame translation).
+            if (
+                self.rigid_nodes is not None
+                and rigid_frame_idx is not None
+                and cfg.rigid_smooth_w > 0.0
+            ):
+                loss = loss + cfg.rigid_smooth_w * self.rigid_nodes.temporal_smoothness_loss(
+                    rigid_frame_idx, cfg.rigid_smooth_range
+                )
+
             loss.backward()
+
+            # Accumulate the rigid densification signal (3D positional gradient)
+            # after backward and before the rigid optimizers zero their grads.
+            if self.rigid_densifier is not None:
+                self.rigid_densifier.update_state(self.rigid_nodes)
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss and points is not None:
@@ -1075,6 +1264,10 @@ class Runner:
                     ]
                 data["schedulers"] = [scheduler.state_dict() for scheduler in schedulers]
                 data["strategy_state"] = self.strategy_state
+                # Persist rigid-object nodes (local Gaussians, per-frame poses,
+                # and instance buffers) for the 4D extension.
+                if self.rigid_nodes is not None:
+                    data["rigid_nodes"] = self.rigid_nodes.state_dict()
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -1160,6 +1353,16 @@ class Runner:
             for optimizer in self.post_processing_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+
+            # Rigid-object optimizers (Gaussian attributes + per-frame poses).
+            if self.rigid_nodes is not None:
+                for optimizer in self.rigid_gauss_optimizers.values():
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.rigid_pose_optimizers.values():
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
             for scheduler in schedulers:
                 scheduler.step()
 
@@ -1185,6 +1388,13 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
+
+            # Rigid-object densification (grow/prune on the 3D positional grad).
+            # Runs independently of the background MCMC strategy above.
+            if self.rigid_densifier is not None:
+                self.rigid_densifier.step(
+                    self.rigid_nodes, self.rigid_gauss_optimizers, step
+                )
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -1287,6 +1497,7 @@ class Runner:
                 frame_idcs=None,  # For novel views, pass None (no per-frame parameters available)
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
+                rigid_frame_idx=self._resolve_rigid_frame_idx(data),
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)

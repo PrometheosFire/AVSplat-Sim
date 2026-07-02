@@ -14,7 +14,7 @@ from gsplat.cuda._wrapper import CameraModel
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = True
+    disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # If True, load the checkpoint state and continue training instead of eval-only.
@@ -191,6 +191,39 @@ class Config:
     with_ut: bool = True
     with_eval3d: bool = True
 
+    # ----------------------------------------------------------------- #
+    # Dynamic rigid objects (vehicles) — 4D extension                    #
+    # ----------------------------------------------------------------- #
+    # Master switch. When False, training is background-only (unchanged).
+    enable_dynamic: bool = False
+    # Path to refined 3D tracks (``track_3d_refined_colmap.json``).
+    dynamic_tracks_json: Optional[str] = None
+    # Scene root holding the COLMAP reconstruction (``<root>/colmap_sparse/rig``
+    # or ``<root>/sparse/0``), used to align boxes to the training frame.
+    dynamic_scene_root: Optional[str] = None
+    # Rigid class names to keep (None -> vehicle group: car/truck/bus/...).
+    dynamic_rigid_classes: Optional[List[str]] = None
+    # Minimum tracking score to keep a box.
+    dynamic_min_track_score: float = 0.0
+    # Initial number of Gaussians sampled inside each instance box.
+    rigid_init_points_per_instance: int = 2000
+    # Per-frame pose learning rates (translation moves faster than rotation).
+    rigid_pose_trans_lr: float = 5e-4
+    rigid_pose_quats_lr: float = 1e-5
+    # Temporal smoothness (2nd-order on translation) weight + window.
+    rigid_smooth_w: float = 0.01
+    rigid_smooth_range: int = 5
+    # Rigid densification (Default-3DGS-style on the 3D positional gradient).
+    rigid_grow_grad_thresh: float = 4e-4
+    rigid_grow_scale3d: float = 0.01
+    rigid_prune_opacity: float = 0.05
+    rigid_prune_scale3d: float = 0.5
+    rigid_refine_start_iter: int = 500
+    rigid_refine_stop_iter: int = 15_000
+    rigid_refine_every: int = 100
+    rigid_warmup_for_big_prune: int = 3_000
+    rigid_cull_out_of_bound: bool = True
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -214,3 +247,9 @@ class Config:
                 )
         else:
             assert_never(strategy)
+
+        # Keep rigid densification schedule aligned with the global step scaler.
+        self.rigid_refine_start_iter = int(self.rigid_refine_start_iter * factor)
+        self.rigid_refine_stop_iter = int(self.rigid_refine_stop_iter * factor)
+        self.rigid_refine_every = max(1, int(self.rigid_refine_every * factor))
+        self.rigid_warmup_for_big_prune = int(self.rigid_warmup_for_big_prune * factor)

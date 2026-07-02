@@ -52,6 +52,39 @@ depth_loss: false
 test_every: 16
 
 
+# ----------------------------------------------------------------- #
+# Dynamic rigid objects (vehicles) — 4D extension                    #
+# ----------------------------------------------------------------- #
+# Master switch. When false, training is background-only (unchanged).
+enable_dynamic: false
+# Path to refined 3D tracks (track_3d_refined_colmap.json). Set per run.
+dynamic_tracks_json: null
+# Scene root holding the COLMAP reconstruction (<root>/colmap_sparse/rig).
+dynamic_scene_root: null
+# Rigid class names to keep (null -> vehicle group: car/truck/bus/...).
+dynamic_rigid_classes: null
+# Minimum tracking score to keep a box.
+dynamic_min_track_score: 0.0
+# Initial Gaussians sampled inside each instance box.
+rigid_init_points_per_instance: 2000
+# Per-frame pose learning rates.
+rigid_pose_trans_lr: 0.0005
+rigid_pose_quats_lr: 0.00001
+# Temporal smoothness (2nd-order on translation) weight + window.
+rigid_smooth_w: 0.01
+rigid_smooth_range: 5
+# Rigid densification (Default-3DGS-style on the 3D positional gradient).
+rigid_grow_grad_thresh: 0.0004
+rigid_grow_scale3d: 0.01
+rigid_prune_opacity: 0.05
+rigid_prune_scale3d: 0.5
+rigid_refine_start_iter: 500
+rigid_refine_stop_iter: 15000
+rigid_refine_every: 100
+rigid_warmup_for_big_prune: 3000
+rigid_cull_out_of_bound: true
+
+
 strategy:
   cap_max: 1000000        # Default cap
   min_opacity: 0.005        # Default pruning opacity

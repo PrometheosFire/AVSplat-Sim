@@ -759,6 +759,10 @@ class NCoreParser:
         """
         self.frame_list: List[Tuple[str, int]] = []
         self.camera_idx_per_frame: List[int] = []
+        # START-timepoint capture timestamp (microseconds) per flattened frame.
+        # Used to align external per-frame annotations (e.g. 3D track boxes,
+        # keyed by image-filename timestamp) with the trainer's frame indexing.
+        self.frame_timestamps_us: List[int] = []
         starts: List[np.ndarray] = []
         ends: List[np.ndarray] = []
 
@@ -768,6 +772,7 @@ class NCoreParser:
                 continue
 
             sensor = camera_sensors[camera_id]
+            frames_timestamps_us = sensor.frames_timestamps_us
             indices = np.arange(frame_range.start, frame_range.stop)
             T_start = self._ncore_world_to_scene_poses(
                 sensor.get_frames_T_source_target(
@@ -795,6 +800,9 @@ class NCoreParser:
             for local_idx, frame_idx in enumerate(frame_range):
                 self.frame_list.append((camera_id, frame_idx))
                 self.camera_idx_per_frame.append(cam_idx)
+                self.frame_timestamps_us.append(
+                    int(frames_timestamps_us[frame_idx, ncore.data.FrameTimepoint.START])
+                )
                 starts.append(T_start[local_idx])
                 ends.append(T_end[local_idx])
 
@@ -1108,6 +1116,7 @@ class NCoreDataset(torch.utils.data.Dataset):
             "image": torch.from_numpy(image).float(),
             "image_id": item,
             "camera_idx": camera_idx,
+            "timestamp_us": int(self.parser.frame_timestamps_us[index]),
         }
 
         valid_mask: Optional[np.ndarray] = None

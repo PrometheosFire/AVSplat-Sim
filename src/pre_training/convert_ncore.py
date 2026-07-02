@@ -21,7 +21,8 @@ def main(cfg: DictConfig):
 
     # 1. Path Resolution
     dataset_base = to_absolute_path(cfg.dataset.base_dir)
-    input_masks_dir = to_absolute_path(cfg.input_masks_dir)
+    masks_cfg = OmegaConf.select(cfg, "input_masks_dir")
+    input_masks_dir = to_absolute_path(masks_cfg) if masks_cfg else None
     workspace_dir = HydraConfig.get().runtime.output_dir
     
     # 2. Setup Directories
@@ -34,7 +35,10 @@ def main(cfg: DictConfig):
     print(f"\n--- 🏗️ Building Virtual Symlink Farm ---")
     
     create_symlink(os.path.join(dataset_base, "images"), os.path.join(staging_dir, "images"))
-    create_symlink(input_masks_dir, os.path.join(staging_dir, "masks"))
+    if input_masks_dir:
+        create_symlink(input_masks_dir, os.path.join(staging_dir, "masks"))
+    else:
+        print("  -> No input_masks_dir provided; converting without segmentation masks.")
     
     os.makedirs(os.path.join(staging_dir, "sparse"), exist_ok=True)
     
@@ -64,8 +68,9 @@ def main(cfg: DictConfig):
         "--root-dir", staging_dir,        
         "--output-dir", final_output_dir, 
         "colmap-v4", 
-        "--masks-dir", "masks"            
     ]
+    if input_masks_dir:
+        cmd += ["--masks-dir", "masks"]
 
     try:
         subprocess.run(cmd, env=os.environ.copy(), cwd=ncore_root, check=True)

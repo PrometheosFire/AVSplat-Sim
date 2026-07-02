@@ -21,11 +21,19 @@ data_root: ""
 iou_thr: 0.3
 merge_dist: 2.0
 min_overlap_frames: 1
-# Persistent proximity: tracks co-present for >= persistent_overlap_frames whose
-# median centroid distance stays <= persistent_merge_dist are the same object
-# split by depth error (real neighbors drift apart over a long overlap).
+# Persistent proximity: tracks co-present for >= persistent_overlap_frames, OR
+# where the shorter is >= containment_frac nested inside the longer (a fragment
+# of it), whose median centroid distance stays <= persistent_merge_dist are the
+# same object split by depth error (real neighbors drift apart -> high median).
 persistent_overlap_frames: 15
 persistent_merge_dist: 3.5
+containment_frac: 0.7
+# Divergence guard: two tracks that are co-present in some frame but ever
+# separate by more than divergence_cap meters are distinct objects and are
+# never placed in the same fused group — even transitively through a shared
+# "hub" track. Real depth-split duplicates stay within ~6 m; distinct vehicles
+# diverge to 10+ m.
+divergence_cap: 6.0
 # Gap handoff: a track that ends merges with one that starts within max_gap
 # frames if the velocity-predicted position lands within gap_dist meters.
 max_gap: 5
@@ -46,10 +54,17 @@ class_groups:
 #                      jitter so wobbling parked cars read ~0; "span" = legacy
 #                      point-cloud diameter (jitter-inflated, keeps more).
 #   displacement_smooth: frames averaged at each end for the net metric.
+#   min_rel_displacement: also require travel >= this fraction of the object's
+#                      distance from ego. Removes far static objects whose
+#                      apparent motion is depth jitter (scales with range):
+#                      static-far ~ 0.05, real movers ~ 0.13+. Higher = more
+#                      aggressive but starts dropping genuine distant movers. 0
+#                      disables.
 min_displacement: 3.0
 min_track_length: 3
 displacement_mode: "net"
 displacement_smooth: 3
+min_rel_displacement: 0.1
 displacement_percentile: 90.0
 
 # --- Visualization (BEV qualitative validation) ---

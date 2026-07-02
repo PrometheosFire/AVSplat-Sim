@@ -14,6 +14,62 @@ def generate_config_hash(config_subset: dict) -> str:
     return hashlib.md5(config_str.encode("utf-8")).hexdigest()[:8]
 
 
+def ensure_ncore_dataset(cfg, dataset_cfg: dict, overrides, explicit: str = "") -> str:
+    """Create (or reuse) the ncore dataset for the 4DGS pipeline.
+
+    Unlike run_pipeline.py, this pipeline skips SAM segmentation and mask
+    fusion: it feeds the dataset's own ego masks
+    (``<dataset.base_dir>/masks``) straight into the ncore converter. Output is
+    written to the shared static results dir (``results/<name>/<scene>/``) using
+    a ``03_ncore_dataset_*`` cache folder. When ``explicit`` is set, that
+    directory is used directly and no conversion runs. Returns the ncore dataset
+    directory (the folder containing ``ncore_dataset/``).
+    """
+    if explicit:
+        return os.path.abspath(explicit)
+
+    static_results_dir = os.path.abspath(
+        f"results/{dataset_cfg['name']}/{dataset_cfg['scene']}"
+    )
+    os.makedirs(static_results_dir, exist_ok=True)
+
+    gsplat_python = os.path.abspath("envs/envs/env_gsplat/bin/python")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.path.abspath(".")
+
+    # Ego masks shipped with the dataset (objects=black on white background,
+    # exactly the convention the ncore converter consumes). No SAM / fusion.
+    ego_masks_dir = os.path.abspath(os.path.join(dataset_cfg["base_dir"], "masks"))
+
+    # --- STEP 03: ncore dataset conversion (ego masks only) ---
+    print("\n" + "=" * 50)
+    print("▶️ [STEP 03] Checking ncore Dataset Conversion (ego masks only)...")
+    ncore_config_str = f"ncore_ego_{ego_masks_dir}"
+    ncore_hash = hashlib.md5(ncore_config_str.encode()).hexdigest()[:8]
+    ncore_dir = os.path.join(
+        static_results_dir, f"03_ncore_dataset_{ncore_hash}"
+    )
+    if os.path.exists(os.path.join(ncore_dir, ".success")):
+        print(f"✅ Cache Hit! Reusing ncore dataset from: {ncore_dir}")
+    else:
+        print(f"🔄 New ncore config (Hash: {ncore_hash}). Running conversion...")
+        print(f"🎭 ego masks: {ego_masks_dir}")
+        subprocess.run(
+            [
+                gsplat_python,
+                os.path.abspath("src/pre_training/convert_ncore.py"),
+                f"hydra.run.dir={ncore_dir}",
+                f"+input_masks_dir={ego_masks_dir}",
+                *overrides,
+            ],
+            env=env,
+            check=True,
+        )
+        print(f"✅ ncore dataset saved to {ncore_dir}")
+
+    return ncore_dir
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
     print("🚀 Starting 4DGS Orchestrator...")
@@ -26,6 +82,7 @@ def main(cfg: DictConfig):
     tracker_cfg = OmegaConf.to_container(cfg.tracker, resolve=True)
     track_task_cfg = OmegaConf.to_container(cfg.track_task, resolve=True)
     refine_task_cfg = OmegaConf.to_container(cfg.refine_task, resolve=True)
+    train_task_cfg = OmegaConf.to_container(cfg.train_task, resolve=True)
 
     base_results_dir = os.path.abspath(
         f"results/4dgs/{dataset_cfg['name']}/{dataset_cfg['scene']}"
@@ -83,6 +140,7 @@ def main(cfg: DictConfig):
     print("\n" + "=" * 50)
     print("▶️ [STEP 15] Checking Track Refinement...")
 
+    refined_tracks_json = None
     if not refine_task_cfg.get("enabled", True):
         print("⏭️ Refinement disabled via refine_task.enabled=false")
     else:
@@ -101,6 +159,9 @@ def main(cfg: DictConfig):
         )
         viz_cfg = refine_task_cfg.get("visualize", {})
         viz_dir = os.path.join(refine_dir, "vis")
+        refined_tracks_json = os.path.join(
+            refine_dir, "track_3d_refined_colmap.json"
+        )
 
         if os.path.exists(refine_success):
             print(f"✅ Cache Hit! Reusing refinement from: {refine_dir}")
@@ -161,6 +222,90 @@ def main(cfg: DictConfig):
                 )
 
             print(f"✅ Refinement saved to {refine_dir}")
+
+    # ==========================================
+    # STEP 20: 4D GAUSSIAN SPLATTING TRAINING (with dynamic rigid annotations)
+    #   Prepares the ncore dataset (ego masks only) then trains the 4DGS model.
+    # ==========================================
+    print("\n" + "=" * 50)
+    print("▶️ [STEP 20] Preparing 4DGS Training (dynamic rigid objects)...")
+
+    if not train_task_cfg.get("enabled", True):
+        print("⏭️ 4DGS training disabled via train_task.enabled=false")
+    elif refined_tracks_json is None:
+        print(
+            "⏭️ Skipping 4DGS training: refinement is disabled, so there are no "
+            "annotations to feed. Enable refine_task to produce the tracks JSON."
+        )
+    else:
+        # Create (or reuse) the ncore dataset the same way run_pipeline.py does.
+        ncore_dir = ensure_ncore_dataset(
+            cfg, dataset_cfg, overrides, train_task_cfg.get("ncore_dataset_dir", "")
+        )
+        ncore_json_path = os.path.join(
+            ncore_dir, "ncore_dataset", "staging_symlinks.json"
+        )
+
+        print("\n" + "=" * 50)
+        print("▶️ [STEP 20] Checking 4DGS Training (dynamic rigid objects)...")
+
+        # Camera list auto-extracted by the ncore conversion step.
+        cam_list_path = os.path.join(ncore_dir, "ncore_dataset", "camera_list.yaml")
+        if os.path.exists(cam_list_path):
+            cam_config = OmegaConf.load(cam_list_path)
+            cam_list_str = ",".join(cam_config.ncore_camera_ids)
+            cam_override = f"++gaussian_splatting.ncore_camera_ids=[{cam_list_str}]"
+        else:
+            cam_override = "++gaussian_splatting.ncore_camera_ids=[]"
+
+        # COLMAP scene root (contains colmap_sparse/rig) used to align the tracks
+        # from the COLMAP world into the trainer's normalized frame.
+        scene_root = os.path.abspath(dataset_cfg["base_dir"])
+
+        # Hash over the training config + its dynamic inputs so re-runs cache.
+        gsplat_config_yaml = OmegaConf.to_yaml(cfg.gaussian_splatting)
+        step20_hash = generate_config_hash(
+            {
+                "gsplat": gsplat_config_yaml,
+                "ncore": ncore_dir,
+                "tracks": refined_tracks_json,
+                "scene_root": scene_root,
+            }
+        )
+        training_dir = os.path.join(
+            base_results_dir, f"20_gsplat_dynamic_{step20_hash}"
+        )
+        train_success = os.path.join(training_dir, ".success")
+
+        if os.path.exists(train_success):
+            print(f"✅ Cache Hit! Reusing 4DGS training from: {training_dir}")
+        else:
+            print(f"🔄 New 4DGS training config (Hash: {step20_hash}). Running...")
+            print(f"📂 ncore dataset: {ncore_dir}")
+            print(f"🚗 rigid annotations: {refined_tracks_json}")
+
+            # Training runs in the gsplat environment (separate from the tracker).
+            gsplat_python_exec = os.path.abspath("envs/envs/env_gsplat/bin/python")
+            train_script = os.path.abspath("src/gsplat_training/train_splats.py")
+
+            subprocess.run(
+                [
+                    gsplat_python_exec,
+                    train_script,
+                    f"hydra.run.dir={training_dir}",
+                    f"++gaussian_splatting.data_dir={ncore_json_path}",
+                    f"++gaussian_splatting.result_dir={training_dir}",
+                    cam_override,
+                    "++gaussian_splatting.enable_dynamic=true",
+                    f"++gaussian_splatting.dynamic_tracks_json={refined_tracks_json}",
+                    f"++gaussian_splatting.dynamic_scene_root={scene_root}",
+                    *overrides,
+                ],
+                env=env,
+                check=True,
+            )
+
+            print(f"✅ 4DGS training saved to {training_dir}")
 
 
 if __name__ == "__main__":
