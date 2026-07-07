@@ -14,7 +14,7 @@ from gsplat.cuda._wrapper import CameraModel
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = False
+    disable_viewer: bool = True
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # If True, load the checkpoint state and continue training instead of eval-only.
@@ -159,15 +159,15 @@ class Config:
     app_opt_reg: float = 1e-6
 
     # Post-processing method for appearance correction (experimental)
-    post_processing: Optional[Literal["bilateral_grid", "ppisp"]] = "ppisp"
+    post_processing: Optional[Literal["bilateral_grid", "ppisp"]] = None
     # Use fused implementation for bilateral grid (only applies when post_processing="bilateral_grid")
     bilateral_grid_fused: bool = False
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
     # Enable PPISP controller
-    ppisp_use_controller: bool = True
+    ppisp_use_controller: bool = False
     # Use controller distillation in PPISP (only applies when post_processing="ppisp" and ppisp_use_controller=True)
-    ppisp_controller_distillation: bool = True
+    ppisp_controller_distillation: bool = False
     # Controller activation ratio for PPISP (only applies when post_processing="ppisp" and ppisp_use_controller=True)
     ppisp_controller_activation_num_steps: int = 25_000
     # Color correction method for cc_* metrics (only applies when post_processing is set)

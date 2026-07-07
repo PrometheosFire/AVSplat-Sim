@@ -11,10 +11,10 @@ defaults:
   - pipeline@diff_task: apply_diffusion   # Loads pipeline/apply_diffusion.yaml into cfg.diff_task
   - pipeline@track_task: run_tracking     # Loads pipeline/run_tracking.yaml into cfg.track_task
   - pipeline@refine_task: refine_tracks   # Loads pipeline/refine_tracks.yaml into cfg.refine_task
-  - pipeline@train_task: train_4dgs       # Loads pipeline/train_4dgs.yaml into cfg.train_task
 
   - gaussian_splatting: train
   - rendering@rendering: render   # Loads rendering/render.yaml into cfg.rendering
+  - rendering@simulator: simulator # Loads rendering/simulator.yaml into cfg.simulator
   - _self_
 
 scene_name: "${dataset.scene}"

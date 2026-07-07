@@ -14,6 +14,27 @@ def generate_config_hash(config_subset: dict) -> str:
     return hashlib.md5(config_str.encode("utf-8")).hexdigest()[:8]
 
 
+def _latest_checkpoint(ckpt_dir: str) -> str:
+    """Return the highest-step ``*.pt`` checkpoint in ``ckpt_dir`` (or "").
+
+    Checkpoints are named ``ckpt_<step>_rank<r>.pt`` by the trainer, so the step
+    is the second underscore-separated field.
+    """
+    if not os.path.isdir(ckpt_dir):
+        return ""
+
+    def step_of(fname: str) -> int:
+        try:
+            return int(fname.split("_")[1])
+        except (IndexError, ValueError):
+            return -1
+
+    ckpts = sorted(
+        [f for f in os.listdir(ckpt_dir) if f.endswith(".pt")], key=step_of
+    )
+    return os.path.join(ckpt_dir, ckpts[-1]) if ckpts else ""
+
+
 def ensure_ncore_dataset(cfg, dataset_cfg: dict, overrides, explicit: str = "") -> str:
     """Create (or reuse) the ncore dataset for the 4DGS pipeline.
 
@@ -82,7 +103,6 @@ def main(cfg: DictConfig):
     tracker_cfg = OmegaConf.to_container(cfg.tracker, resolve=True)
     track_task_cfg = OmegaConf.to_container(cfg.track_task, resolve=True)
     refine_task_cfg = OmegaConf.to_container(cfg.refine_task, resolve=True)
-    train_task_cfg = OmegaConf.to_container(cfg.train_task, resolve=True)
 
     base_results_dir = os.path.abspath(
         f"results/4dgs/{dataset_cfg['name']}/{dataset_cfg['scene']}"
@@ -230,18 +250,19 @@ def main(cfg: DictConfig):
     print("\n" + "=" * 50)
     print("▶️ [STEP 20] Preparing 4DGS Training (dynamic rigid objects)...")
 
-    if not train_task_cfg.get("enabled", True):
-        print("⏭️ 4DGS training disabled via train_task.enabled=false")
-    elif refined_tracks_json is None:
+    #if not cfg.gaussian_splatting.enable_dynamic:
+    #    print(
+    #       "⏭️ 4DGS training skipped: gaussian_splatting.enable_dynamic=false "
+    #        "(single source of truth for the dynamic pipeline)."
+    #    )
+    if refined_tracks_json is None:
         print(
             "⏭️ Skipping 4DGS training: refinement is disabled, so there are no "
             "annotations to feed. Enable refine_task to produce the tracks JSON."
         )
     else:
         # Create (or reuse) the ncore dataset the same way run_pipeline.py does.
-        ncore_dir = ensure_ncore_dataset(
-            cfg, dataset_cfg, overrides, train_task_cfg.get("ncore_dataset_dir", "")
-        )
+        ncore_dir = ensure_ncore_dataset(cfg, dataset_cfg, overrides)
         ncore_json_path = os.path.join(
             ncore_dir, "ncore_dataset", "staging_symlinks.json"
         )
@@ -296,7 +317,6 @@ def main(cfg: DictConfig):
                     f"++gaussian_splatting.data_dir={ncore_json_path}",
                     f"++gaussian_splatting.result_dir={training_dir}",
                     cam_override,
-                    "++gaussian_splatting.enable_dynamic=true",
                     f"++gaussian_splatting.dynamic_tracks_json={refined_tracks_json}",
                     f"++gaussian_splatting.dynamic_scene_root={scene_root}",
                     *overrides,
@@ -306,6 +326,63 @@ def main(cfg: DictConfig):
             )
 
             print(f"✅ 4DGS training saved to {training_dir}")
+
+        # ==========================================
+        # STEP 25: DYNAMIC RENDERING (rigid objects composited at a timestep)
+        # ==========================================
+        print("\n" + "=" * 50)
+        print("▶️ [STEP 25] Checking Dynamic Rendering...")
+
+        rendering_cfg = OmegaConf.to_container(cfg.rendering, resolve=True)
+        render_hash = generate_config_hash(
+            {"rendering": rendering_cfg, "training": training_dir}
+        )
+        render_dir = os.path.join(base_results_dir, f"25_rendered_{render_hash}")
+        render_success = os.path.join(render_dir, ".success")
+
+        if os.path.exists(render_success):
+            print(f"✅ Cache Hit! Reusing renders from: {render_dir}")
+        else:
+            # Rigid objects are stored in the training checkpoint (not the PLY),
+            # so dynamic rendering loads the latest checkpoint. Vehicles animate
+            # with the trajectory (frame i -> rigid i); rendering.render_dynamic
+            # / freeze_timestep (render.yaml or CLI) control this, forwarded via
+            # *overrides.
+            checkpoint_path = _latest_checkpoint(
+                os.path.join(training_dir, "ckpts")
+            )
+            if not checkpoint_path:
+                raise RuntimeError(
+                    f"No checkpoint (.pt) found under {training_dir}/ckpts; "
+                    "cannot render dynamic objects."
+                )
+            camera_paths_dir = os.path.join(training_dir, "camera_paths")
+
+            render_script = os.path.abspath(
+                "src/gsplat_training/render_standalone.py"
+            )
+            gsplat_python_exec = os.path.abspath(
+                "envs/envs/env_gsplat/bin/python"
+            )
+
+            print(f"🎥 checkpoint: {checkpoint_path}")
+            print(f"⏱️ freeze_timestep: {cfg.rendering.get('freeze_timestep')}")
+
+            subprocess.run(
+                [
+                    gsplat_python_exec,
+                    render_script,
+                    f"hydra.run.dir={render_dir}",
+                    f"++rendering.checkpoint_path={checkpoint_path}",
+                    f"++rendering.camera_paths_dir={camera_paths_dir}",
+                    f"++rendering.output_dir={render_dir}",
+                    *overrides,
+                ],
+                env=env,
+                check=True,
+            )
+
+            print(f"✅ Dynamic renders saved to {render_dir}")
 
 
 if __name__ == "__main__":

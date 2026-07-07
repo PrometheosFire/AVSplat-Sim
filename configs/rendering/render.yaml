@@ -14,6 +14,15 @@ output_dir: null           # Required, set via override
 # Filter which cameras to render (empty = all cameras)
 cameras_to_render: []
 
+# Dynamic rigid objects (vehicles). They ANIMATE with the trajectory: each
+# camera pose renders the vehicles at that frame's pose (frame i -> rigid i).
+# Requires checkpoint_path, since rigid nodes are stored in the training
+# checkpoint (not the PLY).
+render_dynamic: true
+# Optional bullet-time: hold all frames at this single rigid frame index instead
+# of animating. null -> animate per camera pose.
+freeze_timestep: null
+
 # Trajectory transformations
 # Each shift is [x_m, y_m, z_m] in real-world meters:
 #   x: lateral  (+ right, - left)

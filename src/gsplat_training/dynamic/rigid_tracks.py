@@ -25,8 +25,6 @@ DEFAULT_RIGID_CLASSES: Tuple[str, ...] = (
     "car",
     "truck",
     "bus",
-    "trailer",
-    "construction_vehicle",
 )
 
 

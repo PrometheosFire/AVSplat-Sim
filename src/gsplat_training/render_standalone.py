@@ -37,7 +37,6 @@ from gsplat.cuda._wrapper import FThetaCameraDistortionParameters, FThetaPolynom
 
 from trajectory import TrajectoryManipulator, TrajectoryShift
 
-
 @dataclass
 class CameraMetadata:
     """Camera metadata loaded from camera_data.json."""
@@ -222,6 +221,82 @@ def load_splats_from_checkpoint(
     return splats, pp_state
 
 
+def load_rigid_state_from_checkpoint(
+    ckpt_path: str, device: str = "cuda"
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Load the rigid-object node state (vehicles) from a training checkpoint.
+
+    Rigid Gaussians live in the checkpoint under ``rigid_nodes`` (a flattened
+    ``RigidNodes.state_dict()``); they are NOT exported to the PLY. Returns the
+    tensors moved to ``device``, or ``None`` when the checkpoint has no rigid
+    nodes (background-only run).
+
+    Keys of interest:
+      * ``gauss.means/scales/quats/opacities/sh0/shN`` - local Gaussian params
+        (scales in log-space, opacities in logit-space).
+      * ``poses.trans`` ``(T, M, 3)`` / ``poses.quats`` ``(T, M, 4)`` - per-frame
+        SE(3) poses (wxyz).
+      * ``instances_fv`` ``(T, M)`` bool - per-frame instance validity.
+      * ``point_ids`` ``(N,)`` long - Gaussian -> instance column.
+    """
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    rigid = ckpt.get("rigid_nodes")
+    if rigid is None:
+        return None
+    return {k: v.to(device) for k, v in rigid.items()}
+
+
+@torch.no_grad()
+def rigid_world_gaussians(
+    rigid_state: Dict[str, torch.Tensor], frame_idx: int
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Place active rigid instances into world space for a global frame index.
+
+    Mirrors ``RigidNodes.get_world_gaussians``: selects Gaussians whose instance
+    is valid at ``frame_idx``, applies activations, and maps each local Gaussian
+    to world via its instance's per-frame pose (``x_world = R[f] @ x_local + t[f]``).
+    Returns activated ``means/quats/scales/opacities/colors`` ready to concat with
+    the background, or ``None`` if no instance is present this frame.
+    """
+    from dynamic.rigid_nodes import quat_multiply, quat_normalize, quat_to_rotmat
+
+    fv = rigid_state["instances_fv"]  # (T, M) bool
+    num_frames = fv.shape[0]
+    if not (0 <= frame_idx < num_frames):
+        raise ValueError(
+            f"timestep {frame_idx} out of range for rigid poses [0, {num_frames})."
+        )
+
+    point_ids = rigid_state["point_ids"]  # (N,)
+    active = fv[frame_idx][point_ids]  # (N,)
+    if not bool(active.any()):
+        return None
+
+    idx = active.nonzero(as_tuple=True)[0]
+    inst_a = point_ids[idx]  # (P,)
+    local_means = rigid_state["gauss.means"][idx]
+    local_quats = quat_normalize(rigid_state["gauss.quats"][idx])
+    scales = torch.exp(rigid_state["gauss.scales"][idx])
+    opacities = torch.sigmoid(rigid_state["gauss.opacities"][idx])
+    colors = torch.cat(
+        [rigid_state["gauss.sh0"][idx], rigid_state["gauss.shN"][idx]], dim=1
+    )
+
+    pose_t = rigid_state["poses.trans"][frame_idx][inst_a]  # (P, 3)
+    pose_q = quat_normalize(rigid_state["poses.quats"][frame_idx][inst_a])  # (P, 4)
+    R = quat_to_rotmat(pose_q)  # (P, 3, 3)
+    means_world = torch.bmm(R, local_means.unsqueeze(-1)).squeeze(-1) + pose_t
+    quats_world = quat_multiply(pose_q, local_quats)
+    return {
+        "means": means_world,
+        "quats": quats_world,
+        "scales": scales,
+        "opacities": opacities,
+        "colors": colors,
+    }
+
+
+
 class StandaloneRenderer:
     """Renders frames from a trained GSplat model."""
 
@@ -234,6 +309,7 @@ class StandaloneRenderer:
         with_ut: bool = True,
         with_eval3d: bool = True,
         ppisp_state: Optional[dict] = None,
+        rigid_state: Optional[Dict[str, torch.Tensor]] = None,
         device: str = "cuda",
     ):
         self.splats = splats
@@ -242,6 +318,7 @@ class StandaloneRenderer:
         self.far_plane = far_plane
         self.with_ut = with_ut
         self.with_eval3d = with_eval3d
+        self.rigid_state = rigid_state
         self.device = device
 
         self.ppisp_module = None
@@ -269,6 +346,7 @@ class StandaloneRenderer:
         thin_prism_coeffs: Optional[np.ndarray] = None,
         ftheta_coeffs: Optional[FThetaCameraDistortionParameters] = None,
         camera_idx: Optional[int] = None,
+        rigid_frame_idx: Optional[int] = None,
     ) -> np.ndarray:
         """Render a single frame.
 
@@ -283,6 +361,8 @@ class StandaloneRenderer:
             thin_prism_coeffs: Thin prism distortion coefficients
             ftheta_coeffs: F-theta camera parameters
             camera_idx: Integer camera index for PPISP (None disables per-camera effects)
+            rigid_frame_idx: Global rigid-track frame index whose vehicle poses are
+                composited into the render. None -> background only.
 
         Returns:
             Rendered RGB image as uint8 numpy array [H, W, 3]
@@ -312,6 +392,18 @@ class StandaloneRenderer:
         scales = torch.exp(self.splats["scales"])
         opacities = torch.sigmoid(self.splats["opacities"])
         colors = torch.cat([self.splats["sh0"], self.splats["shN"]], dim=1)
+
+        # Composite dynamic rigid objects (vehicles) at the requested timestep.
+        # Their world-space Gaussians are simply concatenated onto the background
+        # so a single rasterization pass blends both with correct occlusion.
+        if self.rigid_state is not None and rigid_frame_idx is not None:
+            rigid = rigid_world_gaussians(self.rigid_state, int(rigid_frame_idx))
+            if rigid is not None:
+                means = torch.cat([means, rigid["means"]], dim=0)
+                quats = torch.cat([quats, rigid["quats"]], dim=0)
+                scales = torch.cat([scales, rigid["scales"]], dim=0)
+                opacities = torch.cat([opacities, rigid["opacities"]], dim=0)
+                colors = torch.cat([colors, rigid["colors"]], dim=0)
 
         # Rasterize
         render_colors, render_alphas, _ = rasterization(
@@ -369,8 +461,15 @@ class StandaloneRenderer:
         save_video: bool = True,
         fps: int = 30,
         camera_idx: Optional[int] = None,
+        freeze_timestep: Optional[int] = None,
     ) -> List[str]:
         """Render a full camera trajectory.
+
+        Dynamic rigid objects (vehicles) animate with the trajectory: frame ``i``
+        renders the vehicles at their frame-``i`` pose (the camera trajectory is
+        the captured per-camera sequence, whose ordering matches the rigid frame
+        index). Set ``freeze_timestep`` to instead hold all frames at one rigid
+        frame (bullet-time). Requires ``self.rigid_state`` to be loaded.
 
         Args:
             camera: Camera metadata with intrinsics and distortion
@@ -380,6 +479,8 @@ class StandaloneRenderer:
             save_video: Whether to save an MP4 video
             fps: Video frame rate
             camera_idx: Integer camera index for PPISP post-processing
+            freeze_timestep: If set, hold vehicles at this rigid frame for every
+                pose; if None, vehicles animate per-frame (frame i -> rigid i).
 
         Returns:
             List of saved frame paths
@@ -388,11 +489,23 @@ class StandaloneRenderer:
         frames_dir = os.path.join(output_dir, "frames", shift_name, safe_cam_name)
         os.makedirs(frames_dir, exist_ok=True)
 
+        num_rigid_frames = (
+            int(self.rigid_state["poses.trans"].shape[0])
+            if self.rigid_state is not None
+            else 0
+        )
+
         frame_paths = []
         video_frames = []
 
         desc = f"Rendering {shift_name}/{safe_cam_name}"
         for i in tqdm.trange(len(camtoworlds), desc=desc):
+            # Per-frame rigid index: animate (i) unless a freeze frame is given.
+            rigid_frame_idx = None
+            if self.rigid_state is not None:
+                rf = freeze_timestep if freeze_timestep is not None else i
+                rigid_frame_idx = rf if 0 <= rf < num_rigid_frames else None
+
             frame = self.render_frame(
                 camtoworld=camtoworlds[i],
                 K=camera.K,
@@ -404,6 +517,7 @@ class StandaloneRenderer:
                 thin_prism_coeffs=camera.thin_prism_coeffs,
                 ftheta_coeffs=camera.ftheta_coeffs,
                 camera_idx=camera_idx,
+                rigid_frame_idx=rigid_frame_idx,
             )
 
             frame_path = os.path.join(frames_dir, f"frame_{i:05d}.png")
@@ -522,6 +636,43 @@ def main(cfg: DictConfig):
 
     print(f"Loaded {splats['means'].shape[0]} Gaussians")
 
+    # Dynamic rigid objects (vehicles). They animate with the trajectory: each
+    # camera pose renders the vehicles at that frame's pose. Rigid nodes are
+    # stored in the training checkpoint (not the PLY), so this needs
+    # checkpoint_path. `render_dynamic=false` disables them; `freeze_timestep`
+    # (int) holds all frames at one rigid frame instead of animating.
+    render_dynamic = render_cfg.get("render_dynamic", True)
+    freeze_timestep = render_cfg.get("freeze_timestep")
+    rigid_state = None
+    if render_dynamic:
+        if checkpoint_path and os.path.exists(checkpoint_path):
+            rigid_state = load_rigid_state_from_checkpoint(checkpoint_path, device)
+            if rigid_state is None:
+                print("Rigid: checkpoint has no rigid_nodes — background only.")
+            else:
+                num_frames = rigid_state["poses.trans"].shape[0]
+                num_inst = rigid_state["poses.trans"].shape[1]
+                if freeze_timestep is not None:
+                    if not (0 <= int(freeze_timestep) < num_frames):
+                        raise ValueError(
+                            f"rendering.freeze_timestep={freeze_timestep} out of "
+                            f"range [0, {num_frames})."
+                        )
+                    print(
+                        f"Rigid: {num_inst} instances, {num_frames} frames — "
+                        f"FROZEN at frame {freeze_timestep}."
+                    )
+                else:
+                    print(
+                        f"Rigid: {num_inst} instances, {num_frames} frames — "
+                        f"animating per camera pose (frame i -> rigid i)."
+                    )
+        else:
+            print(
+                "Rigid: render_dynamic=true but no checkpoint_path given. Rigid "
+                "nodes live in the checkpoint (not the PLY) — background only."
+            )
+
     # Load camera metadata
     print(f"Loading cameras from: {camera_paths_dir}")
     cameras = load_all_cameras(camera_paths_dir)
@@ -546,6 +697,7 @@ def main(cfg: DictConfig):
         with_ut=render_cfg.get("render", {}).get("with_ut", True),
         with_eval3d=render_cfg.get("render", {}).get("with_eval3d", True),
         ppisp_state=ppisp_state,
+        rigid_state=rigid_state,
         device=device,
     )
 
@@ -576,6 +728,11 @@ def main(cfg: DictConfig):
                 save_video=render_cfg.get("render", {}).get("save_video", True),
                 fps=render_cfg.get("render", {}).get("fps", 30),
                 camera_idx=camera.camera_index,
+                freeze_timestep=(
+                    int(freeze_timestep)
+                    if (rigid_state is not None and freeze_timestep is not None)
+                    else None
+                ),
             )
 
     # Write success marker

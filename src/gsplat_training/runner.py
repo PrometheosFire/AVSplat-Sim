@@ -705,7 +705,6 @@ class Runner:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
-        # TODO FIX: setting coeffs to None while using wit_ut does not make sense!
         ftheta_coeffs = None
         radial_coeffs = None
         tangential_coeffs = None

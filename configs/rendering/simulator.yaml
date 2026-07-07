@@ -1,0 +1,33 @@
+# Standalone simulator configuration (used by scripts/run_simulator.py)
+
+# Camera to use as the ego source trajectory. Empty -> first available camera.
+start_camera_id: ""
+
+# Initial frame index for ego trajectory and rigid timeline.
+start_frame: 0
+start_rigid_frame: 0
+
+# Simulator mode: replay or user
+mode: replay
+
+# Time / loop
+# Integration dt and render cap; effective tick is limited by rendering speed.
+dt_sec: 0.1
+max_fps: 10.0
+loop_trajectory: true
+
+# Dynamic rigid timeline behavior
+rigid_paused: false
+# In replay mode, whether rigid timeline also advances every tick.
+advance_rigid_in_replay: true
+
+# Bicycle model parameters
+wheelbase_m: 2.7
+max_steer_rad: 0.45
+max_accel_mps2: 3.0
+max_brake_mps2: 6.0
+drag_per_sec: 0.6
+max_speed_mps: 25.0
+
+# Viewer
+port: 8090
