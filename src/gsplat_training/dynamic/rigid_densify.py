@@ -51,6 +51,7 @@ class RigidDensifier:
     grow_scale3d: float = 0.01  # clone if max scale <= this, else split
     prune_opacity: float = 0.05
     prune_scale3d: float = 0.5  # cull Gaussians larger than this (after warmup)
+    cap_max: int = 500_000  # hard cap on TOTAL rigid Gaussians (all instances)
     refine_start_iter: int = 500
     refine_stop_iter: int = 15_000
     refine_every: int = 100
@@ -129,6 +130,24 @@ class RigidDensifier:
         is_split = is_grad_high & (~is_small)
         n_dupli = int(is_dupli.sum())
         n_split = int(is_split.sum())
+
+        # Cap the TOTAL rigid Gaussian count: clone adds 1 and split adds 1 net
+        # per selected, so trim the growth set to the remaining budget, keeping
+        # the highest-gradient candidates. Pruning below is unaffected.
+        n_current = int(params["means"].shape[0])
+        budget = max(0, self.cap_max - n_current)
+        if n_dupli + n_split > budget:
+            grow_mask = is_dupli | is_split
+            grow_idx = grow_mask.nonzero(as_tuple=True)[0]
+            keep_idx = grow_idx[
+                torch.argsort(grads[grow_idx], descending=True)[:budget]
+            ]
+            keep_mask = torch.zeros_like(grow_mask)
+            keep_mask[keep_idx] = True
+            is_dupli = is_dupli & keep_mask
+            is_split = is_split & keep_mask
+            n_dupli = int(is_dupli.sum())
+            n_split = int(is_split.sum())
 
         if n_dupli > 0:
             duplicate(params=params, optimizers=optimizers, state=state, mask=is_dupli)

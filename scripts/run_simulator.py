@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import hashlib
+import json
 import os
 import select
 import sys
@@ -6,7 +10,6 @@ import time
 import tty
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
 
 import hydra
 import numpy as np
@@ -35,6 +38,75 @@ class BicycleState:
     z_m: float = 0.0
     yaw_rad: float = 0.0
     speed_mps: float = 0.0
+
+
+def generate_config_hash(config_subset: dict) -> str:
+    config_str = json.dumps(config_subset, sort_keys=True)
+    return hashlib.md5(config_str.encode("utf-8")).hexdigest()[:8]
+
+
+def _find_latest_checkpoint(ckpt_dir: str) -> str:
+    if not os.path.isdir(ckpt_dir):
+        return ""
+
+    def step_of(fname: str) -> int:
+        try:
+            return int(fname.split("_")[1])
+        except (IndexError, ValueError):
+            return -1
+
+    ckpts = sorted([f for f in os.listdir(ckpt_dir) if f.endswith(".pt")], key=step_of)
+    return os.path.join(ckpt_dir, ckpts[-1]) if ckpts else ""
+
+
+def _resolve_cached_inputs(cfg: DictConfig) -> tuple[str, str]:
+    """Resolve simulator inputs from the same cache hashes used by the orchestrator."""
+    dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
+    tracker_cfg = OmegaConf.to_container(cfg.tracker, resolve=True)
+    track_task_cfg = OmegaConf.to_container(cfg.track_task, resolve=True)
+    refine_task_cfg = OmegaConf.to_container(cfg.refine_task, resolve=True)
+    gsplat_cfg = OmegaConf.to_container(cfg.gaussian_splatting, resolve=True)
+
+    base_results_dir = os.path.abspath(
+        f"results/4dgs/{dataset_cfg['name']}/{dataset_cfg['scene']}"
+    )
+    static_results_dir = os.path.abspath(
+        f"results/{dataset_cfg['name']}/{dataset_cfg['scene']}"
+    )
+
+    ego_masks_dir = os.path.abspath(os.path.join(dataset_cfg["base_dir"], "masks"))
+    ncore_hash = hashlib.md5(f"ncore_ego_{ego_masks_dir}".encode()).hexdigest()[:8]
+    ncore_dir = os.path.join(static_results_dir, f"03_ncore_dataset_{ncore_hash}")
+
+    step15_hash = generate_config_hash(
+        {
+            "dataset": dataset_cfg,
+            "tracker": tracker_cfg,
+            "track_task": track_task_cfg,
+            "refine_task": refine_task_cfg,
+        }
+    )
+    refine_dir = os.path.join(base_results_dir, f"15_refine_{step15_hash}")
+    refined_tracks_json = os.path.join(refine_dir, "track_3d_refined_colmap.json")
+
+    scene_root = os.path.abspath(dataset_cfg["base_dir"])
+    step20_hash = generate_config_hash(
+        {
+            "gsplat": OmegaConf.to_yaml(gsplat_cfg),
+            "ncore": ncore_dir,
+            "tracks": refined_tracks_json,
+            "scene_root": scene_root,
+        }
+    )
+    training_dir = os.path.join(base_results_dir, f"20_gsplat_dynamic_{step20_hash}")
+    camera_paths_dir = os.path.join(training_dir, "camera_paths")
+    checkpoint_path = _find_latest_checkpoint(os.path.join(training_dir, "ckpts"))
+
+    if not os.path.isdir(camera_paths_dir) or not checkpoint_path:
+        print("could not find configuration")
+        raise SystemExit(1)
+
+    return camera_paths_dir, checkpoint_path
 
 
 class TerminalKeyboard:
@@ -92,12 +164,16 @@ class SimulatorRuntime:
         self.server_port = int(sim_cfg.get("port", 8090))
 
         camera_paths_dir = render_cfg.get("camera_paths_dir")
-        if not camera_paths_dir:
-            raise ValueError("rendering.camera_paths_dir must be set.")
+        checkpoint_path = render_cfg.get("checkpoint_path")
+        if not camera_paths_dir or not checkpoint_path:
+            auto_camera_paths_dir, auto_checkpoint_path = _resolve_cached_inputs(cfg)
+            camera_paths_dir = camera_paths_dir or auto_camera_paths_dir
+            checkpoint_path = checkpoint_path or auto_checkpoint_path
 
         self.cameras = load_all_cameras(str(camera_paths_dir))
         if not self.cameras:
-            raise ValueError(f"No camera_data.json found under {camera_paths_dir}")
+            print("could not find configuration")
+            raise SystemExit(1)
 
         selected_camera_id = str(sim_cfg.get("start_camera_id", ""))
         if selected_camera_id:
@@ -115,11 +191,11 @@ class SimulatorRuntime:
         if self.num_ego_frames <= 0:
             raise ValueError("Selected camera has empty camtoworld trajectory.")
 
-        self.ego_frame_idx = int(sim_cfg.get("start_frame", 0))
-        self.ego_frame_idx = max(0, min(self.ego_frame_idx, self.num_ego_frames - 1))
+        self.ego_frame_idx = max(
+            0, min(int(sim_cfg.get("start_frame", 0)), self.num_ego_frames - 1)
+        )
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        checkpoint_path = render_cfg.get("checkpoint_path")
         ply_path = render_cfg.get("ply_path")
 
         ppisp_state = None
@@ -130,23 +206,28 @@ class SimulatorRuntime:
                 str(checkpoint_path), device=device
             )
         else:
-            raise ValueError(
-                "Set rendering.checkpoint_path or rendering.ply_path to an existing file."
-            )
+            print("could not find configuration")
+            raise SystemExit(1)
 
         render_dynamic = bool(render_cfg.get("render_dynamic", True))
         self.rigid_state = None
         if render_dynamic and checkpoint_path and os.path.exists(str(checkpoint_path)):
-            self.rigid_state = load_rigid_state_from_checkpoint(str(checkpoint_path), device=device)
+            self.rigid_state = load_rigid_state_from_checkpoint(
+                str(checkpoint_path), device=device
+            )
 
         self.num_rigid_frames = (
-            int(self.rigid_state["poses.trans"].shape[0]) if self.rigid_state is not None else 0
+            int(self.rigid_state["poses.trans"].shape[0])
+            if self.rigid_state is not None
+            else 0
         )
-        self.rigid_frame_idx = int(sim_cfg.get("start_rigid_frame", self.ego_frame_idx))
-        if self.num_rigid_frames > 0:
-            self.rigid_frame_idx = max(0, min(self.rigid_frame_idx, self.num_rigid_frames - 1))
-        else:
-            self.rigid_frame_idx = 0
+        self.rigid_frame_idx = max(
+            0,
+            min(
+                int(sim_cfg.get("start_rigid_frame", self.ego_frame_idx)),
+                max(self.num_rigid_frames - 1, 0),
+            ),
+        )
 
         self.renderer = StandaloneRenderer(
             splats=self.splats,
@@ -166,7 +247,7 @@ class SimulatorRuntime:
         self.server = viser.ViserServer(port=self.server_port, verbose=False)
         self.server.gui.set_panel_label("AVSplat Simulator")
 
-        self.help_handle = self.server.gui.add_markdown(
+        self.server.gui.add_markdown(
             """
 ### Keyboard (terminal)
 - `w/s`: accelerate / brake
@@ -184,19 +265,16 @@ class SimulatorRuntime:
         self.image_handle = self.server.gui.add_image(init_img, label="Render")
 
     def _build_user_pose(self) -> np.ndarray:
-        """Construct user-controlled pose by applying bicycle state on base pose."""
         pose = self.base_pose.copy()
         R0 = pose[:3, :3]
         tx_axis = R0[:, 0]
         tz_axis = R0[:, 2]
 
-        # Local translation in camera-ground plane (x lateral, z longitudinal).
         t_world = tx_axis * self.bicycle.x_m + tz_axis * self.bicycle.z_m
         pose[:3, 3] = self.base_pose[:3, 3] + t_world
 
         cy = np.cos(self.bicycle.yaw_rad)
         sy = np.sin(self.bicycle.yaw_rad)
-        # Yaw about local Y axis.
         Ry = np.array(
             [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float32
         )
@@ -217,8 +295,7 @@ class SimulatorRuntime:
             steer -= self.max_steer_rad
 
         self.bicycle.speed_mps += accel * self.dt
-        drag = max(0.0, 1.0 - self.drag_per_sec * self.dt)
-        self.bicycle.speed_mps *= drag
+        self.bicycle.speed_mps *= max(0.0, 1.0 - self.drag_per_sec * self.dt)
         self.bicycle.speed_mps = float(
             np.clip(self.bicycle.speed_mps, -self.max_speed_mps, self.max_speed_mps)
         )
@@ -239,9 +316,7 @@ class SimulatorRuntime:
                 self.ego_frame_idx = min(self.ego_frame_idx + 1, self.num_ego_frames - 1)
 
         if self.num_rigid_frames > 0 and not self.rigid_paused:
-            if self.mode == "replay" and not self.advance_rigid_in_replay:
-                pass
-            else:
+            if self.mode != "replay" or self.advance_rigid_in_replay:
                 self.rigid_frame_idx = (self.rigid_frame_idx + 1) % self.num_rigid_frames
 
     def _reset_ego(self) -> None:
@@ -253,9 +328,11 @@ class SimulatorRuntime:
         self.rigid_frame_idx = 0
 
     def _current_pose(self) -> np.ndarray:
-        if self.mode == "replay":
-            return self.camera.camtoworlds[self.ego_frame_idx]
-        return self._build_user_pose()
+        return (
+            self.camera.camtoworlds[self.ego_frame_idx]
+            if self.mode == "replay"
+            else self._build_user_pose()
+        )
 
     def _render_frame(self) -> np.ndarray:
         rigid_idx = self.rigid_frame_idx if self.num_rigid_frames > 0 else None
@@ -285,18 +362,18 @@ class SimulatorRuntime:
 
     def run(self) -> None:
         print("Simulator started.")
-        print("Controls: w/s/a/d move, m mode, p rigid pause, r ego reset, t rigid reset, g reset all, q quit")
+        print(
+            "Controls: w/s/a/d move, m mode, p rigid pause, r ego reset, t rigid reset, g reset all, q quit"
+        )
         target_period = 1.0 / max(self.max_fps, 1.0)
 
         with TerminalKeyboard() as kb:
-            running = True
-            while running:
+            while True:
                 loop_t0 = time.time()
                 keys = kb.read_keys()
 
                 if "q" in keys:
-                    running = False
-                    continue
+                    break
                 if "m" in keys:
                     self.mode = "user" if self.mode == "replay" else "replay"
                 if "p" in keys:
@@ -312,13 +389,11 @@ class SimulatorRuntime:
                 if self.mode == "user":
                     self._apply_user_controls(keys)
 
-                frame = self._render_frame()
-                self.image_handle.image = frame
+                self.image_handle.image = self._render_frame()
                 self._update_status()
                 self._advance_indices()
 
-                elapsed = time.time() - loop_t0
-                sleep_s = max(target_period - elapsed, 0.0)
+                sleep_s = max(target_period - (time.time() - loop_t0), 0.0)
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
@@ -328,7 +403,6 @@ class SimulatorRuntime:
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
     print("Starting standalone simulator...")
-    # Print resolved snippets for reproducibility
     print("rendering config:\n" + OmegaConf.to_yaml(cfg.get("rendering", {})))
     if cfg.get("simulator") is not None:
         print("simulator config:\n" + OmegaConf.to_yaml(cfg.get("simulator")))

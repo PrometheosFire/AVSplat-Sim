@@ -218,6 +218,8 @@ class Config:
     rigid_grow_scale3d: float = 0.01
     rigid_prune_opacity: float = 0.05
     rigid_prune_scale3d: float = 0.5
+    # Hard cap on the TOTAL number of rigid Gaussians across all instances.
+    rigid_cap_max: int = 1_000_000
     rigid_refine_start_iter: int = 500
     rigid_refine_stop_iter: int = 15_000
     rigid_refine_every: int = 100

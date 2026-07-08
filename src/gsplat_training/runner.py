@@ -597,6 +597,7 @@ class Runner:
             grow_scale3d=cfg.rigid_grow_scale3d,
             prune_opacity=cfg.rigid_prune_opacity,
             prune_scale3d=cfg.rigid_prune_scale3d,
+            cap_max=cfg.rigid_cap_max,
             refine_start_iter=cfg.rigid_refine_start_iter,
             refine_stop_iter=cfg.rigid_refine_stop_iter,
             refine_every=cfg.rigid_refine_every,
@@ -1311,6 +1312,11 @@ class Runner:
                     save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
                 )
 
+                # Also dump each rigid vehicle instance to its own PLY for
+                # per-object reconstruction analysis.
+                if self.rigid_nodes is not None:
+                    self.export_rigid_plys(step)
+
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
                 assert cfg.packed, "Sparse gradients only work with packed mode."
@@ -1430,6 +1436,50 @@ class Runner:
         frames_by_camera = self._group_frames_by_camera()
         self._save_camera_paths(frames_by_camera)
         print(f"Camera metadata saved to {self.cfg.result_dir}/camera_paths/")
+
+    @torch.no_grad()
+    def export_rigid_plys(self, step: int) -> None:
+        """Export each rigid instance's Gaussians to its own PLY (local frame).
+
+        Writes one PLY per vehicle instance under ``result_dir/ply`` (alongside the
+        background ``point_cloud_*.ply``), in the object's canonical *local* frame
+        (before the per-frame SE(3) pose), so the reconstruction of each object can
+        be inspected on its own — independent of motion. No-op when dynamic rigid
+        objects are disabled.
+        """
+        if self.rigid_nodes is None:
+            return
+
+        rigid_dir = self.ply_dir
+        os.makedirs(rigid_dir, exist_ok=True)
+
+        gauss = self.rigid_nodes.gauss
+        point_ids = self.rigid_nodes.point_ids
+        n_written = 0
+        for m in range(self.rigid_nodes.num_instances):
+            sel = (point_ids == m).nonzero(as_tuple=True)[0]
+            if sel.numel() == 0:
+                continue
+            tid = self.rigid_nodes.instance_ids[m]
+            cname = str(self.rigid_nodes.class_names[m]).replace("/", "_")
+            # export_splats consumes raw params (log scales, logit opacities),
+            # exactly as stored — same convention as the background PLY export.
+            export_splats(
+                means=gauss["means"][sel],
+                scales=gauss["scales"][sel],
+                quats=gauss["quats"][sel],
+                opacities=gauss["opacities"][sel],
+                sh0=gauss["sh0"][sel],
+                shN=gauss["shN"][sel],
+                format="ply",
+                save_to=os.path.join(
+                    rigid_dir, f"instance{m:03d}_id{tid}_{cname}_step{step}.ply"
+                ),
+            )
+            n_written += 1
+        print(
+            f"[Dynamic] Exported {n_written} rigid instance PLYs to {rigid_dir}"
+        )
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
@@ -1903,8 +1953,20 @@ class Runner:
         camera_idx_tensor = torch.tensor([cam_idx]).to(device)
 
         writer = imageio.get_writer(f"{video_dir}/traj_{step}_{safe_cam_name}.mp4", fps=30)
+        # Dynamic rigid objects animate with the trajectory: captured frame i shows
+        # the vehicles at their frame-i pose. Only valid for the 1:1 "raw" path
+        # (interp/ellipse/spiral resample the poses, breaking the frame mapping).
+        rigid_animatable = (
+            self.rigid_nodes is not None and cfg.render_traj_path == "raw"
+        )
+        num_rigid_frames = (
+            self.rigid_nodes.num_frames if self.rigid_nodes is not None else 0
+        )
         for i in tqdm.trange(len(c2ws_tensor), desc=f"Rendering {cam_name}"):
             c2w = c2ws_tensor[i : i + 1]
+            rigid_frame_idx = (
+                i if (rigid_animatable and 0 <= i < num_rigid_frames) else None
+            )
             renders, _, _ = self.rasterize_splats(
                 camtoworlds=c2w,
                 Ks=K_tensor,
@@ -1919,6 +1981,7 @@ class Runner:
                 image_ids=None,
                 masks=None,
                 exposure=None,
+                rigid_frame_idx=rigid_frame_idx,
             )
 
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)
