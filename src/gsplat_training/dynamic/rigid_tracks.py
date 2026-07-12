@@ -183,7 +183,13 @@ def load_rigid_tracks(
                 continue
             tid = int(box["tracking_id"])
             id_to_class.setdefault(tid, box["tracking_name"])
-            size = np.asarray(box["size"], dtype=np.float64)
+            # Tracker stores size as [width, length, height] (Vis4D convention),
+            # with length->local x, width->local y, height->local z (see
+            # src/tracking/track_geometry.py). Reorder to [length, width, height]
+            # so it matches the local (x, y, z) axes the rigid Gaussians and box
+            # wireframes use — otherwise each box is rotated 90 deg about its up
+            # axis relative to the vehicle heading.
+            size = np.asarray(box["size"], dtype=np.float64)[[1, 0, 2]]
             id_to_size_sum[tid] = id_to_size_sum.get(tid, np.zeros(3)) + size
             id_to_count[tid] = id_to_count.get(tid, 0) + 1
 

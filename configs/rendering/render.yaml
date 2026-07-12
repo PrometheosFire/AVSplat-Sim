@@ -22,6 +22,9 @@ render_dynamic: true
 # Optional bullet-time: hold all frames at this single rigid frame index instead
 # of animating. null -> animate per camera pose.
 freeze_timestep: null
+# Debug: overlay each dynamic object's 3D box (semi-transparent, per-instance
+# color) on the render to inspect box/reconstruction alignment.
+debug_render_boxes: true
 
 # Trajectory transformations
 # Each shift is [x_m, y_m, z_m] in real-world meters:
@@ -33,8 +36,8 @@ freeze_timestep: null
 trajectory:
   shifts:
     - [0, 0, 0]
-    - [-3, 0, 0]
-    - [3, 0, 0]
+    #- [-3, 0, 0]
+    #- [3, 0, 0]
 
 # Rendering parameters
 render:

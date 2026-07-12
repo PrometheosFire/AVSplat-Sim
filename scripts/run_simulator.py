@@ -244,6 +244,21 @@ class SimulatorRuntime:
         self.base_pose = self.camera.camtoworlds[self.ego_frame_idx].copy()
         self.bicycle = BicycleState()
 
+        # Fit a ground plane to the ego trajectory camera positions using SVD.
+        # The direction of smallest variance across all positions is the plane normal
+        # (world "up"), which is robust to any PCA axis orientation and handles
+        # gently inclined roads: the camera always stays on the fitted surface.
+        positions = self.camera.camtoworlds[:, :3, 3]  # [N, 3]
+        self.plane_centroid = positions.mean(axis=0).astype(np.float32)
+        _, _, Vt = np.linalg.svd(positions - self.plane_centroid, full_matrices=False)
+        plane_normal = Vt[-1].astype(np.float32)  # smallest-variance direction
+        # Orient normal toward camera "up" (not down).
+        avg_cam_up = (-self.camera.camtoworlds[:, :3, 1]).mean(axis=0)
+        if float(np.dot(plane_normal, avg_cam_up)) < 0:
+            plane_normal = -plane_normal
+        self.plane_normal = plane_normal
+        print(f"[Simulator] Ground plane normal = {self.plane_normal.round(3)}, centroid = {self.plane_centroid.round(3)}")
+
         self.server = viser.ViserServer(port=self.server_port, verbose=False)
         self.server.gui.set_panel_label("AVSplat Simulator")
 
@@ -261,17 +276,35 @@ class SimulatorRuntime:
 """
         )
         self.status_handle = self.server.gui.add_markdown("Waiting for first frame...")
+        # Display renders as full-viewport background so the image fills the 3D canvas.
         init_img = np.zeros((self.camera.height, self.camera.width, 3), dtype=np.uint8)
-        self.image_handle = self.server.gui.add_image(init_img, label="Render")
+        self.server.scene.set_background_image(init_img)
 
     def _build_user_pose(self) -> np.ndarray:
         pose = self.base_pose.copy()
-        R0 = pose[:3, :3]
-        tx_axis = R0[:, 0]
-        tz_axis = R0[:, 2]
+        R0 = self.base_pose[:3, :3]
 
-        t_world = tx_axis * self.bicycle.x_m + tz_axis * self.bicycle.z_m
-        pose[:3, 3] = self.base_pose[:3, 3] + t_world
+        # Project right (col 0) and forward (col 2) onto the plane perpendicular to
+        # the trajectory-estimated world up. Using the trajectory average (not the
+        # single-frame cam-down) cancels out camera pitch so the offset is truly
+        # Fitted ground-plane normal (unit vector pointing "up").
+        n = self.plane_normal
+
+        # Directions in the ground plane: remove the normal component, renormalize.
+        tx_flat = R0[:, 0] - np.dot(R0[:, 0], n) * n
+        tz_flat = R0[:, 2] - np.dot(R0[:, 2], n) * n
+        tx_n = np.linalg.norm(tx_flat)
+        tz_n = np.linalg.norm(tz_flat)
+        tx_flat = tx_flat / tx_n if tx_n > 1e-6 else R0[:, 0]
+        tz_flat = tz_flat / tz_n if tz_n > 1e-6 else R0[:, 2]
+
+        # Snap the base position onto the fitted plane.  Because tx_flat and
+        # tz_flat are already in the plane, the resulting position is guaranteed
+        # to lie on the ground plane for any (x_m, z_m) value.
+        base_on_plane = self.base_pose[:3, 3] - (
+            np.dot(self.base_pose[:3, 3] - self.plane_centroid, n) * n
+        )
+        pose[:3, 3] = base_on_plane + tx_flat * self.bicycle.x_m + tz_flat * self.bicycle.z_m
 
         cy = np.cos(self.bicycle.yaw_rad)
         sy = np.sin(self.bicycle.yaw_rad)
@@ -290,9 +323,9 @@ class SimulatorRuntime:
 
         steer = 0.0
         if "a" in keys:
-            steer += self.max_steer_rad
+            steer -= self.max_steer_rad  # steer left
         if "d" in keys:
-            steer -= self.max_steer_rad
+            steer += self.max_steer_rad  # steer right
 
         self.bicycle.speed_mps += accel * self.dt
         self.bicycle.speed_mps *= max(0.0, 1.0 - self.drag_per_sec * self.dt)
@@ -389,7 +422,7 @@ class SimulatorRuntime:
                 if self.mode == "user":
                     self._apply_user_controls(keys)
 
-                self.image_handle.image = self._render_frame()
+                self.server.scene.set_background_image(self._render_frame())
                 self._update_status()
                 self._advance_indices()
 

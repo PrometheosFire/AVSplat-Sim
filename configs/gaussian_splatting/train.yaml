@@ -66,22 +66,28 @@ dynamic_rigid_classes: null
 # Minimum tracking score to keep a box.
 dynamic_min_track_score: 0.0
 # Initial Gaussians sampled inside each instance box.
-rigid_init_points_per_instance: 2000
+rigid_init_points_per_instance: 5000
 # Per-frame pose learning rates.
 rigid_pose_trans_lr: 0.0005
 rigid_pose_quats_lr: 0.00001
 # Temporal smoothness (2nd-order on translation) weight + window.
-rigid_smooth_w: 0.01
+rigid_smooth_w: 0.0 #0.05
 rigid_smooth_range: 5
 # Rigid densification (Default-3DGS-style on the 3D positional gradient).
-rigid_grow_grad_thresh: 0.0004
+rigid_grow_grad_thresh: 0.00005
 rigid_grow_scale3d: 0.01
-rigid_prune_opacity: 0.05
+rigid_prune_opacity: 0.02
 rigid_prune_scale3d: 0.5
 # Hard cap on the TOTAL number of rigid Gaussians across all instances (VRAM).
-rigid_cap_max: 500000
+rigid_cap_max: 1000000
+# Debug: also save renders with per-instance 3D boxes overlaid (alignment check).
+debug_render_boxes: true
+# Export per-instance rigid PLYs with DC-only color (drop higher-order SH) so
+# external viewers (SuperSplat) show flat color instead of the view-dependent
+# rainbow SH artifact. false keeps full SH.
+rigid_ply_dc_only: true
 rigid_refine_start_iter: 500
-rigid_refine_stop_iter: 15000
+rigid_refine_stop_iter: 25000
 rigid_refine_every: 100
 rigid_warmup_for_big_prune: 3000
 rigid_cull_out_of_bound: true

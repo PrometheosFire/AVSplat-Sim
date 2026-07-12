@@ -30,8 +30,6 @@ import numpy as np
 import torch
 import tqdm
 from omegaconf import DictConfig, OmegaConf, MISSING
-from plyfile import PlyData
-
 from gsplat.rendering import rasterization
 from gsplat.cuda._wrapper import FThetaCameraDistortionParameters, FThetaPolynomialType
 
@@ -139,6 +137,8 @@ def load_splats_from_ply(ply_path: str, device: str = "cuda") -> Dict[str, torch
         - sh0: [N, 1, 3]
         - shN: [N, K, 3]
     """
+    from plyfile import PlyData  # lazy: only needed for PLY sources
+
     plydata = PlyData.read(ply_path)
     vertex = plydata["vertex"]
 
@@ -296,6 +296,94 @@ def rigid_world_gaussians(
     }
 
 
+@torch.no_grad()
+def rigid_box_edge_gaussians(
+    rigid_state: Dict[str, torch.Tensor],
+    frame_idx: int,
+    opacity: float = 0.4,
+    points_per_edge: int = 24,
+    scale_frac: float = 0.03,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Semi-transparent, per-instance-colored 3D box wireframes as Gaussians.
+
+    Mirrors ``RigidNodes.get_box_edge_gaussians`` but works on the flattened
+    checkpoint state. For every instance valid at ``frame_idx``, samples points
+    along the 12 edges of its oriented box (posed into world/training frame) and
+    returns ready-to-composite Gaussians (activated params). Drawn through the
+    same rasterization pass as the render, so the boxes align exactly (distortion
+    included). Returns ``None`` when no instance is present this frame.
+    """
+    from dynamic.rigid_nodes import _instance_palette, quat_normalize, quat_to_rotmat
+    from utils import rgb_to_sh
+
+    device = rigid_state["poses.trans"].device
+    fv = rigid_state["instances_fv"]  # (T, M) bool
+    num_frames, num_inst = fv.shape
+    if not (0 <= frame_idx < num_frames):
+        raise ValueError(
+            f"frame_idx {frame_idx} out of range for rigid poses [0, {num_frames})."
+        )
+    active = fv[frame_idx].nonzero(as_tuple=True)[0]
+    if active.numel() == 0:
+        return None
+
+    num_sh_bases = (
+        rigid_state["gauss.sh0"].shape[1] + rigid_state["gauss.shN"].shape[1]
+    )
+    signs = torch.tensor(
+        [[x, y, z] for x in (-1.0, 1.0) for y in (-1.0, 1.0) for z in (-1.0, 1.0)],
+        dtype=torch.float32,
+        device=device,
+    )  # (8, 3)
+    edges = torch.tensor(
+        [(0, 1), (0, 2), (1, 3), (2, 3), (4, 5), (4, 6), (5, 7), (6, 7),
+         (0, 4), (1, 5), (2, 6), (3, 7)],
+        dtype=torch.long,
+        device=device,
+    )  # (12, 2)
+    line_t = torch.linspace(0.0, 1.0, points_per_edge, device=device)  # (P,)
+
+    palette = _instance_palette(num_inst, device)  # (M, 3) rgb in [0, 1]
+    sizes = rigid_state["instances_size"]  # (M, 3)
+    trans = rigid_state["poses.trans"][frame_idx]  # (M, 3)
+    quats = rigid_state["poses.quats"][frame_idx]  # (M, 4)
+
+    means_list, colors_list, scales_list = [], [], []
+    for m in active.tolist():
+        size = sizes[m]
+        corners_local = signs * (size[None, :] / 2.0)  # (8, 3)
+        R = quat_to_rotmat(quat_normalize(quats[m]))
+        corners_world = (R @ corners_local.T).T + trans[m]  # (8, 3)
+        c0 = corners_world[edges[:, 0]]
+        c1 = corners_world[edges[:, 1]]
+        pts = c0[:, None, :] + (c1 - c0)[:, None, :] * line_t[None, :, None]
+        pts = pts.reshape(-1, 3)
+        means_list.append(pts)
+
+        col = torch.zeros(pts.shape[0], num_sh_bases, 3, device=device)
+        col[:, 0, :] = rgb_to_sh(palette[m][None, :]).expand(pts.shape[0], 3)
+        colors_list.append(col)
+
+        s = float((scale_frac * size.min()).clamp_min(1e-3))
+        scales_list.append(torch.full((pts.shape[0], 3), s, device=device))
+
+    means = torch.cat(means_list, dim=0)
+    colors = torch.cat(colors_list, dim=0)
+    scales = torch.cat(scales_list, dim=0)
+    n = means.shape[0]
+    quats_out = torch.zeros(n, 4, device=device)
+    quats_out[:, 0] = 1.0
+    opacities = torch.full((n,), float(opacity), device=device)
+    return {
+        "means": means,
+        "quats": quats_out,
+        "scales": scales,
+        "opacities": opacities,
+        "colors": colors,
+    }
+
+
+
 
 class StandaloneRenderer:
     """Renders frames from a trained GSplat model."""
@@ -347,6 +435,7 @@ class StandaloneRenderer:
         ftheta_coeffs: Optional[FThetaCameraDistortionParameters] = None,
         camera_idx: Optional[int] = None,
         rigid_frame_idx: Optional[int] = None,
+        draw_boxes: bool = False,
     ) -> np.ndarray:
         """Render a single frame.
 
@@ -405,6 +494,17 @@ class StandaloneRenderer:
                 opacities = torch.cat([opacities, rigid["opacities"]], dim=0)
                 colors = torch.cat([colors, rigid["colors"]], dim=0)
 
+        # Debug overlay: draw per-instance 3D boxes as semi-transparent Gaussians
+        # (same rasterization pass -> aligns exactly with the render).
+        if draw_boxes and self.rigid_state is not None and rigid_frame_idx is not None:
+            boxes = rigid_box_edge_gaussians(self.rigid_state, int(rigid_frame_idx))
+            if boxes is not None:
+                means = torch.cat([means, boxes["means"]], dim=0)
+                quats = torch.cat([quats, boxes["quats"]], dim=0)
+                scales = torch.cat([scales, boxes["scales"]], dim=0)
+                opacities = torch.cat([opacities, boxes["opacities"]], dim=0)
+                colors = torch.cat([colors, boxes["colors"]], dim=0)
+
         # Rasterize
         render_colors, render_alphas, _ = rasterization(
             means=means,
@@ -462,6 +562,7 @@ class StandaloneRenderer:
         fps: int = 30,
         camera_idx: Optional[int] = None,
         freeze_timestep: Optional[int] = None,
+        draw_boxes: bool = False,
     ) -> List[str]:
         """Render a full camera trajectory.
 
@@ -518,6 +619,7 @@ class StandaloneRenderer:
                 ftheta_coeffs=camera.ftheta_coeffs,
                 camera_idx=camera_idx,
                 rigid_frame_idx=rigid_frame_idx,
+                draw_boxes=draw_boxes,
             )
 
             frame_path = os.path.join(frames_dir, f"frame_{i:05d}.png")
@@ -643,6 +745,7 @@ def main(cfg: DictConfig):
     # (int) holds all frames at one rigid frame instead of animating.
     render_dynamic = render_cfg.get("render_dynamic", True)
     freeze_timestep = render_cfg.get("freeze_timestep")
+    draw_boxes = bool(render_cfg.get("debug_render_boxes", False))
     rigid_state = None
     if render_dynamic:
         if checkpoint_path and os.path.exists(checkpoint_path):
@@ -733,6 +836,7 @@ def main(cfg: DictConfig):
                     if (rigid_state is not None and freeze_timestep is not None)
                     else None
                 ),
+                draw_boxes=draw_boxes and rigid_state is not None,
             )
 
     # Write success marker

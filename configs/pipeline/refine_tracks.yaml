@@ -67,6 +67,26 @@ displacement_smooth: 3
 min_rel_displacement: 0.1
 displacement_percentile: 90.0
 
+# --- Gap filling (make each kept track continuous within its lifespan) ---
+# The tracker often drops individual frames; interpolate the missing boxes
+# (linear position/size, SLERP rotation) between a track's first and last
+# observed frame so the 4DGS rigid node renders without holes. Filled boxes are
+# marked with "interpolated": true in the JSON.
+fill_gaps: true
+# End extension: extrapolate up to this many frames BEFORE the first / AFTER the
+# last observed frame using constant ground-plane velocity (rotation & size
+# held). Covers objects still visible in the fisheye view but no longer detected
+# by the narrower-FOV tracker at frame edges / far range. 0 disables. Extended
+# boxes are marked "extrapolated": true.
+extend_frames: 5
+extend_velocity_window: 3
+
+# Pose smoothing: after gap-fill/extension, low-pass each track's per-frame
+# translation with a centered moving average of this many frames to remove
+# tracker position jitter (shaky rigid motion). Rotation & size are left
+# untouched. 0 or 1 disables; larger = smoother but can round off sharp turns.
+pose_smooth_window: 5
+
 # --- Visualization (BEV qualitative validation) ---
 # The orchestrator renders raw and/or refined predictions per these toggles.
 visualize:

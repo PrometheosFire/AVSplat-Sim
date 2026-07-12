@@ -30,6 +30,7 @@ from omegaconf import DictConfig
 from src.tracking.track_geometry import (
     bev_iou,
     box_center_ground,
+    UP_AXIS,
 )
 
 
@@ -372,6 +373,212 @@ def filter_static(
 
 
 # --------------------------------------------------------------------------- #
+# Gap filling (interpolate missing frames inside each track's lifespan)
+# --------------------------------------------------------------------------- #
+def _slerp_wxyz(q0, q1, alpha: float) -> np.ndarray:
+    """Spherical linear interpolation between two ``[w, x, y, z]`` quaternions."""
+    a = np.asarray(q0, dtype=np.float64)
+    b = np.asarray(q1, dtype=np.float64)
+    a = a / (np.linalg.norm(a) + 1e-12)
+    b = b / (np.linalg.norm(b) + 1e-12)
+    dot = float(np.dot(a, b))
+    if dot < 0.0:  # take the shortest arc (q and -q are the same rotation)
+        b = -b
+        dot = -dot
+    if dot > 0.9995:  # nearly parallel -> normalized lerp avoids div-by-zero
+        q = (1.0 - alpha) * a + alpha * b
+        return q / (np.linalg.norm(q) + 1e-12)
+    theta0 = np.arccos(np.clip(dot, -1.0, 1.0))
+    theta = theta0 * alpha
+    perp = b - a * dot
+    perp = perp / (np.linalg.norm(perp) + 1e-12)
+    return a * np.cos(theta) + perp * np.sin(theta)
+
+
+def _interp_box(box_a: dict, box_b: dict, alpha: float) -> dict:
+    """Interpolate a box between two keyframes (lerp position/size, slerp rot)."""
+    import copy
+
+    nb = copy.deepcopy(box_a)
+    ta = np.asarray(box_a["translation"], dtype=np.float64)
+    tb = np.asarray(box_b["translation"], dtype=np.float64)
+    nb["translation"] = ((1.0 - alpha) * ta + alpha * tb).tolist()
+    if "size" in box_a and "size" in box_b:
+        sa = np.asarray(box_a["size"], dtype=np.float64)
+        sb = np.asarray(box_b["size"], dtype=np.float64)
+        nb["size"] = ((1.0 - alpha) * sa + alpha * sb).tolist()
+    nb["rotation"] = _slerp_wxyz(box_a["rotation"], box_b["rotation"], alpha).tolist()
+    if box_a.get("velocity") is not None and box_b.get("velocity") is not None:
+        va = np.asarray(box_a["velocity"], dtype=np.float64)
+        vb = np.asarray(box_b["velocity"], dtype=np.float64)
+        nb["velocity"] = ((1.0 - alpha) * va + alpha * vb).tolist()
+    sca = float(box_a.get("tracking_score", 1.0))
+    scb = float(box_b.get("tracking_score", 1.0))
+    nb["tracking_score"] = (1.0 - alpha) * sca + alpha * scb
+    nb["interpolated"] = True  # mark synthetic boxes for debugging/inspection
+    return nb
+
+
+def fill_track_gaps(
+    tracks: dict[int, dict[int, dict]], frame_keys: list[str]
+) -> int:
+    """Fill interior frame gaps of each track by interpolation, in place.
+
+    For every track, any frame missing between its first and last observed
+    frame is synthesized by interpolating the two surrounding keyframes
+    (linear on translation/size, SLERP on rotation). This makes each track
+    gap-free within its lifespan so the 4DGS rigid node is rendered continuously
+    (the tracker often drops individual frames). Returns the number of frames
+    filled. Object identity (``tracking_id``/``tracking_name``) and per-instance
+    size are preserved; frames outside ``[first, last]`` are untouched.
+    """
+    n_filled = 0
+    n_keys = len(frame_keys)
+    for track in tracks.values():
+        frames = sorted(track)
+        if len(frames) < 2:
+            continue
+        for a, b in zip(frames[:-1], frames[1:]):
+            if b - a <= 1:
+                continue
+            box_a, box_b = track[a], track[b]
+            for f in range(a + 1, b):
+                new_box = _interp_box(box_a, box_b, (f - a) / (b - a))
+                if 0 <= f < n_keys and "sample_token" in new_box:
+                    new_box["sample_token"] = frame_keys[f]
+                track[f] = new_box
+                n_filled += 1
+    return n_filled
+
+
+# --------------------------------------------------------------------------- #
+# End extension (extrapolate a bounded number of frames past each track's ends)
+# --------------------------------------------------------------------------- #
+def _endpoint_velocity_3d(track, frames, at_start: bool, window: int) -> np.ndarray:
+    """3D translation velocity (per frame) at a track endpoint.
+
+    Vertical (up-axis) component is zeroed so extrapolation stays on the ground
+    plane and vehicles don't drift up/down from tracker jitter.
+    """
+    if len(frames) < 2:
+        return np.zeros(3)
+    if at_start:
+        i0, i1 = 0, min(window, len(frames) - 1)
+    else:
+        i1, i0 = len(frames) - 1, max(0, len(frames) - 1 - window)
+    f0, f1 = frames[i0], frames[i1]
+    span = f1 - f0
+    if span <= 0:
+        return np.zeros(3)
+    t0 = np.asarray(track[f0]["translation"], dtype=np.float64)
+    t1 = np.asarray(track[f1]["translation"], dtype=np.float64)
+    vel = (t1 - t0) / float(span)
+    vel[UP_AXIS] = 0.0
+    return vel
+
+
+def _extrap_box(base_box: dict, new_trans: np.ndarray, token: str | None) -> dict:
+    """Copy a keyframe box at a new translation (rotation/size held constant)."""
+    import copy
+
+    nb = copy.deepcopy(base_box)
+    nb["translation"] = np.asarray(new_trans, dtype=np.float64).tolist()
+    nb["interpolated"] = True
+    nb["extrapolated"] = True  # synthesized beyond the observed track span
+    if token is not None and "sample_token" in nb:
+        nb["sample_token"] = token
+    return nb
+
+
+def extend_track_ends(
+    tracks: dict[int, dict[int, dict]],
+    frame_keys: list[str],
+    extend_frames: int,
+    vel_window: int = 3,
+) -> int:
+    """Extrapolate up to ``extend_frames`` frames before/after each track, in place.
+
+    The tracker runs on undistorted crops with a narrower FOV than the fisheye
+    cameras, so objects entering/leaving frame (or getting far) stop being
+    detected while still visible in the training images. Extend each track with
+    constant ground-plane velocity (rotation and size held), bounded by
+    ``extend_frames`` and the clip range. Returns the number of frames added.
+    """
+    if extend_frames <= 0:
+        return 0
+    n_keys = len(frame_keys)
+    n_ext = 0
+    for track in tracks.values():
+        frames = sorted(track)
+        if len(frames) < 2:
+            continue
+        first, last = frames[0], frames[-1]
+
+        # Forward from the last observed frame.
+        v_end = _endpoint_velocity_3d(track, frames, at_start=False, window=vel_window)
+        base_box = track[last]
+        base_t = np.asarray(base_box["translation"], dtype=np.float64)
+        for k in range(1, extend_frames + 1):
+            f = last + k
+            if f >= n_keys or f in track:
+                break
+            token = frame_keys[f] if 0 <= f < n_keys else None
+            track[f] = _extrap_box(base_box, base_t + v_end * k, token)
+            n_ext += 1
+
+        # Backward from the first observed frame.
+        v_start = _endpoint_velocity_3d(track, frames, at_start=True, window=vel_window)
+        base_box = track[first]
+        base_t = np.asarray(base_box["translation"], dtype=np.float64)
+        for k in range(1, extend_frames + 1):
+            f = first - k
+            if f < 0 or f in track:
+                break
+            token = frame_keys[f] if 0 <= f < n_keys else None
+            track[f] = _extrap_box(base_box, base_t - v_start * k, token)
+            n_ext += 1
+    return n_ext
+
+
+# --------------------------------------------------------------------------- #
+# Translation smoothing (denoise per-frame tracker jitter)
+# --------------------------------------------------------------------------- #
+def smooth_track_translations(
+    tracks: dict[int, dict[int, dict]], window: int
+) -> int:
+    """Low-pass each track's per-frame translation with a centered moving average.
+
+    The tracker's per-frame box centers jitter (depth/position noise), which
+    shows up as shaky rigid-object motion. A centered moving average over
+    ``window`` frames denoises the translation while preserving overall motion;
+    the window shrinks at track ends so endpoints aren't dragged. Rotation and
+    size are left untouched (rotation smoothing is intentionally not applied).
+    Operates in place; returns the number of frames modified.
+    """
+    if window <= 1:
+        return 0
+    half = window // 2
+    n_smoothed = 0
+    for track in tracks.values():
+        frames = sorted(track)
+        if len(frames) < 3:
+            continue
+        trans = np.asarray(
+            [track[f]["translation"] for f in frames], dtype=np.float64
+        )  # (T, 3)
+        smoothed = np.empty_like(trans)
+        T = trans.shape[0]
+        for i in range(T):
+            lo = max(0, i - half)
+            hi = min(T, i + half + 1)
+            smoothed[i] = trans[lo:hi].mean(axis=0)
+        for i, f in enumerate(frames):
+            track[f]["translation"] = smoothed[i].tolist()
+            n_smoothed += 1
+    return n_smoothed
+
+
+# --------------------------------------------------------------------------- #
 # Serialization
 # --------------------------------------------------------------------------- #
 def tracks_to_results(
@@ -424,6 +631,32 @@ def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
         min_rel_displacement=float(cfg.get("min_rel_displacement", 0.0)),
     )
 
+    # Interpolate interior frame gaps so each kept track is continuous within its
+    # lifespan (the tracker frequently drops single frames). Done after filtering
+    # so we never waste work on tracks that get dropped.
+    n_filled = 0
+    if bool(cfg.get("fill_gaps", True)):
+        n_filled = fill_track_gaps(kept, frame_keys)
+
+    # Extrapolate a bounded number of frames past each track's ends to cover the
+    # fisheye FOV edges / far-away dropouts the (narrower-FOV) tracker misses.
+    n_extended = 0
+    if int(cfg.get("extend_frames", 0)) > 0:
+        n_extended = extend_track_ends(
+            kept,
+            frame_keys,
+            extend_frames=int(cfg.get("extend_frames", 0)),
+            vel_window=int(cfg.get("extend_velocity_window", 3)),
+        )
+
+    # Low-pass the (now dense) per-frame translations to remove tracker jitter,
+    # which otherwise shows up as shaky rigid-object motion in the 4DGS render.
+    n_smoothed = 0
+    if int(cfg.get("pose_smooth_window", 0)) > 1:
+        n_smoothed = smooth_track_translations(
+            kept, window=int(cfg.get("pose_smooth_window", 0))
+        )
+
     report = {
         "tracks_in": n_in,
         "tracks_after_fusion": n_fused,
@@ -432,6 +665,9 @@ def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
         "tracks_dropped": len(dropped),
         "dropped_static": sum(1 for d in dropped if d["reason"] == "static"),
         "dropped_short": sum(1 for d in dropped if d["reason"] == "short"),
+        "frames_filled": n_filled,
+        "frames_extended": n_extended,
+        "frames_smoothed": n_smoothed,
     }
     return tracks_to_results(kept, frame_keys), report
 
@@ -487,7 +723,10 @@ def main(cfg: DictConfig) -> None:
     print(
         f"✅ Refined: {report['tracks_in']} -> {report['tracks_after_fusion']} "
         f"(merged {report['merges']}) -> kept {report['tracks_kept']} "
-        f"(dropped {report['dropped_static']} static, {report['dropped_short']} short)"
+        f"(dropped {report['dropped_static']} static, {report['dropped_short']} short) "
+        f"| filled {report['frames_filled']} gap frames"
+        f", extended {report['frames_extended']} end frames"
+        f", smoothed {report['frames_smoothed']} frames"
     )
     with open(os.path.join(output_dir, ".success"), "w", encoding="utf-8") as f:
         f.write("Refinement finished successfully.")

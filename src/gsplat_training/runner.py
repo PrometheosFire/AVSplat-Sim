@@ -641,6 +641,7 @@ class Runner:
         camera_idcs: Optional[Tensor] = None,
         exposure: Optional[Tensor] = None,
         rigid_frame_idx: Optional[int] = None,
+        draw_boxes: bool = False,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         """Rasterize 3D Gaussians into 2D image tensors using differentiable splatting.
@@ -758,6 +759,18 @@ class Runner:
                 opacities = torch.cat([opacities, rigid["opacities"]], dim=0)
                 colors = torch.cat([colors, rigid["colors"]], dim=0)
                 n_rigid = rigid["means"].shape[0]
+
+        # --- Debug overlay: draw per-instance 3D boxes as semi-transparent
+        # Gaussians so they line up exactly with the render (distortion included).
+        # Visualization only (detached); typically enabled in eval / trajectory.
+        if draw_boxes and rigid_nodes is not None and rigid_frame_idx is not None:
+            boxes = rigid_nodes.get_box_edge_gaussians(int(rigid_frame_idx))
+            if boxes is not None:
+                means = torch.cat([means, boxes["means"]], dim=0)
+                quats = torch.cat([quats, boxes["quats"]], dim=0)
+                scales = torch.cat([scales, boxes["scales"]], dim=0)
+                opacities = torch.cat([opacities, boxes["opacities"]], dim=0)
+                colors = torch.cat([colors, boxes["colors"]], dim=0)
 
         render_colors, render_alphas, info = rasterization(
             means=means,
@@ -1446,12 +1459,20 @@ class Runner:
         (before the per-frame SE(3) pose), so the reconstruction of each object can
         be inspected on its own — independent of motion. No-op when dynamic rigid
         objects are disabled.
+
+        When ``cfg.rigid_ply_dc_only`` is set, the higher-order SH bands are
+        dropped so external viewers show a flat, view-independent color. Rigid
+        vehicles are only seen from a narrow range of angles in training, so their
+        view-dependent SH overfits and "explodes" into rainbow colors when
+        free-orbited in a viewer (SuperSplat etc.) — dropping it makes the base
+        geometry/color inspectable.
         """
         if self.rigid_nodes is None:
             return
 
         rigid_dir = self.ply_dir
         os.makedirs(rigid_dir, exist_ok=True)
+        dc_only = bool(getattr(self.cfg, "rigid_ply_dc_only", True))
 
         gauss = self.rigid_nodes.gauss
         point_ids = self.rigid_nodes.point_ids
@@ -1462,6 +1483,13 @@ class Runner:
                 continue
             tid = self.rigid_nodes.instance_ids[m]
             cname = str(self.rigid_nodes.class_names[m]).replace("/", "_")
+            if dc_only:
+                # Empty higher-order SH -> viewer renders view-independent DC color.
+                shN = torch.empty(
+                    (sel.numel(), 0, 3), device=gauss["shN"].device
+                )
+            else:
+                shN = gauss["shN"][sel]
             # export_splats consumes raw params (log scales, logit opacities),
             # exactly as stored — same convention as the background PLY export.
             export_splats(
@@ -1470,7 +1498,7 @@ class Runner:
                 quats=gauss["quats"][sel],
                 opacities=gauss["opacities"][sel],
                 sh0=gauss["sh0"][sel],
-                shN=gauss["shN"][sel],
+                shN=shN,
                 format="ply",
                 save_to=os.path.join(
                     rigid_dir, f"instance{m:03d}_id{tid}_{cname}_step{step}.ply"
@@ -1479,6 +1507,7 @@ class Runner:
             n_written += 1
         print(
             f"[Dynamic] Exported {n_written} rigid instance PLYs to {rigid_dir}"
+            f"{' (DC-only color)' if dc_only else ''}"
         )
 
     @torch.no_grad()
@@ -1534,6 +1563,7 @@ class Runner:
 
             torch.cuda.synchronize()
             tic = time.time()
+            rigid_idx = self._resolve_rigid_frame_idx(data)
             colors, _, _ = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -1546,7 +1576,7 @@ class Runner:
                 frame_idcs=None,  # For novel views, pass None (no per-frame parameters available)
                 camera_idcs=data["camera_idx"].to(device),
                 exposure=exposure,
-                rigid_frame_idx=self._resolve_rigid_frame_idx(data),
+                rigid_frame_idx=rigid_idx,
             )  # [1, H, W, 3]
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
@@ -1564,6 +1594,37 @@ class Runner:
                     f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
                     canvas,
                 )
+
+                # Debug: also save a render with per-instance 3D boxes overlaid.
+                if (
+                    getattr(cfg, "debug_render_boxes", False)
+                    and self.rigid_nodes is not None
+                    and rigid_idx is not None
+                ):
+                    boxed, _, _ = self.rasterize_splats(
+                        camtoworlds=camtoworlds,
+                        Ks=Ks,
+                        width=width,
+                        height=height,
+                        sh_degree=cfg.sh_degree,
+                        near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane,
+                        masks=masks,
+                        frame_idcs=None,
+                        camera_idcs=data["camera_idx"].to(device),
+                        exposure=exposure,
+                        rigid_frame_idx=rigid_idx,
+                        draw_boxes=True,
+                    )
+                    boxed = torch.clamp(boxed[..., :3], 0.0, 1.0)
+                    boxed_canvas = torch.cat([pixels_masked, boxed], dim=2)
+                    boxed_canvas = (boxed_canvas.squeeze(0).cpu().numpy() * 255).astype(
+                        np.uint8
+                    )
+                    imageio.imwrite(
+                        f"{self.render_dir}/{stage}_step{step}_{i:04d}_boxes.png",
+                        boxed_canvas,
+                    )
 
                 pixels_p = pixels_masked.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
@@ -1982,6 +2043,7 @@ class Runner:
                 masks=None,
                 exposure=None,
                 rigid_frame_idx=rigid_frame_idx,
+                draw_boxes=getattr(cfg, "debug_render_boxes", False),
             )
 
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)

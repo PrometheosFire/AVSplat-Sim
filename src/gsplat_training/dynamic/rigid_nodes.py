@@ -75,6 +75,22 @@ def _random_quats(n: int) -> Tensor:
     return F.normalize(q, dim=-1)
 
 
+def _instance_palette(num_instances: int, device) -> Tensor:
+    """Return ``(num_instances, 3)`` visually distinct RGB colors in [0, 1].
+
+    Uses golden-ratio hue spacing so adjacent instance ids get well-separated
+    hues (good for telling neighboring boxes apart).
+    """
+    import colorsys
+
+    golden = 0.61803398875
+    colors = [
+        colorsys.hsv_to_rgb((i * golden) % 1.0, 0.65, 0.95)
+        for i in range(max(1, num_instances))
+    ]
+    return torch.tensor(colors, dtype=torch.float32, device=device)
+
+
 # ---------------------------------------------------------------------------
 # RigidNodes model
 # ---------------------------------------------------------------------------
@@ -227,6 +243,82 @@ class RigidNodes(nn.Module):
             "opacities": opacities,
             "colors": colors,
             "gaussian_idx": idx,
+        }
+
+    @torch.no_grad()
+    def get_box_edge_gaussians(
+        self,
+        frame_idx: int,
+        opacity: float = 0.4,
+        points_per_edge: int = 24,
+        scale_frac: float = 0.03,
+    ) -> Optional[Dict[str, Tensor]]:
+        """Build semi-transparent, per-instance-colored box wireframes as Gaussians.
+
+        For every instance valid at ``frame_idx``, samples points along the 12
+        edges of its oriented 3D box (posed into the world/training frame) and
+        returns them as ready-to-composite Gaussians (activated params: actual
+        ``scales``, ``opacities`` in [0, 1], ``colors`` as SH coefficients). Drawing
+        these through the normal rasterization pass makes the boxes line up exactly
+        with the render, distortion included. Returns ``None`` if no instance is
+        present this frame. Debug/visualization only — not optimized.
+        """
+        from utils import rgb_to_sh  # local import; lives in gsplat_training
+
+        device = self.poses["trans"].device
+        fv_f = self.instances_fv[frame_idx]  # (M,) bool
+        active = fv_f.nonzero(as_tuple=True)[0]
+        if active.numel() == 0:
+            return None
+
+        # 8 unit-cube corners and the 12 edges connecting them.
+        signs = torch.tensor(
+            [[x, y, z] for x in (-1.0, 1.0) for y in (-1.0, 1.0) for z in (-1.0, 1.0)],
+            dtype=torch.float32,
+            device=device,
+        )  # (8, 3)
+        edges = torch.tensor(
+            [(0, 1), (0, 2), (1, 3), (2, 3), (4, 5), (4, 6), (5, 7), (6, 7),
+             (0, 4), (1, 5), (2, 6), (3, 7)],
+            dtype=torch.long,
+            device=device,
+        )  # (12, 2)
+        line_t = torch.linspace(0.0, 1.0, points_per_edge, device=device)  # (P,)
+
+        palette = _instance_palette(self.num_instances, device)  # (M, 3) rgb in [0,1]
+        means_list, colors_list, scales_list = [], [], []
+        for m in active.tolist():
+            size = self.instances_size[m]  # (3,)
+            corners_local = signs * (size[None, :] / 2.0)  # (8, 3)
+            R = quat_to_rotmat(quat_normalize(self.poses["quats"][frame_idx][m]))
+            t = self.poses["trans"][frame_idx][m]
+            corners_world = (R @ corners_local.T).T + t  # (8, 3)
+            c0 = corners_world[edges[:, 0]]  # (12, 3)
+            c1 = corners_world[edges[:, 1]]  # (12, 3)
+            pts = c0[:, None, :] + (c1 - c0)[:, None, :] * line_t[None, :, None]
+            pts = pts.reshape(-1, 3)  # (12 * P, 3)
+            means_list.append(pts)
+
+            col = torch.zeros(pts.shape[0], self.num_sh_bases, 3, device=device)
+            col[:, 0, :] = rgb_to_sh(palette[m][None, :]).expand(pts.shape[0], 3)
+            colors_list.append(col)
+
+            s = float((scale_frac * size.min()).clamp_min(1e-3))
+            scales_list.append(torch.full((pts.shape[0], 3), s, device=device))
+
+        means = torch.cat(means_list, dim=0)
+        colors = torch.cat(colors_list, dim=0)
+        scales = torch.cat(scales_list, dim=0)
+        n = means.shape[0]
+        quats = torch.zeros(n, 4, device=device)
+        quats[:, 0] = 1.0
+        opacities = torch.full((n,), float(opacity), device=device)
+        return {
+            "means": means,
+            "quats": quats,
+            "scales": scales,
+            "opacities": opacities,
+            "colors": colors,
         }
 
     # ------------------------------------------------------------------

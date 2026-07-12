@@ -206,22 +206,29 @@ class Config:
     # Minimum tracking score to keep a box.
     dynamic_min_track_score: float = 0.0
     # Initial number of Gaussians sampled inside each instance box.
-    rigid_init_points_per_instance: int = 2000
+    rigid_init_points_per_instance: int = 5000
     # Per-frame pose learning rates (translation moves faster than rotation).
     rigid_pose_trans_lr: float = 5e-4
     rigid_pose_quats_lr: float = 1e-5
     # Temporal smoothness (2nd-order on translation) weight + window.
-    rigid_smooth_w: float = 0.01
+    rigid_smooth_w: float = 0.05
     rigid_smooth_range: int = 5
     # Rigid densification (Default-3DGS-style on the 3D positional gradient).
-    rigid_grow_grad_thresh: float = 4e-4
+    rigid_grow_grad_thresh: float = 5e-5
     rigid_grow_scale3d: float = 0.01
-    rigid_prune_opacity: float = 0.05
+    rigid_prune_opacity: float = 0.02
     rigid_prune_scale3d: float = 0.5
     # Hard cap on the TOTAL number of rigid Gaussians across all instances.
     rigid_cap_max: int = 1_000_000
+    # Debug: also save eval/trajectory renders with per-instance 3D boxes drawn
+    # (semi-transparent, per-instance color) to inspect dynamic-object alignment.
+    debug_render_boxes: bool = False
+    # Export per-instance rigid PLYs with DC-only color (drop higher-order SH) so
+    # external viewers show flat, view-independent color instead of the rainbow
+    # SH-overfit artifact when free-orbiting an object seen from few angles.
+    rigid_ply_dc_only: bool = True
     rigid_refine_start_iter: int = 500
-    rigid_refine_stop_iter: int = 15_000
+    rigid_refine_stop_iter: int = 25_000
     rigid_refine_every: int = 100
     rigid_warmup_for_big_prune: int = 3_000
     rigid_cull_out_of_bound: bool = True
