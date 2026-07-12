@@ -87,6 +87,21 @@ extend_velocity_window: 3
 # untouched. 0 or 1 disables; larger = smoother but can round off sharp turns.
 pose_smooth_window: 5
 
+# --- Interactive user refinement (post automatic refinement) ---
+# If enabled, after the automatic refinement the terminal accepts commands:
+#   Filter: <class>_<id>
+#   Fuse: <class>_<id>, <class>_<id> [, ...]
+#   Extend: <class>_<id>[, <int>]
+#   undo
+#   done
+# Each accepted modification writes a numbered snapshot under
+# <refine_dir>/user_refinement/NNN/track_3d_refined_colmap.json.
+user_refinement:
+  enabled: true
+  output_dir: "user_refinement"
+  default_extend: 5
+  extend_velocity_window: 3
+
 # --- Visualization (BEV qualitative validation) ---
 # The orchestrator renders raw and/or refined predictions per these toggles.
 visualize:

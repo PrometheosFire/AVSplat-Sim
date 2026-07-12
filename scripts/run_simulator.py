@@ -59,6 +59,32 @@ def _find_latest_checkpoint(ckpt_dir: str) -> str:
     return os.path.join(ckpt_dir, ckpts[-1]) if ckpts else ""
 
 
+def _latest_user_refined_json(refine_dir: str) -> str:
+    """Return latest numbered user-refinement JSON, or "" if unavailable."""
+    root = os.path.join(refine_dir, "user_refinement")
+    if not os.path.isdir(root):
+        return ""
+
+    iters: list[tuple[int, str]] = []
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            idx = int(name)
+        except ValueError:
+            continue
+        cand = os.path.join(path, "track_3d_refined_colmap.json")
+        ok = os.path.exists(cand) and os.path.exists(os.path.join(path, ".success"))
+        if ok:
+            iters.append((idx, cand))
+
+    if not iters:
+        return ""
+    iters.sort(key=lambda x: x[0])
+    return iters[-1][1]
+
+
 def _resolve_cached_inputs(cfg: DictConfig) -> tuple[str, str]:
     """Resolve simulator inputs from the same cache hashes used by the orchestrator."""
     dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
@@ -88,6 +114,10 @@ def _resolve_cached_inputs(cfg: DictConfig) -> tuple[str, str]:
     )
     refine_dir = os.path.join(base_results_dir, f"15_refine_{step15_hash}")
     refined_tracks_json = os.path.join(refine_dir, "track_3d_refined_colmap.json")
+    if refine_task_cfg.get("user_refinement", {}).get("enabled", False):
+        latest_user_json = _latest_user_refined_json(refine_dir)
+        if latest_user_json:
+            refined_tracks_json = latest_user_json
 
     scene_root = os.path.abspath(dataset_cfg["base_dir"])
     step20_hash = generate_config_hash(

@@ -901,6 +901,24 @@ class Runner:
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
         ]
+        # Rigid pose learning-rate decay (OmniRe schedule: linear, trans 5e-4→1e-4,
+        # quats 1e-5→5e-6).  Guards against a zero initial LR to avoid div-by-zero.
+        if self.rigid_nodes is not None:
+            for key, opt in self.rigid_pose_optimizers.items():
+                init_lr = opt.param_groups[0]["lr"]
+                if key == "pose_trans":
+                    final_lr = cfg.rigid_pose_trans_lr_final
+                else:
+                    final_lr = cfg.rigid_pose_quats_lr_final
+                end_factor = (final_lr / init_lr) if init_lr > 0 else 1.0
+                schedulers.append(
+                    torch.optim.lr_scheduler.LinearLR(
+                        opt,
+                        start_factor=1.0,
+                        end_factor=end_factor,
+                        total_iters=max_steps,
+                    )
+                )
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
@@ -1172,6 +1190,17 @@ class Runner:
                     rigid_frame_idx, cfg.rigid_smooth_range
                 )
 
+            # Rigid sharp-shape regularisation: penalise aspect ratio > max_ratio.
+            # Applied every rigid_sharp_shape_every steps (OmniRe: weight 1.0, every 10).
+            if (
+                self.rigid_nodes is not None
+                and cfg.rigid_sharp_shape_w > 0.0
+                and step % cfg.rigid_sharp_shape_every == 0
+            ):
+                loss = loss + cfg.rigid_sharp_shape_w * self.rigid_nodes.sharp_shape_loss(
+                    cfg.rigid_sharp_shape_ratio
+                )
+
             loss.backward()
 
             # Accumulate the rigid densification signal (3D positional gradient)
@@ -1413,6 +1442,17 @@ class Runner:
                 self.rigid_densifier.step(
                     self.rigid_nodes, self.rigid_gauss_optimizers, step
                 )
+
+            # Rigid opacity reset (OmniRe: every 3000 steps, clamp to max 0.01).
+            # Forces saturated / dead Gaussians to re-compete via densification.
+            if (
+                self.rigid_nodes is not None
+                and cfg.rigid_reset_opacity_every > 0
+                and step > 0
+                and step % cfg.rigid_reset_opacity_every == 0
+            ):
+                _max_logit = torch.logit(torch.tensor(0.01))
+                self.rigid_nodes.gauss["opacities"].data.clamp_(max=_max_logit.item())
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:

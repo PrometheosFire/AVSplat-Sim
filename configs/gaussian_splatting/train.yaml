@@ -70,9 +70,19 @@ rigid_init_points_per_instance: 5000
 # Per-frame pose learning rates.
 rigid_pose_trans_lr: 0.0005
 rigid_pose_quats_lr: 0.00001
+# Final pose LRs for linear decay over training (OmniRe schedule).
+# trans: 5e-4 -> 1e-4, quats: 1e-5 -> 5e-6.
+rigid_pose_trans_lr_final: 0.0001
+rigid_pose_quats_lr_final: 0.000005
 # Temporal smoothness (2nd-order on translation) weight + window.
 rigid_smooth_w: 0.0 #0.05
 rigid_smooth_range: 5
+# Opacity reset for rigid Gaussians every N steps (0 = off).
+rigid_reset_opacity_every: 3000
+# Sharp-shape regularisation: penalise aspect ratio > ratio (OmniRe: w=1.0, every 10).
+rigid_sharp_shape_w: 1.0
+rigid_sharp_shape_ratio: 10.0
+rigid_sharp_shape_every: 10
 # Rigid densification (Default-3DGS-style on the 3D positional gradient).
 rigid_grow_grad_thresh: 0.00005
 rigid_grow_scale3d: 0.01

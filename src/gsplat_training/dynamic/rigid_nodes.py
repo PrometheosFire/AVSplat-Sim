@@ -324,6 +324,22 @@ class RigidNodes(nn.Module):
     # ------------------------------------------------------------------
     # Regularization
     # ------------------------------------------------------------------
+    def sharp_shape_loss(self, max_ratio: float = 10.0) -> Tensor:
+        """Penalise Gaussians whose aspect ratio exceeds ``max_ratio``.
+
+        Mirrors OmniRe's "sharp shape" regulariser:
+        ``mean(max(scale_max / scale_min, max_ratio) - max_ratio)``
+
+        Zero when all Gaussians are rounder than ``max_ratio``; grows linearly
+        for more elongated splats.  Prevents thin planar sheets from forming on
+        vehicle surfaces, which confuse pose optimization from other viewpoints.
+        """
+        scales = torch.exp(self.gauss["scales"])          # (N, 3) actual scale
+        scale_max = scales.max(dim=-1).values             # (N,)
+        scale_min = scales.min(dim=-1).values.clamp_min(1e-6)
+        ratio = scale_max / scale_min                     # (N,)
+        return (ratio - max_ratio).clamp_min(0.0).mean()
+
     def temporal_smoothness_loss(
         self, frame_idx: int, smooth_range: int = 5
     ) -> Tensor:

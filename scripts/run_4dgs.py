@@ -35,6 +35,32 @@ def _latest_checkpoint(ckpt_dir: str) -> str:
     return os.path.join(ckpt_dir, ckpts[-1]) if ckpts else ""
 
 
+def _latest_user_refined_json(refine_dir: str) -> str:
+    """Return latest numbered user-refinement JSON, or "" if unavailable."""
+    root = os.path.join(refine_dir, "user_refinement")
+    if not os.path.isdir(root):
+        return ""
+
+    iters: list[tuple[int, str]] = []
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            idx = int(name)
+        except ValueError:
+            continue
+        cand = os.path.join(path, "track_3d_refined_colmap.json")
+        ok = os.path.exists(cand) and os.path.exists(os.path.join(path, ".success"))
+        if ok:
+            iters.append((idx, cand))
+
+    if not iters:
+        return ""
+    iters.sort(key=lambda x: x[0])
+    return iters[-1][1]
+
+
 def ensure_ncore_dataset(cfg, dataset_cfg: dict, overrides, explicit: str = "") -> str:
     """Create (or reuse) the ncore dataset for the 4DGS pipeline.
 
@@ -179,13 +205,16 @@ def main(cfg: DictConfig):
         )
         viz_cfg = refine_task_cfg.get("visualize", {})
         viz_dir = os.path.join(refine_dir, "vis")
-        refined_tracks_json = os.path.join(
-            refine_dir, "track_3d_refined_colmap.json"
-        )
+        refined_tracks_json = os.path.join(refine_dir, "track_3d_refined_colmap.json")
+        user_refine_enabled = refine_task_cfg.get("user_refinement", {}).get("enabled", False)
+        base_cache_hit = os.path.exists(refine_success)
+        cache_hit = base_cache_hit and not user_refine_enabled
 
-        if os.path.exists(refine_success):
+        if cache_hit:
             print(f"✅ Cache Hit! Reusing refinement from: {refine_dir}")
         else:
+            if base_cache_hit and user_refine_enabled:
+                print("♻️ Step 15 cache exists, but user_refinement.enabled=true so rerunning refinement.")
             print(f"🔄 New refinement config (Hash: {step15_hash}). Running...")
 
             # Optional BEV of the raw (pre-refinement) tracks.
@@ -211,37 +240,46 @@ def main(cfg: DictConfig):
                 env=env, check=True,
             )
 
-            # Optional BEV of the refined (post-refinement) tracks.
-            if viz_cfg.get("refined", True):
-                refined_json = os.path.join(
-                    refine_dir, "track_3d_refined_colmap.json"
-                )
-                subprocess.run(
-                    [
-                        python_exec, viz_script,
-                        f"refine_task.viz_input_json={refined_json}",
-                        f"refine_task.viz_output_path={os.path.join(viz_dir, 'bev_refined.png')}",
-                        *overrides,
-                    ],
-                    env=env, check=True,
-                )
-
-            # Optional: project refined boxes back onto the camera frames.
-            if viz_cfg.get("project", True):
-                refined_json = os.path.join(
-                    refine_dir, "track_3d_refined_colmap.json"
-                )
-                subprocess.run(
-                    [
-                        python_exec, project_script,
-                        f"refine_task.project_input_json={refined_json}",
-                        f"refine_task.project_output_dir={os.path.join(refine_dir, 'projected')}",
-                        *overrides,
-                    ],
-                    env=env, check=True,
-                )
-
             print(f"✅ Refinement saved to {refine_dir}")
+
+        selected_refined_json = (
+            _latest_user_refined_json(refine_dir) if user_refine_enabled else ""
+        ) or refined_tracks_json
+
+        if not cache_hit and viz_cfg.get("refined", True):
+            subprocess.run(
+                [
+                    python_exec,
+                    viz_script,
+                    f"refine_task.viz_input_json={selected_refined_json}",
+                    f"refine_task.viz_output_path={os.path.join(viz_dir, 'bev_refined.png')}",
+                    *overrides,
+                ],
+                env=env,
+                check=True,
+            )
+
+        # Optional: project refined boxes back onto the camera frames.
+        if not cache_hit and viz_cfg.get("project", True):
+            subprocess.run(
+                [
+                    python_exec,
+                    project_script,
+                    f"refine_task.project_input_json={selected_refined_json}",
+                    f"refine_task.project_output_dir={os.path.join(refine_dir, 'projected')}",
+                    *overrides,
+                ],
+                env=env,
+                check=True,
+            )
+
+        if user_refine_enabled:
+            latest_user_json = _latest_user_refined_json(refine_dir)
+            if latest_user_json:
+                refined_tracks_json = latest_user_json
+                print(f"🧑‍🔧 Using latest user refinement snapshot: {refined_tracks_json}")
+            else:
+                print("ℹ️ User refinement enabled but no snapshots found; using base refined JSON.")
 
     # ==========================================
     # STEP 20: 4D GAUSSIAN SPLATTING TRAINING (with dynamic rigid annotations)

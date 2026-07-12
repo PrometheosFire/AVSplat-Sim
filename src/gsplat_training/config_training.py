@@ -210,9 +210,21 @@ class Config:
     # Per-frame pose learning rates (translation moves faster than rotation).
     rigid_pose_trans_lr: float = 5e-4
     rigid_pose_quats_lr: float = 1e-5
+    # Final pose learning rates for linear LR decay (OmniRe schedule).
+    # Set to the same value as the initial LR to disable decay.
+    rigid_pose_trans_lr_final: float = 1e-4
+    rigid_pose_quats_lr_final: float = 5e-6
     # Temporal smoothness (2nd-order on translation) weight + window.
-    rigid_smooth_w: float = 0.05
+    rigid_smooth_w: float = 0.01
     rigid_smooth_range: int = 5
+    # Opacity reset for rigid Gaussians: every N steps clamp opacity to max 0.01
+    # (same as OmniRe). Forces dead/saturated Gaussians to re-compete. 0 = off.
+    rigid_reset_opacity_every: int = 3000
+    # Sharp-shape regularization: penalise Gaussians with aspect ratio > ratio.
+    # Weight 1.0 and every-10-steps matches OmniRe. 0.0 weight disables.
+    rigid_sharp_shape_w: float = 1.0
+    rigid_sharp_shape_ratio: float = 10.0
+    rigid_sharp_shape_every: int = 10
     # Rigid densification (Default-3DGS-style on the 3D positional gradient).
     rigid_grow_grad_thresh: float = 5e-5
     rigid_grow_scale3d: float = 0.01
@@ -262,3 +274,7 @@ class Config:
         self.rigid_refine_stop_iter = int(self.rigid_refine_stop_iter * factor)
         self.rigid_refine_every = max(1, int(self.rigid_refine_every * factor))
         self.rigid_warmup_for_big_prune = int(self.rigid_warmup_for_big_prune * factor)
+        if self.rigid_reset_opacity_every > 0:
+            self.rigid_reset_opacity_every = max(1, int(self.rigid_reset_opacity_every * factor))
+        if self.rigid_sharp_shape_every > 0:
+            self.rigid_sharp_shape_every = max(1, int(self.rigid_sharp_shape_every * factor))

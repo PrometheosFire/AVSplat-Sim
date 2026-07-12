@@ -17,6 +17,7 @@ Run standalone or via the 4DGS orchestrator. Input/output are resolved from
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 from collections import Counter, defaultdict
@@ -592,14 +593,362 @@ def tracks_to_results(
     return results
 
 
+def _write_user_iteration(
+    root_dir: str,
+    base_payload: dict,
+    tracks: dict[int, dict[int, dict]],
+    frame_keys: list[str],
+    iteration_idx: int,
+    command: str,
+    data_root: str,
+    camera_names: list[str],
+    project_cfg: dict,
+) -> str:
+    """Write one numbered user-refinement snapshot and return its directory."""
+    it_dir = os.path.join(root_dir, f"{iteration_idx:03d}")
+    os.makedirs(it_dir, exist_ok=True)
+
+    out = dict(base_payload)
+    out["results"] = tracks_to_results(tracks, frame_keys)
+    out_json = os.path.join(it_dir, "track_3d_refined_colmap.json")
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(out, f)
+
+    report = {
+        "iteration": iteration_idx,
+        "command": command,
+        "tracks": len(tracks),
+    }
+    with open(os.path.join(it_dir, "refine_report_user.json"), "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    with open(os.path.join(it_dir, ".success"), "w", encoding="utf-8") as f:
+        f.write("User refinement iteration finished successfully.")
+
+    with open(os.path.join(root_dir, "latest.txt"), "w", encoding="utf-8") as f:
+        f.write(f"{iteration_idx:03d}\n")
+
+    proj_report = _project_results_snapshot(
+        results=out["results"],
+        data_root=data_root,
+        output_dir=os.path.join(it_dir, "projected"),
+        camera_names=camera_names,
+        project_cfg=project_cfg,
+    )
+    with open(os.path.join(it_dir, "project_report.json"), "w", encoding="utf-8") as f:
+        json.dump(proj_report, f, indent=2)
+
+    return it_dir
+
+
+def _project_results_snapshot(
+    results: dict,
+    data_root: str,
+    output_dir: str,
+    camera_names: list[str],
+    project_cfg: dict,
+) -> dict:
+    """Project one refined snapshot to camera frames and return a report."""
+    from src.tracking.project_tracks import project_tracks
+
+    os.makedirs(output_dir, exist_ok=True)
+    return project_tracks(
+        results=results,
+        data_root=to_absolute_path(data_root),
+        output_dir=output_dir,
+        camera_names=list(camera_names),
+        box_width=int(project_cfg.get("box_width", 2)),
+        subdiv=int(project_cfg.get("subdiv", 12)),
+        max_frames=int(project_cfg.get("max_frames", 0)) or None,
+        max_view_angle=float(project_cfg.get("max_view_angle", 80.0)),
+    )
+
+
+def _parse_track_selector(text: str) -> tuple[str, int]:
+    """Parse ``<class>_<id>`` selectors (class can include underscores)."""
+    token = text.strip()
+    cls, sep, raw_id = token.rpartition("_")
+    if not sep or not cls:
+        raise ValueError(f"Invalid selector '{text}'. Expected '<class>_<id>'.")
+    try:
+        tid = int(raw_id)
+    except ValueError as exc:
+        raise ValueError(f"Invalid track id in selector '{text}'.") from exc
+    return cls, tid
+
+
+def _validate_selector(
+    tracks: dict[int, dict[int, dict]],
+    selector: str,
+) -> tuple[int, str]:
+    """Resolve selector to (track_id, current_track_class), validating class."""
+    cls, tid = _parse_track_selector(selector)
+    if tid not in tracks:
+        raise ValueError(f"Track id {tid} not found.")
+    current = _track_class(tracks[tid])
+    if cls != current:
+        raise ValueError(
+            f"Selector class mismatch for id {tid}: got '{cls}', current is '{current}'."
+        )
+    return tid, current
+
+
+def _manual_fuse_tracks(
+    tracks: dict[int, dict[int, dict]], selectors: list[str]
+) -> tuple[int, int]:
+    """Fuse selected tracks in place. Returns (canonical_id, removed_count)."""
+    resolved = [_validate_selector(tracks, s) for s in selectors]
+    ids = [tid for tid, _ in resolved]
+    uniq_ids = list(dict.fromkeys(ids))
+    if len(uniq_ids) < 2:
+        raise ValueError("Fuse requires at least two distinct tracks.")
+
+    canonical = max(uniq_ids, key=lambda t: len(tracks[t]))
+    merged_track = copy.deepcopy(tracks[canonical])
+
+    for tid in uniq_ids:
+        if tid == canonical:
+            continue
+        for fidx, box in tracks[tid].items():
+            existing = merged_track.get(fidx)
+            if existing is None or float(box.get("tracking_score", 1.0)) > float(
+                existing.get("tracking_score", 1.0)
+            ):
+                merged_track[fidx] = copy.deepcopy(box)
+
+    name = _track_class(merged_track)
+    for box in merged_track.values():
+        box["tracking_id"] = int(canonical)
+        box["tracking_name"] = name
+
+    tracks[canonical] = merged_track
+    removed = 0
+    for tid in uniq_ids:
+        if tid != canonical and tid in tracks:
+            del tracks[tid]
+            removed += 1
+
+    return canonical, removed
+
+
+def _extend_single_track(
+    track: dict[int, dict],
+    frame_keys: list[str],
+    amount: int,
+    vel_window: int,
+) -> int:
+    """Extend exactly one track on one side. Positive=end, negative=start."""
+    n_keys = len(frame_keys)
+    frames = sorted(track)
+    if len(frames) < 2 or amount == 0:
+        return 0
+
+    n_ext = 0
+    if amount > 0:
+        last = frames[-1]
+        vel = _endpoint_velocity_3d(track, frames, at_start=False, window=vel_window)
+        base_box = track[last]
+        base_t = np.asarray(base_box["translation"], dtype=np.float64)
+        for k in range(1, amount + 1):
+            f = last + k
+            if f >= n_keys or f in track:
+                break
+            token = frame_keys[f]
+            track[f] = _extrap_box(base_box, base_t + vel * k, token)
+            n_ext += 1
+        return n_ext
+
+    first = frames[0]
+    vel = _endpoint_velocity_3d(track, frames, at_start=True, window=vel_window)
+    base_box = track[first]
+    base_t = np.asarray(base_box["translation"], dtype=np.float64)
+    for k in range(1, abs(amount) + 1):
+        f = first - k
+        if f < 0 or f in track:
+            break
+        token = frame_keys[f]
+        track[f] = _extrap_box(base_box, base_t - vel * k, token)
+        n_ext += 1
+    return n_ext
+
+
+def _run_user_refinement_loop(
+    refined_results: dict,
+    frame_keys: list[str],
+    cfg: dict,
+    output_dir: str,
+    payload_template: dict,
+    data_root: str,
+    camera_names: list[str],
+) -> tuple[dict, dict]:
+    """Interactive post-refinement loop with undo and numbered snapshots."""
+    user_cfg = cfg.get("user_refinement", {}) or {}
+    if not bool(user_cfg.get("enabled", False)):
+        return refined_results, {
+            "enabled": False,
+            "iterations": 0,
+            "commands_applied": 0,
+        }
+
+    tracks = build_tracks(copy.deepcopy(refined_results))
+    history: list[dict[int, dict[int, dict]]] = []
+    commands: list[str] = []
+    vel_window = int(user_cfg.get("extend_velocity_window", cfg.get("extend_velocity_window", 3)))
+    default_extend = int(user_cfg.get("default_extend", 5))
+    project_cfg = cfg.get("project", {}) or {}
+
+    root_dir = os.path.join(output_dir, str(user_cfg.get("output_dir", "user_refinement")))
+    os.makedirs(root_dir, exist_ok=True)
+    existing_iters: list[int] = []
+    for name in os.listdir(root_dir):
+        path = os.path.join(root_dir, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            existing_iters.append(int(name))
+        except ValueError:
+            continue
+    start_idx = (max(existing_iters) + 1) if existing_iters else 0
+    iter_idx = start_idx
+    first_dir = _write_user_iteration(
+        root_dir=root_dir,
+        base_payload=payload_template,
+        tracks=tracks,
+        frame_keys=frame_keys,
+        iteration_idx=iter_idx,
+        command="initial",
+        data_root=data_root,
+        camera_names=camera_names,
+        project_cfg=project_cfg,
+    )
+
+    print("\n🧭 Interactive user refinement enabled.")
+    print(f"📂 Iteration {iter_idx:03d} saved to: {first_dir}")
+    print("Commands:")
+    print("  Filter: <class>_<id>")
+    print("  Fuse: <class>_<id>, <class>_<id> [, ...]")
+    print(f"  Extend: <class>_<id>[, <int>] (default int={default_extend})")
+    print("  undo")
+    print("  done")
+
+    while True:
+        raw = input("user-refine> ").strip()
+        if not raw:
+            continue
+
+        if ":" in raw:
+            head, tail = raw.split(":", 1)
+            cmd = head.strip().lower()
+            args = tail.strip()
+        else:
+            parts = raw.strip().split(None, 1)
+            cmd = parts[0].strip().lower()
+            args = parts[1].strip() if len(parts) > 1 else ""
+
+        try:
+            if cmd == "done":
+                break
+
+            if cmd == "undo":
+                if not history:
+                    print("⚠️ Nothing to undo.")
+                    continue
+                tracks = history.pop()
+                if commands:
+                    commands.pop()
+                iter_idx += 1
+                out_dir = _write_user_iteration(
+                    root_dir=root_dir,
+                    base_payload=payload_template,
+                    tracks=tracks,
+                    frame_keys=frame_keys,
+                    iteration_idx=iter_idx,
+                    command="undo",
+                    data_root=data_root,
+                    camera_names=camera_names,
+                    project_cfg=project_cfg,
+                )
+                print(f"↩️ Undo applied. Snapshot: {out_dir}")
+                continue
+
+            if cmd == "filter":
+                if not args:
+                    raise ValueError("Filter expects 'Filter: <class>_<id>'.")
+                history.append(copy.deepcopy(tracks))
+                tid, _ = _validate_selector(tracks, args)
+                del tracks[tid]
+                commands.append(raw)
+
+            elif cmd == "fuse":
+                specs = [s.strip() for s in args.split(",") if s.strip()]
+                if len(specs) < 2:
+                    raise ValueError("Fuse expects at least two selectors.")
+                history.append(copy.deepcopy(tracks))
+                canonical, removed = _manual_fuse_tracks(tracks, specs)
+                commands.append(raw)
+                print(f"🔗 Fused into id {canonical}; removed {removed} tracks.")
+
+            elif cmd == "extend":
+                parts = [s.strip() for s in args.split(",") if s.strip()]
+                if not parts:
+                    raise ValueError("Extend expects 'Extend: <class>_<id>[, <int>]'.")
+                selector = parts[0]
+                amount = default_extend
+                if len(parts) >= 2:
+                    amount = int(parts[1])
+                history.append(copy.deepcopy(tracks))
+                tid, _ = _validate_selector(tracks, selector)
+                added = _extend_single_track(
+                    track=tracks[tid],
+                    frame_keys=frame_keys,
+                    amount=amount,
+                    vel_window=vel_window,
+                )
+                commands.append(raw)
+                print(f"↕️ Extended id {tid} by request {amount}; added {added} frames.")
+
+            else:
+                raise ValueError(
+                    "Unknown command. Use Filter/Fuse/Extend/undo/done."
+                )
+
+            iter_idx += 1
+            out_dir = _write_user_iteration(
+                root_dir=root_dir,
+                base_payload=payload_template,
+                tracks=tracks,
+                frame_keys=frame_keys,
+                iteration_idx=iter_idx,
+                command=raw,
+                data_root=data_root,
+                camera_names=camera_names,
+                project_cfg=project_cfg,
+            )
+            print(f"✅ Snapshot written: {out_dir}")
+
+        except Exception as exc:
+            # Drop pre-change snapshot if this command failed.
+            if cmd in {"filter", "fuse", "extend"} and history:
+                history.pop()
+            print(f"❌ {exc}")
+
+    final_results = tracks_to_results(tracks, frame_keys)
+    summary = {
+        "enabled": True,
+        "iterations": iter_idx - start_idx + 1,
+        "commands_applied": len(commands),
+        "history_depth": len(history),
+        "output_root": root_dir,
+    }
+    return final_results, summary
+
+
 def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
     """Run fusion then filtering. Returns (refined_results, report).
 
     Operates on a deep copy so the caller's ``results`` (and its box dicts) are
     never mutated \u2014 fusion rewrites ``tracking_id``/``tracking_name`` in place.
     """
-    import copy
-
     results = copy.deepcopy(results)
     frame_keys, _ = _frame_index(results)
     tracks = build_tracks(results)
@@ -711,6 +1060,33 @@ def main(cfg: DictConfig) -> None:
     results = data.get("results", data)
 
     refined_results, report = refine(results, cfg.refine_task)
+
+    # Optional interactive user edits (filter/fuse/extend/undo) after the
+    # automatic refinement. Writes numbered snapshots under user_refinement/.
+    frame_keys, _ = _frame_index(results)
+    data_root = cfg.refine_task.get("data_root", "") or cfg.dataset.base_dir
+    cameras = list(cfg.refine_task.get("project", {}).get("cameras", []) or []) or list(cfg.dataset.cameras)
+    refined_results, user_report = _run_user_refinement_loop(
+        refined_results=refined_results,
+        frame_keys=frame_keys,
+        cfg=cfg.refine_task,
+        output_dir=output_dir,
+        payload_template=dict(data),
+        data_root=to_absolute_path(data_root),
+        camera_names=cameras,
+    )
+    report["user_refinement"] = user_report
+
+    # Always render projections for the final refined output so refinement
+    # quality can be inspected visually, even outside the orchestrator.
+    proj_report = _project_results_snapshot(
+        results=refined_results,
+        data_root=to_absolute_path(data_root),
+        output_dir=os.path.join(output_dir, "projected"),
+        camera_names=cameras,
+        project_cfg=cfg.refine_task.get("project", {}) or {},
+    )
+    report["projection"] = proj_report
 
     out = dict(data)
     out["results"] = refined_results
