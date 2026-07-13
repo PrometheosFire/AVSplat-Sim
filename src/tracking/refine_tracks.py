@@ -772,6 +772,74 @@ def _extend_single_track(
     return n_ext
 
 
+def _apply_user_command(
+    tracks: dict[int, dict[int, dict]],
+    cmd: str,
+    args: str,
+    default_extend: int,
+    vel_window: int,
+    frame_keys: list[str],
+) -> str:
+    """Apply one interactive user-refinement command in place."""
+    if cmd == "filter":
+        if not args:
+            raise ValueError("Filter expects 'Filter: <class>_<id>'.")
+        tid, cls = _validate_selector(tracks, args)
+        del tracks[tid]
+        return f"🗑️ Staged filter for {cls}_{tid}."
+
+    if cmd == "fuse":
+        specs = [s.strip() for s in args.split(",") if s.strip()]
+        if len(specs) < 2:
+            raise ValueError("Fuse expects at least two selectors.")
+        canonical, removed = _manual_fuse_tracks(tracks, specs)
+        return f"🔗 Staged fuse into id {canonical}; removed {removed} tracks."
+
+    if cmd == "extend":
+        parts = [s.strip() for s in args.split(",") if s.strip()]
+        if not parts:
+            raise ValueError("Extend expects 'Extend: <class>_<id>[, <int>]'.")
+        selector = parts[0]
+        amount = default_extend
+        if len(parts) >= 2:
+            amount = int(parts[1])
+        tid, cls = _validate_selector(tracks, selector)
+        added = _extend_single_track(
+            track=tracks[tid],
+            frame_keys=frame_keys,
+            amount=amount,
+            vel_window=vel_window,
+        )
+        return f"↕️ Staged extend for {cls}_{tid} by {amount}; adds {added} frames."
+
+    raise ValueError("Unknown command. Use Filter/Fuse/Extend/apply/undo/done.")
+
+
+def _replay_pending_commands(
+    tracks: dict[int, dict[int, dict]],
+    pending_commands: list[str],
+    default_extend: int,
+    vel_window: int,
+    frame_keys: list[str],
+) -> tuple[dict[int, dict[int, dict]], list[str]]:
+    """Return preview tracks/messages after replaying staged commands."""
+    preview = copy.deepcopy(tracks)
+    messages: list[str] = []
+    for raw in pending_commands:
+        if ":" in raw:
+            head, tail = raw.split(":", 1)
+            cmd = head.strip().lower()
+            args = tail.strip()
+        else:
+            parts = raw.strip().split(None, 1)
+            cmd = parts[0].strip().lower()
+            args = parts[1].strip() if len(parts) > 1 else ""
+        messages.append(
+            _apply_user_command(preview, cmd, args, default_extend, vel_window, frame_keys)
+        )
+    return preview, messages
+
+
 def _run_user_refinement_loop(
     refined_results: dict,
     frame_keys: list[str],
@@ -793,12 +861,16 @@ def _run_user_refinement_loop(
     tracks = build_tracks(copy.deepcopy(refined_results))
     history: list[dict[int, dict[int, dict]]] = []
     commands: list[str] = []
+    applied_batch_sizes: list[int] = []
+    pending_commands: list[str] = []
+    command_log_lines: list[str] = []
     vel_window = int(user_cfg.get("extend_velocity_window", cfg.get("extend_velocity_window", 3)))
     default_extend = int(user_cfg.get("default_extend", 5))
     project_cfg = cfg.get("project", {}) or {}
 
     root_dir = os.path.join(output_dir, str(user_cfg.get("output_dir", "user_refinement")))
     os.makedirs(root_dir, exist_ok=True)
+    command_log_path = os.path.join(root_dir, "commands_applied.txt")
     existing_iters: list[int] = []
     for name in os.listdir(root_dir):
         path = os.path.join(root_dir, name)
@@ -828,6 +900,7 @@ def _run_user_refinement_loop(
     print("  Filter: <class>_<id>")
     print("  Fuse: <class>_<id>, <class>_<id> [, ...]")
     print(f"  Extend: <class>_<id>[, <int>] (default int={default_extend})")
+    print("  apply")
     print("  undo")
     print("  done")
 
@@ -847,15 +920,24 @@ def _run_user_refinement_loop(
 
         try:
             if cmd == "done":
+                if pending_commands:
+                    print("⚠️ Pending staged commands exist. Use 'apply' or 'undo' before 'done'.")
+                    continue
                 break
 
             if cmd == "undo":
+                if pending_commands:
+                    dropped = pending_commands.pop()
+                    print(f"↩️ Removed staged command: {dropped}")
+                    continue
                 if not history:
                     print("⚠️ Nothing to undo.")
                     continue
                 tracks = history.pop()
-                if commands:
-                    commands.pop()
+                if applied_batch_sizes:
+                    n_drop = applied_batch_sizes.pop()
+                    if n_drop > 0:
+                        del commands[-n_drop:]
                 iter_idx += 1
                 out_dir = _write_user_iteration(
                     root_dir=root_dir,
@@ -868,68 +950,72 @@ def _run_user_refinement_loop(
                     camera_names=camera_names,
                     project_cfg=project_cfg,
                 )
+                command_log_lines.append(f"iter {iter_idx:03d} | undo")
                 print(f"↩️ Undo applied. Snapshot: {out_dir}")
                 continue
 
-            if cmd == "filter":
-                if not args:
-                    raise ValueError("Filter expects 'Filter: <class>_<id>'.")
+            if cmd == "apply":
+                if not pending_commands:
+                    print("⚠️ No staged commands to apply.")
+                    continue
+                preview_tracks, _ = _replay_pending_commands(
+                    tracks,
+                    pending_commands,
+                    default_extend,
+                    vel_window,
+                    frame_keys,
+                )
                 history.append(copy.deepcopy(tracks))
-                tid, _ = _validate_selector(tracks, args)
-                del tracks[tid]
-                commands.append(raw)
-
-            elif cmd == "fuse":
-                specs = [s.strip() for s in args.split(",") if s.strip()]
-                if len(specs) < 2:
-                    raise ValueError("Fuse expects at least two selectors.")
-                history.append(copy.deepcopy(tracks))
-                canonical, removed = _manual_fuse_tracks(tracks, specs)
-                commands.append(raw)
-                print(f"🔗 Fused into id {canonical}; removed {removed} tracks.")
-
-            elif cmd == "extend":
-                parts = [s.strip() for s in args.split(",") if s.strip()]
-                if not parts:
-                    raise ValueError("Extend expects 'Extend: <class>_<id>[, <int>]'.")
-                selector = parts[0]
-                amount = default_extend
-                if len(parts) >= 2:
-                    amount = int(parts[1])
-                history.append(copy.deepcopy(tracks))
-                tid, _ = _validate_selector(tracks, selector)
-                added = _extend_single_track(
-                    track=tracks[tid],
+                tracks = preview_tracks
+                commands.extend(pending_commands)
+                applied_batch = list(pending_commands)
+                applied_batch_sizes.append(len(applied_batch))
+                pending_commands.clear()
+                iter_idx += 1
+                out_dir = _write_user_iteration(
+                    root_dir=root_dir,
+                    base_payload=payload_template,
+                    tracks=tracks,
                     frame_keys=frame_keys,
-                    amount=amount,
-                    vel_window=vel_window,
+                    iteration_idx=iter_idx,
+                    command="apply | " + " ; ".join(applied_batch),
+                    data_root=data_root,
+                    camera_names=camera_names,
+                    project_cfg=project_cfg,
                 )
-                commands.append(raw)
-                print(f"↕️ Extended id {tid} by request {amount}; added {added} frames.")
+                command_log_lines.append(
+                    f"iter {iter_idx:03d} | apply | " + " ; ".join(applied_batch)
+                )
+                print(f"✅ Applied {len(applied_batch)} staged command(s). Snapshot: {out_dir}")
+                continue
 
-            else:
+            if cmd not in {"filter", "fuse", "extend"}:
                 raise ValueError(
-                    "Unknown command. Use Filter/Fuse/Extend/undo/done."
+                    "Unknown command. Use Filter/Fuse/Extend/apply/undo/done."
                 )
 
-            iter_idx += 1
-            out_dir = _write_user_iteration(
-                root_dir=root_dir,
-                base_payload=payload_template,
-                tracks=tracks,
-                frame_keys=frame_keys,
-                iteration_idx=iter_idx,
-                command=raw,
-                data_root=data_root,
-                camera_names=camera_names,
-                project_cfg=project_cfg,
+            preview_tracks, _ = _replay_pending_commands(
+                tracks,
+                pending_commands,
+                default_extend,
+                vel_window,
+                frame_keys,
             )
-            print(f"✅ Snapshot written: {out_dir}")
+            stage_msg = _apply_user_command(
+                preview_tracks,
+                cmd,
+                args,
+                default_extend,
+                vel_window,
+                frame_keys,
+            )
+            pending_commands.append(raw)
+            print(stage_msg)
+            print(
+                f"📝 {len(pending_commands)} command(s) staged. Use 'apply' to write a new iteration."
+            )
 
         except Exception as exc:
-            # Drop pre-change snapshot if this command failed.
-            if cmd in {"filter", "fuse", "extend"} and history:
-                history.pop()
             print(f"❌ {exc}")
 
     final_results = tracks_to_results(tracks, frame_keys)
@@ -939,7 +1025,17 @@ def _run_user_refinement_loop(
         "commands_applied": len(commands),
         "history_depth": len(history),
         "output_root": root_dir,
+        "command_log": command_log_path,
     }
+
+    with open(command_log_path, "a", encoding="utf-8") as f:
+        f.write("=== user refinement session ===\n")
+        f.write(f"start_iteration: {start_idx:03d}\n")
+        for line in command_log_lines:
+            f.write(line + "\n")
+        f.write(f"commands_applied_total: {len(commands)}\n")
+        f.write("\n")
+
     return final_results, summary
 
 

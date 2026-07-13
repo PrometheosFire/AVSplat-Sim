@@ -97,10 +97,13 @@ pose_smooth_window: 5
 # Each accepted modification writes a numbered snapshot under
 # <refine_dir>/user_refinement/NNN/track_3d_refined_colmap.json.
 user_refinement:
-  enabled: true
+  enabled: false
   output_dir: "user_refinement"
-  default_extend: 5
+  default_extend: 0
   extend_velocity_window: 3
+  # If true and enabled=false, downstream stages may still consume the newest
+  # user_refinement snapshot found in step-15 outputs for this scene.
+  prefer_latest_when_disabled: true
 
 # --- Visualization (BEV qualitative validation) ---
 # The orchestrator renders raw and/or refined predictions per these toggles.
@@ -126,7 +129,7 @@ viz_output_path: ""
 # --- Projection onto frames (refined boxes drawn on the original images) ---
 project:
   cameras: []       # empty = dataset.cameras; else subset to render
-  box_width: 2      # cuboid line width in pixels
+  box_width: 1      # cuboid line width in pixels
   subdiv: 12        # points per cuboid edge (higher = smoother fisheye curve)
   max_frames: 0     # 0 = every frame; else evenly subsample to this many
   max_view_angle: 80.0  # skip boxes with corners beyond this angle (deg) from

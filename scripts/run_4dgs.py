@@ -61,24 +61,48 @@ def _latest_user_refined_json(refine_dir: str) -> str:
     return iters[-1][1]
 
 
+def _latest_user_refined_json_any(base_results_dir: str) -> str:
+    """Return newest user-refined JSON across all step-15 folders for a scene."""
+    if not os.path.isdir(base_results_dir):
+        return ""
+    best_path = ""
+    best_mtime = -1.0
+    for name in os.listdir(base_results_dir):
+        if not name.startswith("15_refine_"):
+            continue
+        refine_dir = os.path.join(base_results_dir, name)
+        cand = _latest_user_refined_json(refine_dir)
+        if not cand:
+            continue
+        try:
+            mt = os.path.getmtime(cand)
+        except OSError:
+            continue
+        if mt > best_mtime:
+            best_mtime = mt
+            best_path = cand
+    return best_path
+
+
 def ensure_ncore_dataset(cfg, dataset_cfg: dict, overrides, explicit: str = "") -> str:
     """Create (or reuse) the ncore dataset for the 4DGS pipeline.
 
     Unlike run_pipeline.py, this pipeline skips SAM segmentation and mask
     fusion: it feeds the dataset's own ego masks
     (``<dataset.base_dir>/masks``) straight into the ncore converter. Output is
-    written to the shared static results dir (``results/<name>/<scene>/``) using
-    a ``03_ncore_dataset_*`` cache folder. When ``explicit`` is set, that
+    written to the 4DGS scene results dir
+    (``results/4dgs/<name>/<scene>/``) using a ``03_ncore_dataset_*`` cache
+    folder. When ``explicit`` is set, that
     directory is used directly and no conversion runs. Returns the ncore dataset
     directory (the folder containing ``ncore_dataset/``).
     """
     if explicit:
         return os.path.abspath(explicit)
 
-    static_results_dir = os.path.abspath(
-        f"results/{dataset_cfg['name']}/{dataset_cfg['scene']}"
+    base_results_dir = os.path.abspath(
+        f"results/4dgs/{dataset_cfg['name']}/{dataset_cfg['scene']}"
     )
-    os.makedirs(static_results_dir, exist_ok=True)
+    os.makedirs(base_results_dir, exist_ok=True)
 
     gsplat_python = os.path.abspath("envs/envs/env_gsplat/bin/python")
     env = os.environ.copy()
@@ -93,9 +117,7 @@ def ensure_ncore_dataset(cfg, dataset_cfg: dict, overrides, explicit: str = "") 
     print("▶️ [STEP 03] Checking ncore Dataset Conversion (ego masks only)...")
     ncore_config_str = f"ncore_ego_{ego_masks_dir}"
     ncore_hash = hashlib.md5(ncore_config_str.encode()).hexdigest()[:8]
-    ncore_dir = os.path.join(
-        static_results_dir, f"03_ncore_dataset_{ncore_hash}"
-    )
+    ncore_dir = os.path.join(base_results_dir, f"03_ncore_dataset_{ncore_hash}")
     if os.path.exists(os.path.join(ncore_dir, ".success")):
         print(f"✅ Cache Hit! Reusing ncore dataset from: {ncore_dir}")
     else:
@@ -206,7 +228,11 @@ def main(cfg: DictConfig):
         viz_cfg = refine_task_cfg.get("visualize", {})
         viz_dir = os.path.join(refine_dir, "vis")
         refined_tracks_json = os.path.join(refine_dir, "track_3d_refined_colmap.json")
-        user_refine_enabled = refine_task_cfg.get("user_refinement", {}).get("enabled", False)
+        user_refine_cfg = refine_task_cfg.get("user_refinement", {}) or {}
+        user_refine_enabled = bool(user_refine_cfg.get("enabled", False))
+        prefer_latest_when_disabled = bool(
+            user_refine_cfg.get("prefer_latest_when_disabled", False)
+        )
         base_cache_hit = os.path.exists(refine_success)
         cache_hit = base_cache_hit and not user_refine_enabled
 
@@ -242,9 +268,15 @@ def main(cfg: DictConfig):
 
             print(f"✅ Refinement saved to {refine_dir}")
 
-        selected_refined_json = (
-            _latest_user_refined_json(refine_dir) if user_refine_enabled else ""
-        ) or refined_tracks_json
+        selected_refined_json = ""
+        if user_refine_enabled:
+            selected_refined_json = _latest_user_refined_json(refine_dir)
+        elif prefer_latest_when_disabled:
+            selected_refined_json = (
+                _latest_user_refined_json(refine_dir)
+                or _latest_user_refined_json_any(base_results_dir)
+            )
+        selected_refined_json = selected_refined_json or refined_tracks_json
 
         if not cache_hit and viz_cfg.get("refined", True):
             subprocess.run(
@@ -280,6 +312,17 @@ def main(cfg: DictConfig):
                 print(f"🧑‍🔧 Using latest user refinement snapshot: {refined_tracks_json}")
             else:
                 print("ℹ️ User refinement enabled but no snapshots found; using base refined JSON.")
+        elif prefer_latest_when_disabled:
+            latest_user_json = (
+                _latest_user_refined_json(refine_dir)
+                or _latest_user_refined_json_any(base_results_dir)
+            )
+            if latest_user_json:
+                refined_tracks_json = latest_user_json
+                print(
+                    "🧑‍🔧 Using latest user refinement snapshot while "
+                    f"user_refinement is disabled: {refined_tracks_json}"
+                )
 
     # ==========================================
     # STEP 20: 4D GAUSSIAN SPLATTING TRAINING (with dynamic rigid annotations)

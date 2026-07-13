@@ -40,6 +40,14 @@ _FRONT = [(0, 1), (1, 5), (5, 4), (4, 0)]  # face at +x (length forward)
 _EDGES = _BOTTOM + _TOP + _VERT
 
 
+def _stable_seed(text: str) -> int:
+    """Deterministic small integer hash for layout choices."""
+    seed = 0
+    for ch in text:
+        seed = (seed * 131 + ord(ch)) & 0x7FFFFFFF
+    return seed
+
+
 def _id_color(track_id: int) -> tuple[int, int, int]:
     """Deterministic BGR color for a track id (stable across frames)."""
     rng = (1103515245 * (track_id + 1) + 12345) & 0x7FFFFFFF
@@ -47,6 +55,85 @@ def _id_color(track_id: int) -> tuple[int, int, int]:
     g = 80 + ((rng >> 8) & 0xFF) % 176
     b = 80 + ((rng >> 16) & 0xFF) % 176
     return int(b), int(g), int(r)
+
+
+def _label_text_color(bg_bgr: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Choose white/black text for contrast against the label background."""
+    b, g, r = (float(v) for v in bg_bgr)
+    luminance = 0.114 * b + 0.587 * g + 0.299 * r
+    return (0, 0, 0) if luminance >= 150.0 else (255, 255, 255)
+
+
+def _label_anchor(corners_uv: np.ndarray, w: int, h: int, seed: int) -> tuple[int, int, int]:
+    """Pick a visible corner to attach the label to, alternating by seed."""
+    preferred = [4, 5, 6, 7, 0, 1, 2, 3]
+    in_frame = [
+        idx
+        for idx in preferred
+        if 0 <= corners_uv[idx, 0] < w and 0 <= corners_uv[idx, 1] < h
+    ]
+    choices = in_frame or preferred
+    anchor_idx = choices[seed % len(choices)]
+    anchor = corners_uv[anchor_idx]
+    return int(anchor[0]), int(anchor[1]), anchor_idx
+
+
+def _draw_corner_label(
+    img,
+    text: str,
+    corners_uv: np.ndarray,
+    anchor_xy: tuple[int, int],
+    anchor_idx: int,
+    bg_color: tuple[int, int, int],
+    w: int,
+    h: int,
+) -> None:
+    """Draw a filled label chip tucked inside a projected box corner."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    min_xy = corners_uv.min(axis=0)
+    max_xy = corners_uv.max(axis=0)
+    box_w = float(max_xy[0] - min_xy[0])
+    box_h = float(max_xy[1] - min_xy[1])
+    box_extent = max(min(box_w, box_h), 1.0)
+
+    font_scale = float(np.clip(box_extent / 120.0, 0.22, 0.38))
+    thickness = 1
+    pad_x = int(np.clip(round(box_extent / 18.0), 2, 4))
+    pad_y = int(np.clip(round(box_extent / 24.0), 1, 3))
+    inset = int(np.clip(round(box_extent / 14.0), 2, 6))
+    text_color = _label_text_color(bg_color)
+    (text_w, text_h), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+
+    ax, ay = anchor_xy
+    right_side = anchor_idx in {0, 1, 4, 5}
+    above = anchor_idx in {4, 5, 6, 7}
+
+    rect_w = text_w + 2 * pad_x
+    rect_h = text_h + baseline + 2 * pad_y
+
+    if right_side:
+        x0 = ax + inset
+    else:
+        x0 = ax - inset - rect_w
+    if above:
+        y0 = ay + inset
+    else:
+        y0 = ay - inset - rect_h
+
+    x0 = max(x0, int(min_xy[0]))
+    y0 = max(y0, int(min_xy[1]))
+    x0 = min(x0, int(max_xy[0] - rect_w))
+    y0 = min(y0, int(max_xy[1] - rect_h))
+
+    x0 = int(np.clip(x0, 0, max(w - rect_w - 1, 0)))
+    y0 = int(np.clip(y0, 0, max(h - rect_h - 1, 0)))
+    x1 = x0 + rect_w
+    y1 = y0 + rect_h
+
+    cv2.rectangle(img, (x0, y0), (x1, y1), bg_color, thickness=-1)
+    cv2.rectangle(img, (x0, y0), (x1, y1), (0, 0, 0), thickness=1)
+    text_org = (x0 + pad_x, y0 + pad_y + text_h)
+    cv2.putText(img, text, text_org, font, font_scale, text_color, thickness, cv2.LINE_AA)
 
 
 def _build_camera_tables(cameras, images, camera_names):
@@ -95,7 +182,7 @@ def _draw_edge(img, p0, p1, k, dist, model, color, width, subdiv):
 
 def draw_box_on_image(
     img, box, k, dist, model, w, h,
-    width=2, subdiv=12, label=True, max_view_angle=80.0,
+    width=1, subdiv=12, label=True, max_view_angle=80.0,
 ):
     """Draw a 3D box cuboid (world->camera->image) on ``img``. Returns drawn?"""
     corners_w = box_corners_3d(box)  # (8, 3) in COLMAP world
@@ -117,19 +204,16 @@ def draw_box_on_image(
         return False
 
     color = _id_color(int(box["tracking_id"]))
+    corners_uv = _project(corners_c, k, dist, model)
     for i, j in _EDGES:
-        ew = width + 1 if (i, j) in _FRONT else width
+        ew = width
         _draw_edge(img, corners_c[i], corners_c[j], k, dist, model, color, ew, subdiv)
 
     if label:
-        front_mid = corners_c[[0, 1, 4, 5]].mean(axis=0, keepdims=True)
-        uv = _project(front_mid, k, dist, model)[0]
-        if 0 <= uv[0] < w and 0 <= uv[1] < h:
-            text = f"{box.get('tracking_name','?')} {int(box['tracking_id'])}"
-            cv2.putText(
-                img, text, (int(uv[0]), int(uv[1])),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
-            )
+        text = f"{box.get('tracking_name','?')} {int(box['tracking_id'])}"
+        seed = int(box.get("_label_seed", int(box["tracking_id"])))
+        ax, ay, anchor_idx = _label_anchor(corners_uv, w, h, seed)
+        _draw_corner_label(img, text, corners_uv, (ax, ay), anchor_idx, color, w, h)
     return True
 
 
@@ -143,7 +227,7 @@ def project_tracks(
     data_root: str,
     output_dir: str,
     camera_names,
-    box_width: int = 2,
+    box_width: int = 1,
     subdiv: int = 12,
     max_frames: int | None = None,
     max_view_angle: float = 80.0,
@@ -177,14 +261,17 @@ def project_tracks(
             img = cv2.imread(img_path)
             if img is None:
                 continue
+            camera_seed = _stable_seed(camera)
             for box in boxes:
                 box["_pose"] = (r_w2c, t_w2c)
+                box["_label_seed"] = ts * 1000003 + camera_seed + int(box["tracking_id"])
                 if draw_box_on_image(
                     img, box, k, dist, model, w, h,
                     box_width, subdiv, True, max_view_angle,
                 ):
                     drawn_total += 1
                 box.pop("_pose", None)
+                box.pop("_label_seed", None)
 
             cam_out = os.path.join(output_dir, camera)
             os.makedirs(cam_out, exist_ok=True)

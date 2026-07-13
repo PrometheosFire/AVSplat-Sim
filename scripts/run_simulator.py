@@ -85,6 +85,29 @@ def _latest_user_refined_json(refine_dir: str) -> str:
     return iters[-1][1]
 
 
+def _latest_user_refined_json_any(base_results_dir: str) -> str:
+    """Return newest user-refined JSON across all step-15 folders for a scene."""
+    if not os.path.isdir(base_results_dir):
+        return ""
+    best_path = ""
+    best_mtime = -1.0
+    for name in os.listdir(base_results_dir):
+        if not name.startswith("15_refine_"):
+            continue
+        refine_dir = os.path.join(base_results_dir, name)
+        cand = _latest_user_refined_json(refine_dir)
+        if not cand:
+            continue
+        try:
+            mt = os.path.getmtime(cand)
+        except OSError:
+            continue
+        if mt > best_mtime:
+            best_mtime = mt
+            best_path = cand
+    return best_path
+
+
 def _resolve_cached_inputs(cfg: DictConfig) -> tuple[str, str]:
     """Resolve simulator inputs from the same cache hashes used by the orchestrator."""
     dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
@@ -96,13 +119,10 @@ def _resolve_cached_inputs(cfg: DictConfig) -> tuple[str, str]:
     base_results_dir = os.path.abspath(
         f"results/4dgs/{dataset_cfg['name']}/{dataset_cfg['scene']}"
     )
-    static_results_dir = os.path.abspath(
-        f"results/{dataset_cfg['name']}/{dataset_cfg['scene']}"
-    )
 
     ego_masks_dir = os.path.abspath(os.path.join(dataset_cfg["base_dir"], "masks"))
     ncore_hash = hashlib.md5(f"ncore_ego_{ego_masks_dir}".encode()).hexdigest()[:8]
-    ncore_dir = os.path.join(static_results_dir, f"03_ncore_dataset_{ncore_hash}")
+    ncore_dir = os.path.join(base_results_dir, f"03_ncore_dataset_{ncore_hash}")
 
     step15_hash = generate_config_hash(
         {
@@ -114,8 +134,16 @@ def _resolve_cached_inputs(cfg: DictConfig) -> tuple[str, str]:
     )
     refine_dir = os.path.join(base_results_dir, f"15_refine_{step15_hash}")
     refined_tracks_json = os.path.join(refine_dir, "track_3d_refined_colmap.json")
-    if refine_task_cfg.get("user_refinement", {}).get("enabled", False):
+    user_cfg = refine_task_cfg.get("user_refinement", {}) or {}
+    if bool(user_cfg.get("enabled", False)):
         latest_user_json = _latest_user_refined_json(refine_dir)
+        if latest_user_json:
+            refined_tracks_json = latest_user_json
+    elif bool(user_cfg.get("prefer_latest_when_disabled", False)):
+        latest_user_json = (
+            _latest_user_refined_json(refine_dir)
+            or _latest_user_refined_json_any(base_results_dir)
+        )
         if latest_user_json:
             refined_tracks_json = latest_user_json
 
