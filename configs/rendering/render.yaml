@@ -14,6 +14,16 @@ output_dir: null           # Required, set via override
 # Filter which cameras to render (empty = all cameras)
 cameras_to_render: []
 
+# Render modes (one or many):
+# - full: normal render (background + optional rigid objects)
+# - rigid_white: render only rigid objects over a white background
+# - full_debug_boxes: full + per-instance 3D bbox projection overlay
+# A separate output subtree is created per mode:
+#   <output_dir>/<mode>/frames/... and <output_dir>/<mode>/videos/...
+render_modes: [full_debug_boxes, rigid_white]
+# Legacy single-mode key still supported by code:
+# render_mode: full
+
 # Dynamic rigid objects (vehicles). They ANIMATE with the trajectory: each
 # camera pose renders the vehicles at that frame's pose (frame i -> rigid i).
 # Requires checkpoint_path, since rigid nodes are stored in the training
@@ -22,9 +32,6 @@ render_dynamic: true
 # Optional bullet-time: hold all frames at this single rigid frame index instead
 # of animating. null -> animate per camera pose.
 freeze_timestep: null
-# Debug: overlay each dynamic object's 3D box (semi-transparent, per-instance
-# color) on the render to inspect box/reconstruction alignment.
-debug_render_boxes: true
 
 # Trajectory transformations
 # Each shift is [x_m, y_m, z_m] in real-world meters:

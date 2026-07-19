@@ -190,15 +190,18 @@ def draw_box_on_image(
     r_w2c, t_w2c = cam_id_pose
     corners_c = (r_w2c @ corners_w.T).T + t_w2c  # camera frame (z forward)
 
-    if np.count_nonzero(corners_c[:, 2] > 0.05) < 8:
-        return False  # require fully in front for a clean cuboid
+    front_mask = corners_c[:, 2] > 0.05
+    n_front = int(np.count_nonzero(front_mask))
+    if n_front < 2:
+        return False  # nothing stable to draw
 
     # Cull boxes whose corners exceed the lens cone. A very close/wide box has
     # corners near or beyond the fisheye FOV half-angle, where projection folds
     # back and produces frame-spanning garbage. atan2(radial, forward) is the
     # angle of each corner from the optical axis.
+    corners_vis = corners_c[front_mask]
     angles = np.degrees(
-        np.arctan2(np.linalg.norm(corners_c[:, :2], axis=1), corners_c[:, 2])
+        np.arctan2(np.linalg.norm(corners_vis[:, :2], axis=1), corners_vis[:, 2])
     )
     if float(angles.max()) > max_view_angle:
         return False
@@ -209,7 +212,9 @@ def draw_box_on_image(
         ew = width
         _draw_edge(img, corners_c[i], corners_c[j], k, dist, model, color, ew, subdiv)
 
-    if label:
+    # Anchor labels only when all corners are in front; for partial boxes corner
+    # projections can be unstable and produce noisy label placement.
+    if label and n_front == 8:
         text = f"{box.get('tracking_name','?')} {int(box['tracking_id'])}"
         seed = int(box.get("_label_seed", int(box["tracking_id"])))
         ax, ay, anchor_idx = _label_anchor(corners_uv, w, h, seed)

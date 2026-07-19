@@ -398,6 +398,7 @@ class StandaloneRenderer:
         with_eval3d: bool = True,
         ppisp_state: Optional[dict] = None,
         rigid_state: Optional[Dict[str, torch.Tensor]] = None,
+        render_mode: str = "full",
         device: str = "cuda",
     ):
         self.splats = splats
@@ -407,7 +408,14 @@ class StandaloneRenderer:
         self.with_ut = with_ut
         self.with_eval3d = with_eval3d
         self.rigid_state = rigid_state
+        self.render_mode = render_mode
         self.device = device
+
+        if self.render_mode not in {"full", "rigid_white"}:
+            raise ValueError(
+                f"Unknown render_mode='{self.render_mode}'. "
+                "Expected one of: ['full', 'rigid_white']."
+            )
 
         self.ppisp_module = None
         if ppisp_state is not None:
@@ -475,16 +483,25 @@ class StandaloneRenderer:
                 torch.from_numpy(thin_prism_coeffs).float().to(self.device).unsqueeze(0)
             )
 
-        # Extract Gaussian parameters
-        means = self.splats["means"]
-        quats = self.splats["quats"]
-        scales = torch.exp(self.splats["scales"])
-        opacities = torch.sigmoid(self.splats["opacities"])
-        colors = torch.cat([self.splats["sh0"], self.splats["shN"]], dim=1)
+        # Extract Gaussian parameters.
+        # - full: background (+ optional rigid composited below)
+        # - rigid_white: rigid-only on a white background
+        if self.render_mode == "rigid_white":
+            means = torch.empty((0, 3), device=self.device)
+            quats = torch.empty((0, 4), device=self.device)
+            scales = torch.empty((0, 3), device=self.device)
+            opacities = torch.empty((0,), device=self.device)
+            num_sh_bases = self.splats["sh0"].shape[1] + self.splats["shN"].shape[1]
+            colors = torch.empty((0, num_sh_bases, 3), device=self.device)
+        else:
+            means = self.splats["means"]
+            quats = self.splats["quats"]
+            scales = torch.exp(self.splats["scales"])
+            opacities = torch.sigmoid(self.splats["opacities"])
+            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], dim=1)
 
         # Composite dynamic rigid objects (vehicles) at the requested timestep.
-        # Their world-space Gaussians are simply concatenated onto the background
-        # so a single rasterization pass blends both with correct occlusion.
+        # In rigid_white mode, this is the only foreground content.
         if self.rigid_state is not None and rigid_frame_idx is not None:
             rigid = rigid_world_gaussians(self.rigid_state, int(rigid_frame_idx))
             if rigid is not None:
@@ -504,6 +521,11 @@ class StandaloneRenderer:
                 scales = torch.cat([scales, boxes["scales"]], dim=0)
                 opacities = torch.cat([opacities, boxes["opacities"]], dim=0)
                 colors = torch.cat([colors, boxes["colors"]], dim=0)
+
+        # If rigid_white is selected but no rigid content exists for this frame,
+        # return a pure white frame.
+        if self.render_mode == "rigid_white" and means.shape[0] == 0:
+            return np.full((height, width, 3), 255, dtype=np.uint8)
 
         # Rasterize
         render_colors, render_alphas, _ = rasterization(
@@ -548,6 +570,11 @@ class StandaloneRenderer:
             colors_np = rgb.clamp(0, 1).cpu().numpy()
         else:
             colors_np = render_colors[0, ..., :3].clamp(0, 1).cpu().numpy()
+
+        # Optional white background compositing for rigid-only output.
+        if self.render_mode == "rigid_white":
+            alpha_np = render_alphas[0, ..., :1].clamp(0, 1).cpu().numpy()
+            colors_np = colors_np * alpha_np + (1.0 - alpha_np)
 
         colors_np = (colors_np * 255).astype(np.uint8)
         return colors_np
@@ -703,11 +730,48 @@ def parse_shifts_from_config(cfg: DictConfig) -> List[TrajectoryShift]:
     return shifts
 
 
+def parse_render_modes(cfg: DictConfig) -> List[str]:
+    """Parse one or more render modes from config.
+
+    Preferred config is ``render_modes: [full, rigid_white]``. For backward
+    compatibility, ``render_mode: full`` is also supported.
+    """
+    valid_modes = {
+        "full",
+        "rigid_white",
+        "full_debug_boxes",
+    }
+    modes_cfg = cfg.get("render_modes")
+    if modes_cfg is None:
+        modes_cfg = cfg.get("render_mode", "full")
+
+    if isinstance(modes_cfg, str):
+        raw_modes = [modes_cfg]
+    else:
+        raw_modes = [str(x) for x in list(modes_cfg)]
+
+    modes: List[str] = []
+    for mode in raw_modes:
+        m = str(mode)
+        if m not in valid_modes:
+            raise ValueError(
+                f"Invalid rendering mode '{m}'. "
+                f"Expected one of: {sorted(valid_modes)}"
+            )
+        if m not in modes:
+            modes.append(m)
+
+    if not modes:
+        raise ValueError("No render modes configured.")
+    return modes
+
+
 @hydra.main(version_base=None, config_path="../../configs", config_name="config")
 def main(cfg: DictConfig):
     """Main entry point for standalone rendering."""
     # Get rendering config
     render_cfg = cfg.get("rendering", {})
+    render_modes = parse_render_modes(render_cfg)
 
     # Determine model source
     ply_path = render_cfg.get("ply_path")
@@ -745,13 +809,18 @@ def main(cfg: DictConfig):
     # (int) holds all frames at one rigid frame instead of animating.
     render_dynamic = render_cfg.get("render_dynamic", True)
     freeze_timestep = render_cfg.get("freeze_timestep")
-    draw_boxes = bool(render_cfg.get("debug_render_boxes", False))
+    require_rigid = bool(render_dynamic) or any(
+        m.startswith("rigid_white") for m in render_modes
+    )
     rigid_state = None
-    if render_dynamic:
+    if require_rigid:
         if checkpoint_path and os.path.exists(checkpoint_path):
             rigid_state = load_rigid_state_from_checkpoint(checkpoint_path, device)
             if rigid_state is None:
-                print("Rigid: checkpoint has no rigid_nodes — background only.")
+                if any(m.startswith("rigid_white") for m in render_modes):
+                    print("Rigid-white mode: checkpoint has no rigid_nodes — rendering white frames.")
+                else:
+                    print("Rigid: checkpoint has no rigid_nodes — background only.")
             else:
                 num_frames = rigid_state["poses.trans"].shape[0]
                 num_inst = rigid_state["poses.trans"].shape[1]
@@ -771,10 +840,16 @@ def main(cfg: DictConfig):
                         f"animating per camera pose (frame i -> rigid i)."
                     )
         else:
-            print(
-                "Rigid: render_dynamic=true but no checkpoint_path given. Rigid "
-                "nodes live in the checkpoint (not the PLY) — background only."
-            )
+            if any(m.startswith("rigid_white") for m in render_modes):
+                print(
+                    "Rigid-white mode: no checkpoint_path given. "
+                    "Rigid nodes live in the checkpoint (not PLY) — rendering white frames."
+                )
+            else:
+                print(
+                    "Rigid: render_dynamic=true but no checkpoint_path given. Rigid "
+                    "nodes live in the checkpoint (not the PLY) — background only."
+                )
 
     # Load camera metadata
     print(f"Loading cameras from: {camera_paths_dir}")
@@ -790,19 +865,7 @@ def main(cfg: DictConfig):
     # Parse trajectory shifts
     shifts = parse_shifts_from_config(render_cfg)
     print(f"Trajectory shifts: {[s.name for s in shifts]}")
-
-    # Create renderer
-    renderer = StandaloneRenderer(
-        splats=splats,
-        sh_degree=render_cfg.get("render", {}).get("sh_degree", 3),
-        near_plane=render_cfg.get("render", {}).get("near_plane", 0.01),
-        far_plane=render_cfg.get("render", {}).get("far_plane", 1e10),
-        with_ut=render_cfg.get("render", {}).get("with_ut", True),
-        with_eval3d=render_cfg.get("render", {}).get("with_eval3d", True),
-        ppisp_state=ppisp_state,
-        rigid_state=rigid_state,
-        device=device,
-    )
+    print(f"Render modes: {render_modes}")
 
     # Create trajectory manipulator
     manipulator = TrajectoryManipulator()
@@ -810,34 +873,59 @@ def main(cfg: DictConfig):
     # Render each camera with each shift
     os.makedirs(output_dir, exist_ok=True)
 
-    for camera in cameras:
-        # Get normalization scale (consistent across cameras from same scene)
-        norm_scale = camera.world_to_normalized_scale
-        if norm_scale is not None:
-            print(f"Using world_to_normalized_scale={norm_scale:.6f} (1m real = {norm_scale:.4f} normalized units)")
-        else:
-            print("WARNING: No normalization scale found — shift values will be in raw scene units, not meters")
+    for requested_mode in render_modes:
+        draw_boxes = requested_mode.endswith("_debug_boxes")
+        render_mode = requested_mode.replace("_debug_boxes", "")
+        mode_output_dir = os.path.join(output_dir, requested_mode)
+        os.makedirs(mode_output_dir, exist_ok=True)
 
-        for shift in shifts:
-            # Apply shift to trajectory (scale converts real meters to normalized units)
-            shifted_poses = manipulator.apply_shift(camera.camtoworlds, shift, world_to_normalized_scale=norm_scale)
+        # Create renderer for this mode.
+        renderer = StandaloneRenderer(
+            splats=splats,
+            sh_degree=render_cfg.get("render", {}).get("sh_degree", 3),
+            near_plane=render_cfg.get("render", {}).get("near_plane", 0.01),
+            far_plane=render_cfg.get("render", {}).get("far_plane", 1e10),
+            with_ut=render_cfg.get("render", {}).get("with_ut", True),
+            with_eval3d=render_cfg.get("render", {}).get("with_eval3d", True),
+            ppisp_state=ppisp_state,
+            rigid_state=rigid_state,
+            render_mode=render_mode,
+            device=device,
+        )
 
-            # Render
-            renderer.render_trajectory(
-                camera=camera,
-                camtoworlds=shifted_poses,
-                output_dir=output_dir,
-                shift_name=shift.name,
-                save_video=render_cfg.get("render", {}).get("save_video", True),
-                fps=render_cfg.get("render", {}).get("fps", 30),
-                camera_idx=camera.camera_index,
-                freeze_timestep=(
-                    int(freeze_timestep)
-                    if (rigid_state is not None and freeze_timestep is not None)
-                    else None
-                ),
-                draw_boxes=draw_boxes and rigid_state is not None,
-            )
+        print(f"\n=== Rendering mode: {requested_mode} ===")
+
+        for camera in cameras:
+            # Get normalization scale (consistent across cameras from same scene)
+            norm_scale = camera.world_to_normalized_scale
+            if norm_scale is not None:
+                print(f"Using world_to_normalized_scale={norm_scale:.6f} (1m real = {norm_scale:.4f} normalized units)")
+            else:
+                print("WARNING: No normalization scale found — shift values will be in raw scene units, not meters")
+
+            for shift in shifts:
+                # Apply shift to trajectory (scale converts real meters to normalized units)
+                shifted_poses = manipulator.apply_shift(camera.camtoworlds, shift, world_to_normalized_scale=norm_scale)
+
+                # Render
+                renderer.render_trajectory(
+                    camera=camera,
+                    camtoworlds=shifted_poses,
+                    output_dir=mode_output_dir,
+                    shift_name=shift.name,
+                    save_video=render_cfg.get("render", {}).get("save_video", True),
+                    fps=render_cfg.get("render", {}).get("fps", 30),
+                    camera_idx=camera.camera_index,
+                    freeze_timestep=(
+                        int(freeze_timestep)
+                        if (rigid_state is not None and freeze_timestep is not None)
+                        else None
+                    ),
+                        draw_boxes=draw_boxes and rigid_state is not None,
+                )
+
+        with open(os.path.join(mode_output_dir, ".success"), "w") as f:
+                    f.write(f"Rendering completed successfully for mode={requested_mode}.")
 
     # Write success marker
     success_path = os.path.join(output_dir, ".success")

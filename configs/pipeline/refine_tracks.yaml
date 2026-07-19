@@ -47,6 +47,28 @@ class_groups:
   - [traffic_cone]
   - [barrier]
 
+# Optional fusion-time pose gate on overlapping frames. Prevents bad duplicate
+# boxes (wrong yaw/size/center) from overwriting a good canonical-id box when
+# IDs are merged. If all candidates at an overlap frame are outliers and
+# drop_if_all_outliers=true, the frame is left empty so fill_gaps can rebuild it.
+fusion_pose_filter:
+  enabled: true
+  prefer_canonical: true
+  drop_if_all_outliers: true
+  max_center_dist_m: 2.5
+  max_yaw_deg: 25.0
+  max_size_rel: 0.35
+  # Yaw gate applies only to these classes (pedestrian-like classes are often
+  # too noisy in yaw and are better filtered by center/size consistency).
+  yaw_sensitive_classes:
+    - car
+    - truck
+    - bus
+    - trailer
+    - construction_vehicle
+    - bicycle
+    - motorcycle
+
 # --- Static filtering (drop parked / non-moving objects) ---
 # Kept only if net ground displacement >= min_displacement meters and the track
 # spans >= min_track_length frames.
@@ -86,20 +108,37 @@ extend_velocity_window: 3
 # tracker position jitter (shaky rigid motion). Rotation & size are left
 # untouched. 0 or 1 disables; larger = smoother but can round off sharp turns.
 pose_smooth_window: 5
+# Optional yaw-only rotation smoothing, applied after translation smoothing.
+#   pose_smooth_rotation: master on/off switch (default off preserves current behavior).
+#   pose_smooth_rotation_mode:
+#     - "box_yaw": smooth the raw per-frame box yaw directly.
+#     - "tangent_yaw": derive yaw from the local tangent of the already-smoothed
+#       ground-plane trajectory, with fallback to box yaw when motion is tiny.
+#   pose_smooth_rotation_window: centered moving-average window over yaw values;
+#       if unset or <= 1 it effectively disables the smoothing pass.
+#   pose_smooth_rotation_min_speed: minimum ground-plane speed (m/frame) needed
+#       to trust the tangent heading in "tangent_yaw" mode.
+pose_smooth_rotation: false
+pose_smooth_rotation_mode: "tangent_yaw"
+pose_smooth_rotation_window: 5
+pose_smooth_rotation_min_speed: 0.05
 
 # --- Interactive user refinement (post automatic refinement) ---
 # If enabled, after the automatic refinement the terminal accepts commands:
 #   Filter: <class>_<id>
 #   Fuse: <class>_<id>, <class>_<id> [, ...]
 #   Extend: <class>_<id>[, <int>]
+#   Extend_stopped: <class>_<id>, <int>
+#   Remove: <class>_<id>, <int>  (positive=end, negative=start)
 #   undo
+#   apply
 #   done
 # Each accepted modification writes a numbered snapshot under
 # <refine_dir>/user_refinement/NNN/track_3d_refined_colmap.json.
 user_refinement:
-  enabled: false
+  enabled: true
   output_dir: "user_refinement"
-  default_extend: 0
+  default_extend: 5
   extend_velocity_window: 3
   # If true and enabled=false, downstream stages may still consume the newest
   # user_refinement snapshot found in step-15 outputs for this scene.
