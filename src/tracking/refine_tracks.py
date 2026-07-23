@@ -748,6 +748,112 @@ def extend_track_ends(
 
 
 # --------------------------------------------------------------------------- #
+# Per-instance height plane fitting (RANSAC, pre-training step)
+# --------------------------------------------------------------------------- #
+def fit_instance_heights_ransac(
+    tracks: dict[int, dict[int, dict]],
+    outlier_threshold: float = 0.5,
+    ransac_iters: int = 100,
+    min_inliers: int = 3,
+    rng_seed: int = 42,
+) -> dict:
+    """Fit a per-instance ground plane Y = a·X + b·Z + c to each track.
+
+    For every kept track, collects its valid per-frame box centers in COLMAP
+    world space (X, Y, Z where Y=UP_AXIS=1 is height), then uses RANSAC to
+    robustly fit a plane Y = a·X + b·Z + c, ignoring frames where the tracker
+    produced a wildly wrong height estimate.
+
+    After fitting, replaces each frame's box ``translation[1]`` (Y) with the
+    plane-predicted value ``a*X + b*Z + c``, effectively removing per-frame
+    height jitter while preserving the vehicle's true elevation and any gentle
+    slope along its path.
+
+    Falls back to a median-based constant (a=b=0, c=median(Y)) when the track
+    has fewer frames than ``min_inliers``.
+
+    Args:
+        tracks: ``{track_id: {frame_idx: box}}`` — mutated in-place.
+        outlier_threshold: Maximum |residual| (meters) for a frame to count as
+            an inlier during RANSAC.
+        ransac_iters: Number of random 3-point trials per instance.
+        min_inliers: Minimum valid frames required to attempt RANSAC; shorter
+            tracks fall back to the median.
+        rng_seed: Seed for reproducible RANSAC sampling.
+
+    Returns:
+        Report dict with per-track plane coefficients and inlier counts.
+    """
+    rng = np.random.default_rng(rng_seed)
+    report: dict[str, dict] = {}
+
+    for tid, track in tracks.items():
+        frames = sorted(track.keys())
+        if not frames:
+            continue
+
+        # Collect (X, Y, Z) for each frame's box center.
+        pts = np.array(
+            [np.asarray(track[f]["translation"], dtype=np.float64) for f in frames]
+        )  # (N, 3)
+        X, Y, Z = pts[:, 0], pts[:, 1], pts[:, 2]
+        N = len(pts)
+
+        if N < min_inliers:
+            # Fallback: constant height at median Y.
+            c = float(np.median(Y))
+            a, b = 0.0, 0.0
+            best_inliers = N
+        else:
+            # RANSAC: repeatedly sample 3 points, fit a plane, count inliers.
+            best_inliers = 0
+            best_abc = (0.0, 0.0, float(np.median(Y)))
+
+            # Design matrix [X, Z, 1] for least-squares fit Y = [X,Z,1] @ [a,b,c].
+            A_full = np.column_stack([X, Z, np.ones(N)])
+
+            for _ in range(ransac_iters):
+                sample = rng.choice(N, size=3, replace=False)
+                A_s = A_full[sample]
+                Y_s = Y[sample]
+                # Solve the 3×3 system exactly (3 points determine a plane).
+                try:
+                    abc, _, _, _ = np.linalg.lstsq(A_s, Y_s, rcond=None)
+                except np.linalg.LinAlgError:
+                    continue
+
+                residuals = np.abs(A_full @ abc - Y)
+                n_inliers = int((residuals < outlier_threshold).sum())
+
+                if n_inliers > best_inliers:
+                    best_inliers = n_inliers
+                    # Re-fit on the full inlier set for a more stable estimate.
+                    inlier_mask = residuals < outlier_threshold
+                    A_in = A_full[inlier_mask]
+                    Y_in = Y[inlier_mask]
+                    abc_refined, _, _, _ = np.linalg.lstsq(A_in, Y_in, rcond=None)
+                    best_abc = tuple(float(v) for v in abc_refined)
+
+            a, b, c = best_abc
+
+        # Apply: replace each frame's Y with the plane prediction.
+        for i, f in enumerate(frames):
+            y_fitted = a * X[i] + b * Z[i] + c
+            t = list(track[f]["translation"])
+            t[UP_AXIS] = float(y_fitted)
+            track[f]["translation"] = t
+
+        report[str(tid)] = {
+            "plane": {"a": round(a, 6), "b": round(b, 6), "c": round(c, 6)},
+            "n_frames": N,
+            "n_inliers": best_inliers,
+            "fallback_median": N < min_inliers,
+        }
+
+    return report
+
+
+# --------------------------------------------------------------------------- #
 # Translation smoothing (denoise per-frame tracker jitter)
 # --------------------------------------------------------------------------- #
 def smooth_track_translations(
@@ -1790,6 +1896,31 @@ def main(cfg: DictConfig) -> None:
         camera_names=cameras,
     )
     report["user_refinement"] = user_report
+
+    # Per-instance ground-plane height fitting (RANSAC).
+    # Removes tracker height jitter by fitting Y = a·X + b·Z + c per vehicle
+    # track, replacing every frame's Y with the plane-predicted value.
+    # Run AFTER user refinement so manual edits are respected.
+    height_fit_report: dict = {}
+    if bool(cfg.refine_task.get("height_plane_fit", True)):
+        height_tracks = build_tracks(refined_results)
+        height_fit_report = fit_instance_heights_ransac(
+            height_tracks,
+            outlier_threshold=float(
+                cfg.refine_task.get("height_plane_outlier_thr", 0.5)
+            ),
+            ransac_iters=int(cfg.refine_task.get("height_plane_ransac_iters", 100)),
+            min_inliers=int(cfg.refine_task.get("height_plane_min_inliers", 3)),
+        )
+        frame_keys_final, _ = _frame_index(refined_results)
+        refined_results = tracks_to_results(height_tracks, frame_keys_final)
+        n_fitted = len(height_fit_report)
+        n_ransac = sum(1 for v in height_fit_report.values() if not v["fallback_median"])
+        print(
+            f"📐 Height plane fit: {n_fitted} tracks "
+            f"({n_ransac} RANSAC, {n_fitted - n_ransac} median fallback)"
+        )
+    report["height_plane_fit"] = height_fit_report
 
     # Always render projections for the final refined output so refinement
     # quality can be inspected visually, even outside the orchestrator.

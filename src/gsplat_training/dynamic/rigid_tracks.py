@@ -173,7 +173,7 @@ def load_rigid_tracks(
 
     # First pass: collect instances passing the class/score filter.
     id_to_class: Dict[int, str] = {}
-    id_to_size_sum: Dict[int, np.ndarray] = {}
+    id_to_sizes: Dict[int, list] = {}  # list of (3,) size arrays per instance
     id_to_count: Dict[int, int] = {}
     for token in track_tokens:
         for box in results[token]:
@@ -190,7 +190,9 @@ def load_rigid_tracks(
             # wireframes use — otherwise each box is rotated 90 deg about its up
             # axis relative to the vehicle heading.
             size = np.asarray(box["size"], dtype=np.float64)[[1, 0, 2]]
-            id_to_size_sum[tid] = id_to_size_sum.get(tid, np.zeros(3)) + size
+            if tid not in id_to_sizes:
+                id_to_sizes[tid] = []
+            id_to_sizes[tid].append(size)
             id_to_count[tid] = id_to_count.get(tid, 0) + 1
 
     instance_ids = sorted(id_to_class.keys())
@@ -203,9 +205,11 @@ def load_rigid_tracks(
     num_inst = len(instance_ids)
 
     class_names = [id_to_class[tid] for tid in instance_ids]
-    # Per-instance size = mean box size over its observations, scaled to training.
+    # Per-instance size = median box size over its observations, scaled to training.
+    # Median is more robust than mean to tracker frames with abnormally large/small
+    # box estimates, preventing any single bad frame from inflating the box size.
     sizes = np.stack(
-        [id_to_size_sum[tid] / max(id_to_count[tid], 1) for tid in instance_ids]
+        [np.median(np.stack(id_to_sizes[tid], axis=0), axis=0) for tid in instance_ids]
     )
     sizes = (sizes * transform.scale).astype(np.float32)
 

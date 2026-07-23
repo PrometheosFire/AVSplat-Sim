@@ -541,6 +541,7 @@ class Runner:
         from dynamic import (
             RigidDensifier,
             RigidNodes,
+            UnicycleSmoother,
             compute_colmap_to_training,
             load_rigid_tracks,
             resolve_colmap_sparse_dir,
@@ -591,6 +592,33 @@ class Runner:
         self.rigid_pose_optimizers = {
             k: all_optimizers[k] for k in ("pose_trans", "pose_quats")
         }
+
+        # Unicycle smoother — built and pre-fitted when strategy="unicycle".
+        self.unicycle_optimizers: Dict[str, torch.optim.Optimizer] = {}
+        if getattr(cfg, "rigid_pose_smoothing", "finite_diff") == "unicycle":
+            uc = UnicycleSmoother(
+                self.rigid_tracks,
+                opt_pos=bool(getattr(cfg, "unicycle_opt_pos", True)),
+                device=self.device,
+            )
+            self.rigid_nodes.unicycle = uc
+            self.unicycle_optimizers = self.rigid_nodes.create_unicycle_optimizers(
+                lr_speed=float(getattr(cfg, "unicycle_lr_speed", 1e-3)),
+                lr_heading=float(getattr(cfg, "unicycle_lr_heading", 1e-4)),
+                lr_center=float(getattr(cfg, "unicycle_lr_center", 1e-3)),
+            )
+            uc.prefit(
+                n_iters=int(getattr(cfg, "unicycle_prefit_iters", 100)),
+                reg_w=float(getattr(cfg, "unicycle_prefit_reg_w", 5e-3)),
+                pos_w=float(getattr(cfg, "unicycle_prefit_pos_w", 1e-3)),
+                lr_speed=float(getattr(cfg, "unicycle_lr_speed", 1e-3)),
+                lr_heading=float(getattr(cfg, "unicycle_lr_heading", 1e-4)),
+                lr_center=float(getattr(cfg, "unicycle_lr_center", 1e-3)),
+            )
+            print(
+                f"[Unicycle] Smoother attached: {self.rigid_nodes.num_instances} instances, "
+                f"opt_pos={uc.opt_pos}, prefit={getattr(cfg, 'unicycle_prefit_iters', 100)} iters."
+            )
 
         self.rigid_densifier = RigidDensifier(
             grow_grad_thresh=cfg.rigid_grow_grad_thresh,
@@ -974,6 +1002,8 @@ class Runner:
                 # resizes its tensors to the checkpoint before loading, then we
                 # rebuild the rigid optimizers (fresh Adam state) to match.
                 self.rigid_nodes.load_state_dict(ckpt["rigid_nodes"])
+                if self.rigid_nodes.unicycle is not None and "unicycle_smoother" in ckpt:
+                    self.rigid_nodes.unicycle.load_state_dict(ckpt["unicycle_smoother"])
                 all_optimizers = self.rigid_nodes.create_optimizers(
                     batch_size=cfg.batch_size,
                     means_lr=cfg.means_lr,
@@ -1031,6 +1061,11 @@ class Runner:
                 self.viewer.lock.acquire()
                 tic = time.time()
 
+            # Validate box sizes haven't changed (periodic check every 100 steps).
+            if self.rigid_nodes is not None and step % 100 == 0:
+                if not self.rigid_nodes.validate_sizes_unchanged():
+                    print(f"[ERROR] Box sizes changed at step {step}! Check rigid_nodes.py.")
+
             # Freeze Gaussians when PPISP controller distillation starts
             if (
                 cfg.post_processing == "ppisp"
@@ -1054,7 +1089,6 @@ class Runner:
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2] #Number of pixels in the batch (B*H*W), used by viewer
             )
             image_ids = data["image_id"].to(device)
-            #print("Masks exist?", "mask" in data)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
             exposure = (
                 data["exposure"].to(device) if "exposure" in data else None
@@ -1180,25 +1214,11 @@ class Runner:
             if cfg.scale_reg > 0.0: # penalizes Gaussians that grow too large
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
-            # Rigid-object temporal smoothness (2nd-order on per-frame translation).
-            if (
-                self.rigid_nodes is not None
-                and rigid_frame_idx is not None
-                and cfg.rigid_smooth_w > 0.0
-            ):
-                loss = loss + cfg.rigid_smooth_w * self.rigid_nodes.temporal_smoothness_loss(
-                    rigid_frame_idx, cfg.rigid_smooth_range
-                )
-
-            # Rigid sharp-shape regularisation: penalise aspect ratio > max_ratio.
-            # Applied every rigid_sharp_shape_every steps (OmniRe: weight 1.0, every 10).
-            if (
-                self.rigid_nodes is not None
-                and cfg.rigid_sharp_shape_w > 0.0
-                and step % cfg.rigid_sharp_shape_every == 0
-            ):
-                loss = loss + cfg.rigid_sharp_shape_w * self.rigid_nodes.sharp_shape_loss(
-                    cfg.rigid_sharp_shape_ratio
+            # Rigid regularization: temporal smoothness + sharp-shape + unicycle.
+            # Strategy-dispatch and step-gating are fully inside compute_regularization_losses.
+            if self.rigid_nodes is not None:
+                loss = loss + self.rigid_nodes.compute_regularization_losses(
+                    cfg, rigid_frame_idx, step
                 )
 
             loss.backward()
@@ -1234,6 +1254,18 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+                # Log unicycle loss components separately for tuning.
+                if (
+                    self.rigid_nodes is not None
+                    and getattr(cfg, "rigid_pose_smoothing", "finite_diff") == "unicycle"
+                    and self.rigid_nodes.unicycle is not None
+                ):
+                    with torch.no_grad():
+                        _uc = self.rigid_nodes.unicycle
+                        _reg = _uc.reg_loss()
+                        _pos = _uc.pos_loss()
+                        self.writer.add_scalar("train/unicycle_reg_loss", _reg.item(), step)
+                        self.writer.add_scalar("train/unicycle_pos_loss", _pos.item(), step)
                 if cfg.depth_loss and points is not None:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.post_processing is not None:
@@ -1310,6 +1342,8 @@ class Runner:
                 # and instance buffers) for the 4D extension.
                 if self.rigid_nodes is not None:
                     data["rigid_nodes"] = self.rigid_nodes.state_dict()
+                    if self.rigid_nodes.unicycle is not None:
+                        data["unicycle_smoother"] = self.rigid_nodes.unicycle.state_dict()
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -1358,6 +1392,7 @@ class Runner:
                 # per-object reconstruction analysis.
                 if self.rigid_nodes is not None:
                     self.export_rigid_plys(step)
+                    self.export_trajectory_bev(step)
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -1407,6 +1442,9 @@ class Runner:
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                 for optimizer in self.rigid_pose_optimizers.values():
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.unicycle_optimizers.values():
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
@@ -1549,6 +1587,110 @@ class Runner:
             f"[Dynamic] Exported {n_written} rigid instance PLYs to {rigid_dir}"
             f"{' (DC-only color)' if dc_only else ''}"
         )
+
+    @torch.no_grad()
+    def export_trajectory_bev(self, step: int) -> None:
+        """Export per-object BEV trajectory plots with ego context.
+
+        For each tracked vehicle instance, creates a PNG showing:
+        - Individual vehicle's trajectory on the X-Z ground plane.
+        - Ego trajectory as a reference.
+        - Start (triangle) and end (square) markers.
+
+        Saves to ``result_dir/trajectories/{class_name}_{instance_id}_step{step}.png``.
+        No-op when rigid nodes are not enabled or matplotlib is unavailable.
+        """
+        if self.rigid_nodes is None:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import matplotlib.cm as cm
+        except ImportError:
+            print("[BEV] matplotlib not available — skipping trajectory export.")
+            return
+
+        traj_dir = os.path.join(self.cfg.result_dir, "trajectories")
+        os.makedirs(traj_dir, exist_ok=True)
+
+        # Compute scene bounds for consistent axis scaling across all object plots.
+        poses_trans = self.rigid_nodes.poses["trans"].detach().cpu().numpy()  # (T, M, 3)
+        fv = self.rigid_nodes.instances_fv.cpu().numpy()  # (T, M)
+
+        all_valid = (fv.sum(axis=1) > 0)  # frames with any active instance
+        if not all_valid.any():
+            print("[BEV] No valid frames; skipping.")
+            return
+
+        # Scene bounds: include all object trajectories + ego.
+        xs_all = poses_trans[all_valid, :, 0].flatten()
+        zs_all = poses_trans[all_valid, :, 2].flatten()
+        if hasattr(self.parser, "camtoworlds"):
+            c2ws = np.array(self.parser.camtoworlds)
+            xs_all = np.concatenate([xs_all, c2ws[:, 0, 3]])
+            zs_all = np.concatenate([zs_all, c2ws[:, 2, 3]])
+        x_min, x_max = xs_all.min(), xs_all.max()
+        z_min, z_max = zs_all.min(), zs_all.max()
+        x_margin = (x_max - x_min) * 0.1
+        z_margin = (z_max - z_min) * 0.1
+        x_lims = (x_min - x_margin, x_max + x_margin)
+        z_lims = (z_min - z_margin, z_max + z_margin)
+
+        # Get ego trajectory.
+        ego_x, ego_z = None, None
+        if hasattr(self.parser, "camtoworlds"):
+            c2ws = np.array(self.parser.camtoworlds)
+            ego_x = c2ws[:, 0, 3]
+            ego_z = c2ws[:, 2, 3]
+
+        # Create one PNG per instance.
+        n_created = 0
+        for m in range(self.rigid_nodes.num_instances):
+            valid_frames = np.where(fv[:, m])[0]
+            if len(valid_frames) < 2:
+                continue
+
+            xs = poses_trans[valid_frames, m, 0]
+            zs = poses_trans[valid_frames, m, 2]
+            tid = self.rigid_nodes.instance_ids[m]
+            cname = self.rigid_nodes.class_names[m]
+
+            fig, ax = plt.subplots(figsize=(10, 10))
+            ax.set_aspect("equal")
+            ax.set_xlim(*x_lims)
+            ax.set_ylim(*z_lims)
+            ax.set_title(f"{cname} id={tid} — BEV Trajectory (step {step})", fontsize=12)
+            ax.set_xlabel("X (training units)", fontsize=10)
+            ax.set_ylabel("Z (training units)", fontsize=10)
+            ax.grid(True, alpha=0.3)
+
+            # Instance trajectory in bright color.
+            color_obj = (0.2, 0.7, 0.2)  # green
+            ax.plot(xs, zs, "-o", markersize=4, linewidth=2.0, color=color_obj,
+                    label=f"{cname} id={tid}")
+            ax.plot(xs[0], zs[0], "^", markersize=12, color=color_obj, label="start")
+            ax.plot(xs[-1], zs[-1], "s", markersize=12, color=color_obj, label="end")
+
+            # Ego trajectory as context (faint).
+            if ego_x is not None:
+                ax.plot(ego_x, ego_z, "k--", linewidth=1.0, alpha=0.4, label="ego")
+                ax.plot(ego_x[0], ego_z[0], "kv", markersize=8)
+
+            ax.legend(loc="upper right", fontsize=10)
+
+            # Safe filename: replace spaces/special chars.
+            safe_cname = cname.replace(" ", "_").replace("/", "_")
+            out_path = os.path.join(traj_dir, f"{safe_cname}_{tid:03d}_step{step:05d}.png")
+            fig.savefig(out_path, dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            n_created += 1
+            print(f"[BEV] Saved {safe_cname} id={tid}: {out_path}")
+
+        if n_created == 0:
+            print(f"[BEV] No instances with ≥2 frames; no trajectories exported.")
+        else:
+            print(f"[BEV] Created {n_created} per-object trajectory PNGs at step {step}")
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):

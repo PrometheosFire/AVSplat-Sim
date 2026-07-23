@@ -8,6 +8,7 @@ from .alignment import (
 from .rigid_densify import RigidDensifier
 from .rigid_nodes import RigidNodes
 from .rigid_tracks import RigidTracks, load_rigid_tracks
+from .unicycle_smoother import UnicycleSmoother
 
 __all__ = [
     "SimilarityTransform",
@@ -17,4 +18,5 @@ __all__ = [
     "load_rigid_tracks",
     "RigidNodes",
     "RigidDensifier",
+    "UnicycleSmoother",
 ]

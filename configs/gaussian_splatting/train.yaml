@@ -102,6 +102,24 @@ rigid_refine_every: 100
 rigid_warmup_for_big_prune: 3000
 rigid_cull_out_of_bound: true
 
+# --- Pose smoothing strategy ---
+# "finite_diff": 2nd-order translation smoothness (OmniRe-style, default).
+# "unicycle":    HUGS kinematic regularizer (smooth accel/yaw + position anchoring).
+rigid_pose_smoothing: unicycle
+
+# Unicycle smoother (only active when rigid_pose_smoothing: unicycle).
+unicycle_opt_pos: true          # also optimize planar centers X/Z
+unicycle_prefit_iters: 100      # standalone pre-fit before 4DGS training (0=skip)
+unicycle_prefit_reg_w: 5.0e-3
+unicycle_prefit_pos_w: 1.0e-3
+unicycle_joint_start_iter: 1000   # apply joint loss from this step
+unicycle_joint_end_iter: 15000    # stop applying joint loss after this step
+unicycle_joint_reg_w: 1.0e-3
+unicycle_joint_pos_w: 1.0e-4
+unicycle_lr_speed: 1.0e-3
+unicycle_lr_heading: 1.0e-4
+unicycle_lr_center: 1.0e-3
+
 
 strategy:
   cap_max: 1000000        # Default cap

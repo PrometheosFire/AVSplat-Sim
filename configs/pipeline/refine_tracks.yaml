@@ -136,13 +136,24 @@ pose_smooth_rotation_min_speed: 0.05
 # Each accepted modification writes a numbered snapshot under
 # <refine_dir>/user_refinement/NNN/track_3d_refined_colmap.json.
 user_refinement:
-  enabled: true
+  enabled: false
   output_dir: "user_refinement"
   default_extend: 5
   extend_velocity_window: 3
   # If true and enabled=false, downstream stages may still consume the newest
   # user_refinement snapshot found in step-15 outputs for this scene.
   prefer_latest_when_disabled: true
+
+# --- Per-instance height plane fitting ---
+# Run AFTER user refinement. For each vehicle track, fits Y = a·X + b·Z + c
+# via RANSAC to the per-frame box centers, then replaces every frame's Y
+# with the plane-predicted value. Removes tracker height jitter while
+# preserving the vehicle's true elevation and any gentle slope along its path.
+# Falls back to median Y for tracks with fewer than height_plane_min_inliers frames.
+height_plane_fit: true
+height_plane_outlier_thr: 0.5   # max |residual| in meters to count as inlier
+height_plane_ransac_iters: 100  # number of random 3-point trials per track
+height_plane_min_inliers: 3     # min frames for RANSAC; shorter tracks use median
 
 # --- Visualization (BEV qualitative validation) ---
 # The orchestrator renders raw and/or refined predictions per these toggles.

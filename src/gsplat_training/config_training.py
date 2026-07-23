@@ -245,6 +245,28 @@ class Config:
     rigid_warmup_for_big_prune: int = 3_000
     rigid_cull_out_of_bound: bool = True
 
+    # --- Pose smoothing strategy (selects temporal regularizer) ---
+    # "finite_diff": second-order translation smoothness (OmniRe-style).
+    # "unicycle":    HUGS-style kinematic regularizer (smooth accel/yaw + anchoring).
+    rigid_pose_smoothing: str = "finite_diff"
+
+    # Unicycle smoother hyperparameters (used when rigid_pose_smoothing="unicycle").
+    # Whether to also optimize planar centers X/Z (more correction, more drift risk).
+    unicycle_opt_pos: bool = True
+    # Standalone pre-fit loop before 4DGS training (0 = skip).
+    unicycle_prefit_iters: int = 100
+    unicycle_prefit_reg_w: float = 5e-3
+    unicycle_prefit_pos_w: float = 1e-3
+    # Iteration window for joint unicycle loss during 4DGS training.
+    unicycle_joint_start_iter: int = 1000
+    unicycle_joint_end_iter: int = 15000
+    unicycle_joint_reg_w: float = 1e-3
+    unicycle_joint_pos_w: float = 1e-4
+    # Per-parameter learning rates for the unicycle optimizer.
+    unicycle_lr_speed: float = 1e-3
+    unicycle_lr_heading: float = 1e-4
+    unicycle_lr_center: float = 1e-3
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -278,3 +300,7 @@ class Config:
             self.rigid_reset_opacity_every = max(1, int(self.rigid_reset_opacity_every * factor))
         if self.rigid_sharp_shape_every > 0:
             self.rigid_sharp_shape_every = max(1, int(self.rigid_sharp_shape_every * factor))
+        if self.rigid_pose_smoothing == "unicycle":
+            self.unicycle_prefit_iters = int(self.unicycle_prefit_iters * factor)
+            self.unicycle_joint_start_iter = int(self.unicycle_joint_start_iter * factor)
+            self.unicycle_joint_end_iter = int(self.unicycle_joint_end_iter * factor)

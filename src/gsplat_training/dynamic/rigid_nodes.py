@@ -155,7 +155,33 @@ class RigidNodes(nn.Module):
 
         self.num_frames = num_frames
         self.num_instances = num_inst
+        # Unicycle smoother — attached after construction when
+        # rigid_pose_smoothing="unicycle"; None otherwise.
+        self.unicycle = None
+        
+        # Store reference sizes for validation (sizes must never change per-frame).
+        # Register as buffer so it moves to device with .to(device).
+        self.register_buffer("_sizes_reference", self.instances_size.clone().detach())
+        
         self.to(device)
+
+    # ------------------------------------------------------------------
+    # Validation & Safety
+    # ------------------------------------------------------------------
+    def validate_sizes_unchanged(self) -> bool:
+        """Check that per-instance box sizes have not been modified.
+        
+        Box sizes should be constant per instance (computed as median from tracker).
+        If this check fails, it indicates a bug allowing per-frame size variation.
+        Returns True if sizes match reference, False if changed.
+        """
+        if not torch.allclose(self.instances_size, self._sizes_reference, atol=1e-6):
+            changed = (self.instances_size - self._sizes_reference).abs()
+            print(f"[WARNING] BBox sizes have changed!\n"
+                  f"  Max delta: {changed.max().item():.6f}\n"
+                  f"  Per-instance max deltas: {changed.max(dim=-1).values}")
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Initialization
@@ -368,9 +394,82 @@ class RigidNodes(nn.Module):
         nxt = self.poses["trans"][frame_idx + k][valid].detach()
         return (nxt + prev - 2.0 * cur).abs().mean()
 
+    def compute_regularization_losses(
+        self,
+        cfg: object,
+        frame_idx: Optional[int],
+        step: int,
+    ) -> Tensor:
+        """Return a single weighted scalar regularization loss for this step.
+
+        Dispatches on ``cfg.rigid_pose_smoothing``:
+        - ``"finite_diff"``: second-order temporal smoothness on translation.
+        - ``"unicycle"``: joint unicycle reg + pos loss (if smoother attached
+          and within the configured iteration window).
+
+        Also applies sharp-shape regularization every
+        ``cfg.rigid_sharp_shape_every`` steps regardless of smoothing strategy.
+
+        Returns zero when nothing is applicable (frame_idx is None, all weights
+        are zero, etc.).
+        """
+        device = self.poses["trans"].device
+        loss = torch.zeros((), device=device)
+
+        strategy = getattr(cfg, "rigid_pose_smoothing", "finite_diff")
+
+        # --- Temporal / kinematic smoothness ---
+        if frame_idx is not None:
+            if strategy == "finite_diff":
+                w = float(getattr(cfg, "rigid_smooth_w", 0.0))
+                if w > 0.0:
+                    loss = loss + w * self._temporal_smoothness_loss(
+                        frame_idx, int(getattr(cfg, "rigid_smooth_range", 5))
+                    )
+            elif strategy == "unicycle" and self.unicycle is not None:
+                start = int(getattr(cfg, "unicycle_joint_start_iter", 1000))
+                end = int(getattr(cfg, "unicycle_joint_end_iter", 15000))
+                if start <= step < end and getattr(cfg, "unicycle_opt_pos", True):
+                    reg_w = float(getattr(cfg, "unicycle_joint_reg_w", 1e-3))
+                    pos_w = float(getattr(cfg, "unicycle_joint_pos_w", 1e-4))
+                    loss = loss + reg_w * self.unicycle.reg_loss()
+                    loss = loss + pos_w * self.unicycle.pos_loss()
+
+        # --- Sharp-shape regularization (strategy-independent) ---
+        every = int(getattr(cfg, "rigid_sharp_shape_every", 10))
+        w_shape = float(getattr(cfg, "rigid_sharp_shape_w", 0.0))
+        if w_shape > 0.0 and every > 0 and step % every == 0:
+            loss = loss + w_shape * self._sharp_shape_loss(
+                float(getattr(cfg, "rigid_sharp_shape_ratio", 10.0))
+            )
+
+        return loss
+
+    def _sharp_shape_loss(self, max_ratio: float = 10.0) -> Tensor:
+        """Penalise Gaussians whose aspect ratio exceeds ``max_ratio``."""
+        return self.sharp_shape_loss(max_ratio)
+
+    def _temporal_smoothness_loss(
+        self, frame_idx: int, smooth_range: int = 5
+    ) -> Tensor:
+        """Second-order finite-difference smoothness on per-frame translation."""
+        return self.temporal_smoothness_loss(frame_idx, smooth_range)
+
     # ------------------------------------------------------------------
     # Optimizers
     # ------------------------------------------------------------------
+    def create_unicycle_optimizers(
+        self,
+        lr_speed: float = 1e-3,
+        lr_heading: float = 1e-4,
+        lr_center: float = 1e-3,
+    ):
+        """Passthrough to ``self.unicycle.create_optimizers``.  Returns ``{}`` when
+        no unicycle smoother is attached."""
+        if self.unicycle is None:
+            return {}
+        return self.unicycle.create_optimizers(lr_speed, lr_heading, lr_center)
+
     def create_optimizers(
         self,
         batch_size: int = 1,
