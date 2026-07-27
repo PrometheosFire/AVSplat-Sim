@@ -54,8 +54,10 @@ class_groups:
 fusion_pose_filter:
   enabled: true
   prefer_canonical: true
-  drop_if_all_outliers: true
-  max_center_dist_m: 2.5
+  # Loosened so early prefix/suffix frames of the same object are preserved
+  # even when the canonical track is still several meters away during fusion.
+  drop_if_all_outliers: false
+  max_center_dist_m: 15.0
   max_yaw_deg: 25.0
   max_size_rel: 0.35
   # Yaw gate applies only to these classes (pedestrian-like classes are often
@@ -86,7 +88,7 @@ min_displacement: 3.0
 min_track_length: 3
 displacement_mode: "net"
 displacement_smooth: 3
-min_rel_displacement: 0.1
+min_rel_displacement: 0.0
 displacement_percentile: 90.0
 
 # --- Gap filling (make each kept track continuous within its lifespan) ---
@@ -150,7 +152,7 @@ user_refinement:
 # with the plane-predicted value. Removes tracker height jitter while
 # preserving the vehicle's true elevation and any gentle slope along its path.
 # Falls back to median Y for tracks with fewer than height_plane_min_inliers frames.
-height_plane_fit: true
+height_plane_fit: false
 height_plane_outlier_thr: 0.5   # max |residual| in meters to count as inlier
 height_plane_ransac_iters: 100  # number of random 3-point trials per track
 height_plane_min_inliers: 3     # min frames for RANSAC; shorter tracks use median

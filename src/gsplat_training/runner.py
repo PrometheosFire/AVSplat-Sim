@@ -539,6 +539,7 @@ class Runner:
             return
 
         from dynamic import (
+            BicycleSmoother,
             RigidDensifier,
             RigidNodes,
             UnicycleSmoother,
@@ -593,9 +594,11 @@ class Runner:
             k: all_optimizers[k] for k in ("pose_trans", "pose_quats")
         }
 
-        # Unicycle smoother — built and pre-fitted when strategy="unicycle".
+        # Optional kinematic smoothers.
         self.unicycle_optimizers: Dict[str, torch.optim.Optimizer] = {}
-        if getattr(cfg, "rigid_pose_smoothing", "finite_diff") == "unicycle":
+        self.bicycle_optimizers: Dict[str, torch.optim.Optimizer] = {}
+        smoothing = getattr(cfg, "rigid_pose_smoothing", "finite_diff")
+        if smoothing == "unicycle":
             uc = UnicycleSmoother(
                 self.rigid_tracks,
                 opt_pos=bool(getattr(cfg, "unicycle_opt_pos", True)),
@@ -618,6 +621,35 @@ class Runner:
             print(
                 f"[Unicycle] Smoother attached: {self.rigid_nodes.num_instances} instances, "
                 f"opt_pos={uc.opt_pos}, prefit={getattr(cfg, 'unicycle_prefit_iters', 100)} iters."
+            )
+        elif smoothing == "bicycle":
+            bc = BicycleSmoother(
+                self.rigid_tracks,
+                opt_pos=bool(getattr(cfg, "bicycle_opt_pos", True)),
+                wheelbase_mode=str(
+                    getattr(cfg, "bicycle_wheelbase_mode", "fixed_from_bbox_long_edge")
+                ),
+                wheelbase_alpha=float(getattr(cfg, "bicycle_wheelbase_alpha", 0.60)),
+                yaw_anchor_w=float(getattr(cfg, "bicycle_yaw_anchor_w", 5e-3)),
+                device=self.device,
+            )
+            self.rigid_nodes.bicycle = bc
+            self.bicycle_optimizers = self.rigid_nodes.create_bicycle_optimizers(
+                lr_speed=float(getattr(cfg, "bicycle_lr_speed", 1e-3)),
+                lr_steer=float(getattr(cfg, "bicycle_lr_steer", 1e-4)),
+                lr_center=float(getattr(cfg, "bicycle_lr_center", 1e-3)),
+            )
+            bc.prefit(
+                n_iters=int(getattr(cfg, "bicycle_prefit_iters", 100)),
+                reg_w=float(getattr(cfg, "bicycle_prefit_reg_w", 5e-3)),
+                pos_w=float(getattr(cfg, "bicycle_prefit_pos_w", 1e-3)),
+                lr_speed=float(getattr(cfg, "bicycle_lr_speed", 1e-3)),
+                lr_steer=float(getattr(cfg, "bicycle_lr_steer", 1e-4)),
+                lr_center=float(getattr(cfg, "bicycle_lr_center", 1e-3)),
+            )
+            print(
+                f"[Bicycle] Smoother attached: {self.rigid_nodes.num_instances} instances, "
+                f"opt_pos={bc.opt_pos}, prefit={getattr(cfg, 'bicycle_prefit_iters', 100)} iters."
             )
 
         self.rigid_densifier = RigidDensifier(
@@ -1004,6 +1036,8 @@ class Runner:
                 self.rigid_nodes.load_state_dict(ckpt["rigid_nodes"])
                 if self.rigid_nodes.unicycle is not None and "unicycle_smoother" in ckpt:
                     self.rigid_nodes.unicycle.load_state_dict(ckpt["unicycle_smoother"])
+                if self.rigid_nodes.bicycle is not None and "bicycle_smoother" in ckpt:
+                    self.rigid_nodes.bicycle.load_state_dict(ckpt["bicycle_smoother"])
                 all_optimizers = self.rigid_nodes.create_optimizers(
                     batch_size=cfg.batch_size,
                     means_lr=cfg.means_lr,
@@ -1266,6 +1300,22 @@ class Runner:
                         _pos = _uc.pos_loss()
                         self.writer.add_scalar("train/unicycle_reg_loss", _reg.item(), step)
                         self.writer.add_scalar("train/unicycle_pos_loss", _pos.item(), step)
+                if (
+                    self.rigid_nodes is not None
+                    and getattr(cfg, "rigid_pose_smoothing", "finite_diff") == "bicycle"
+                    and self.rigid_nodes.bicycle is not None
+                ):
+                    with torch.no_grad():
+                        _bc = self.rigid_nodes.bicycle
+                        _reg = _bc.reg_loss()
+                        _pos = _bc.pos_loss()
+                        _cpos, _cyaw = _bc.pose_coupling_losses(
+                            self.rigid_nodes.poses["trans"], self.rigid_nodes.poses["quats"]
+                        )
+                        self.writer.add_scalar("train/bicycle_reg_loss", _reg.item(), step)
+                        self.writer.add_scalar("train/bicycle_pos_loss", _pos.item(), step)
+                        self.writer.add_scalar("train/bicycle_couple_pos_loss", _cpos.item(), step)
+                        self.writer.add_scalar("train/bicycle_couple_yaw_loss", _cyaw.item(), step)
                 if cfg.depth_loss and points is not None:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.post_processing is not None:
@@ -1344,6 +1394,8 @@ class Runner:
                     data["rigid_nodes"] = self.rigid_nodes.state_dict()
                     if self.rigid_nodes.unicycle is not None:
                         data["unicycle_smoother"] = self.rigid_nodes.unicycle.state_dict()
+                    if self.rigid_nodes.bicycle is not None:
+                        data["bicycle_smoother"] = self.rigid_nodes.bicycle.state_dict()
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -1445,6 +1497,9 @@ class Runner:
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                 for optimizer in self.unicycle_optimizers.values():
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                for optimizer in self.bicycle_optimizers.values():
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 

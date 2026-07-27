@@ -248,6 +248,7 @@ class Config:
     # --- Pose smoothing strategy (selects temporal regularizer) ---
     # "finite_diff": second-order translation smoothness (OmniRe-style).
     # "unicycle":    HUGS-style kinematic regularizer (smooth accel/yaw + anchoring).
+    # "bicycle":     Kinematic bicycle regularizer (speed/steer + pose coupling).
     rigid_pose_smoothing: str = "finite_diff"
 
     # Unicycle smoother hyperparameters (used when rigid_pose_smoothing="unicycle").
@@ -266,6 +267,31 @@ class Config:
     unicycle_lr_speed: float = 1e-3
     unicycle_lr_heading: float = 1e-4
     unicycle_lr_center: float = 1e-3
+
+    # Bicycle smoother hyperparameters (used when rigid_pose_smoothing="bicycle").
+    # Whether to also optimize planar centers X/Z.
+    bicycle_opt_pos: bool = True
+    # Standalone pre-fit loop before 4DGS training (0 = skip).
+    bicycle_prefit_iters: int = 100
+    bicycle_prefit_reg_w: float = 5e-3
+    bicycle_prefit_pos_w: float = 1e-3
+    # Iteration window for joint bicycle loss during 4DGS training.
+    bicycle_joint_start_iter: int = 1000
+    bicycle_joint_end_iter: int = 15000
+    bicycle_joint_reg_w: float = 1e-3
+    bicycle_joint_pos_w: float = 1e-4
+    # Coupling weights that pull rigid poses toward bicycle-smoothed center/yaw.
+    bicycle_joint_couple_pos_w: float = 1e-2
+    bicycle_joint_couple_yaw_w: float = 1e-2
+    # Weight for anchoring rolled-out bicycle yaw to observed yaw.
+    bicycle_yaw_anchor_w: float = 5e-3
+    # Per-parameter learning rates for the bicycle optimizer.
+    bicycle_lr_speed: float = 1e-3
+    bicycle_lr_steer: float = 1e-4
+    bicycle_lr_center: float = 1e-3
+    # Fixed wheelbase policy from bbox long edge.
+    bicycle_wheelbase_mode: str = "fixed_from_bbox_long_edge"
+    bicycle_wheelbase_alpha: float = 0.60
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -304,3 +330,7 @@ class Config:
             self.unicycle_prefit_iters = int(self.unicycle_prefit_iters * factor)
             self.unicycle_joint_start_iter = int(self.unicycle_joint_start_iter * factor)
             self.unicycle_joint_end_iter = int(self.unicycle_joint_end_iter * factor)
+        elif self.rigid_pose_smoothing == "bicycle":
+            self.bicycle_prefit_iters = int(self.bicycle_prefit_iters * factor)
+            self.bicycle_joint_start_iter = int(self.bicycle_joint_start_iter * factor)
+            self.bicycle_joint_end_iter = int(self.bicycle_joint_end_iter * factor)

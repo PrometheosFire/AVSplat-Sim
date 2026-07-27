@@ -155,9 +155,10 @@ class RigidNodes(nn.Module):
 
         self.num_frames = num_frames
         self.num_instances = num_inst
-        # Unicycle smoother — attached after construction when
-        # rigid_pose_smoothing="unicycle"; None otherwise.
+        # Optional kinematic smoothers — attached after construction in runner
+        # according to rigid_pose_smoothing strategy.
         self.unicycle = None
+        self.bicycle = None
         
         # Store reference sizes for validation (sizes must never change per-frame).
         # Register as buffer so it moves to device with .to(device).
@@ -406,6 +407,8 @@ class RigidNodes(nn.Module):
         - ``"finite_diff"``: second-order temporal smoothness on translation.
         - ``"unicycle"``: joint unicycle reg + pos loss (if smoother attached
           and within the configured iteration window).
+                - ``"bicycle"``: joint bicycle reg + optional position anchoring +
+                    pose-coupling losses (XZ center + yaw).
 
         Also applies sharp-shape regularization every
         ``cfg.rigid_sharp_shape_every`` steps regardless of smoothing strategy.
@@ -429,11 +432,27 @@ class RigidNodes(nn.Module):
             elif strategy == "unicycle" and self.unicycle is not None:
                 start = int(getattr(cfg, "unicycle_joint_start_iter", 1000))
                 end = int(getattr(cfg, "unicycle_joint_end_iter", 15000))
-                if start <= step < end and getattr(cfg, "unicycle_opt_pos", True):
+                if start <= step < end:
                     reg_w = float(getattr(cfg, "unicycle_joint_reg_w", 1e-3))
                     pos_w = float(getattr(cfg, "unicycle_joint_pos_w", 1e-4))
                     loss = loss + reg_w * self.unicycle.reg_loss()
-                    loss = loss + pos_w * self.unicycle.pos_loss()
+                    if bool(getattr(cfg, "unicycle_opt_pos", True)):
+                        loss = loss + pos_w * self.unicycle.pos_loss()
+            elif strategy == "bicycle" and self.bicycle is not None:
+                start = int(getattr(cfg, "bicycle_joint_start_iter", 1000))
+                end = int(getattr(cfg, "bicycle_joint_end_iter", 15000))
+                if start <= step < end:
+                    reg_w = float(getattr(cfg, "bicycle_joint_reg_w", 1e-3))
+                    pos_w = float(getattr(cfg, "bicycle_joint_pos_w", 1e-4))
+                    couple_pos_w = float(getattr(cfg, "bicycle_joint_couple_pos_w", 1e-2))
+                    couple_yaw_w = float(getattr(cfg, "bicycle_joint_couple_yaw_w", 1e-2))
+                    loss = loss + reg_w * self.bicycle.reg_loss()
+                    if bool(getattr(cfg, "bicycle_opt_pos", True)):
+                        loss = loss + pos_w * self.bicycle.pos_loss()
+                    c_pos, c_yaw = self.bicycle.pose_coupling_losses(
+                        self.poses["trans"], self.poses["quats"]
+                    )
+                    loss = loss + couple_pos_w * c_pos + couple_yaw_w * c_yaw
 
         # --- Sharp-shape regularization (strategy-independent) ---
         every = int(getattr(cfg, "rigid_sharp_shape_every", 10))
@@ -469,6 +488,18 @@ class RigidNodes(nn.Module):
         if self.unicycle is None:
             return {}
         return self.unicycle.create_optimizers(lr_speed, lr_heading, lr_center)
+
+    def create_bicycle_optimizers(
+        self,
+        lr_speed: float = 1e-3,
+        lr_steer: float = 1e-4,
+        lr_center: float = 1e-3,
+    ):
+        """Passthrough to ``self.bicycle.create_optimizers``.  Returns ``{}`` when
+        no bicycle smoother is attached."""
+        if self.bicycle is None:
+            return {}
+        return self.bicycle.create_optimizers(lr_speed, lr_steer, lr_center)
 
     def create_optimizers(
         self,

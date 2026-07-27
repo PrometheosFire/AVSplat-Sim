@@ -8,6 +8,7 @@ from .alignment import (
 from .rigid_densify import RigidDensifier
 from .rigid_nodes import RigidNodes
 from .rigid_tracks import RigidTracks, load_rigid_tracks
+from .bicycle_smoother import BicycleSmoother
 from .unicycle_smoother import UnicycleSmoother
 
 __all__ = [
@@ -18,5 +19,6 @@ __all__ = [
     "load_rigid_tracks",
     "RigidNodes",
     "RigidDensifier",
+    "BicycleSmoother",
     "UnicycleSmoother",
 ]
