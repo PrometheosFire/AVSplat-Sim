@@ -248,7 +248,8 @@ class Config:
     # --- Pose smoothing strategy (selects temporal regularizer) ---
     # "finite_diff": second-order translation smoothness (OmniRe-style).
     # "unicycle":    HUGS-style kinematic regularizer (smooth accel/yaw + anchoring).
-    # "bicycle":     Kinematic bicycle regularizer (speed/steer + pose coupling).
+    # "bicycle":     RETIRED — superseded by the Step 1.5 refinement bicycle-model
+    #                fit (src/tracking/bicycle_fit.py); selecting it raises.
     rigid_pose_smoothing: str = "finite_diff"
 
     # Unicycle smoother hyperparameters (used when rigid_pose_smoothing="unicycle").
@@ -268,7 +269,8 @@ class Config:
     unicycle_lr_heading: float = 1e-4
     unicycle_lr_center: float = 1e-3
 
-    # Bicycle smoother hyperparameters (used when rigid_pose_smoothing="bicycle").
+    # Bicycle smoother hyperparameters — RETIRED (rigid_pose_smoothing="bicycle"
+    # now raises). Kept inert only for backward-compatible config loading.
     # Whether to also optimize planar centers X/Z.
     bicycle_opt_pos: bool = True
     # Standalone pre-fit loop before 4DGS training (0 = skip).

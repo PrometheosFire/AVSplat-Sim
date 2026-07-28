@@ -21,11 +21,20 @@ rigid_paused: false
 # In replay mode, whether rigid timeline also advances every tick.
 advance_rigid_in_replay: true
 
+# Rigid extrapolation past the baked span. When the training checkpoint carries
+# fitted kinematic-bicycle params (Step 1.5), the rigid timeline can continue
+# beyond the observed frames by rolling each vehicle's model forward. Only
+# vehicles with a fitted model are extrapolated; others drop out past the span.
+extrapolate_rigid: true
+# Number of synthesized frames appended to the rigid timeline before it loops.
+# 0 keeps baked-only playback (no extrapolation even if params are present).
+rigid_extrap_frames: 0
+
 # Bicycle model parameters
-wheelbase_m: 2.7
-max_steer_rad: 0.45
-max_accel_mps2: 3.0
-max_brake_mps2: 6.0
+wheelbase_m: 0.5
+max_steer_rad: 1.0
+max_accel_mps2: 0.5
+max_brake_mps2: 0.5
 drag_per_sec: 0.6
 max_speed_mps: 25.0
 

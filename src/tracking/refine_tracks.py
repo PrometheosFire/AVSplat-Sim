@@ -21,6 +21,8 @@ import copy
 import json
 import os
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import replace as _dc_replace
 
 import hydra
 import numpy as np
@@ -32,8 +34,18 @@ from src.tracking.track_geometry import (
     bev_iou,
     box_center_ground,
     quat_wxyz_to_matrix,
+    GROUND_AXES,
     UP_AXIS,
 )
+from src.tracking.bicycle_fit import BicycleFitConfig, fit_track
+from src.tracking.bicycle_kinematics import rollout as _bicycle_rollout
+from src.tracking.bicycle_kinematics import wheelbase_from_size
+from src.tracking.bicycle_kinematics import STATE_THETA, STATE_V
+
+try:  # Optional progress bar; falls back to a plain loop if unavailable.
+    from tqdm import tqdm as _tqdm
+except ImportError:  # pragma: no cover - tqdm is an optional convenience dep
+    _tqdm = None
 
 
 # --------------------------------------------------------------------------- #
@@ -125,6 +137,70 @@ def _estimate_ground_velocity(track: dict[int, dict], window: int = 3):
     return (p_last - p_prev) / float(span)
 
 
+def _bicycle_gap_prediction(
+    track: dict[int, dict],
+    gap: int,
+    dt: float,
+    wheelbase_alpha: float,
+    lr_ratio: float,
+    window: int = 4,
+) -> np.ndarray | None:
+    """Extrapolate a track's endpoint across a gap with the bicycle model.
+
+    Estimates the tail speed and (constant) yaw-rate from the last few centroids
+    and rolls the CoG bicycle model forward ``gap`` frames. Unlike a
+    constant-velocity guess this follows a turn through the gap, so a vehicle
+    that reappears after briefly disappearing mid-corner is still matched.
+    Returns the predicted ground center ``(x, z)``, or ``None`` when the tail is
+    too short/slow to extrapolate reliably.
+    """
+    frames = sorted(track)
+    if len(frames) < 3:
+        return None
+    last = frames[-1]
+    prev = frames[max(0, len(frames) - 1 - window)]
+    span = last - prev
+    if span <= 0:
+        return None
+
+    p_last = box_center_ground(track[last])
+    p_prev = box_center_ground(track[prev])
+    step = (p_last - p_prev) / float(span)  # per-frame displacement
+    speed = float(np.linalg.norm(step)) / max(dt, 1e-6)
+    if speed < 0.3:  # essentially stopped: constant-velocity handles it
+        return None
+
+    heading = float(np.arctan2(step[1], step[0]))
+
+    # Constant yaw-rate from the change of motion heading between the first and
+    # second half of the tail window.
+    mid_idx = max(0, len(frames) - 1 - window // 2)
+    mid = frames[mid_idx]
+    yaw_rate = 0.0
+    if prev < mid < last:
+        h1 = box_center_ground(track[mid]) - p_prev
+        h2 = p_last - box_center_ground(track[mid])
+        if np.linalg.norm(h1) > 1e-6 and np.linalg.norm(h2) > 1e-6:
+            a1 = np.arctan2(h1[1], h1[0])
+            a2 = np.arctan2(h2[1], h2[0])
+            d_yaw = float(np.arctan2(np.sin(a2 - a1), np.cos(a2 - a1)))
+            yaw_rate = d_yaw / (0.5 * span * max(dt, 1e-6))
+
+    size = np.asarray(track[last].get("size", [0.0, 0.0, 0.0]), dtype=np.float64)
+    wheelbase = wheelbase_from_size(size, wheelbase_alpha)
+    lr = max(lr_ratio * wheelbase, 1e-6)
+    sin_beta = float(np.clip(yaw_rate * lr / max(speed, 1e-6), -0.99, 0.99))
+    beta = np.arcsin(sin_beta)
+    steer = float(np.arctan(np.tan(beta) / max(lr_ratio, 1e-6)))
+
+    state0 = np.array([p_last[0], p_last[1], heading, speed], dtype=np.float64)
+    accel = np.zeros(gap)
+    steer_seq = np.full(gap, steer)
+    states = _bicycle_rollout(state0, accel, steer_seq, dt, wheelbase, lr_ratio)
+    return states[-1, :2]
+
+
+
 def fuse_tracks(
     tracks: dict[int, dict[int, dict]],
     iou_thr: float,
@@ -137,6 +213,10 @@ def fuse_tracks(
     persistent_merge_dist: float = 3.5,
     containment_frac: float = 0.7,
     divergence_cap: float = 6.0,
+    model_assisted_gap: bool = False,
+    gap_model_alpha: float = 0.6,
+    gap_model_lr_ratio: float = 0.5,
+    gap_model_dt: float = 0.1,
 ) -> dict[int, int]:
     """Return a mapping ``track_id -> canonical_track_id`` after fusion."""
     ids = list(tracks)
@@ -265,7 +345,17 @@ def fuse_tracks(
             pred = end_center + vel * gap
             pred_dist = float(np.linalg.norm(pred - actual))
             raw_dist = float(np.linalg.norm(end_center - actual))
-            if min(pred_dist, raw_dist) <= gap_dist:
+            candidates = [pred_dist, raw_dist]
+            # Model-assisted handoff: a bicycle (constant-turn) extrapolation of
+            # the ending track predicts the reappearance point better than a
+            # straight-line guess when the vehicle is cornering through the gap.
+            if model_assisted_gap:
+                bike_pred = _bicycle_gap_prediction(
+                    tracks[end], gap, gap_model_dt, gap_model_alpha, gap_model_lr_ratio
+                )
+                if bike_pred is not None:
+                    candidates.append(float(np.linalg.norm(bike_pred - actual)))
+            if min(candidates) <= gap_dist:
                 guarded_union(a, b)
 
     # Canonical id per group = member with the most frames.
@@ -904,11 +994,21 @@ def _yaw_from_box_rotation(box: dict) -> float:
 
 
 def _yaw_matrix(yaw: float) -> np.ndarray:
-    """World-frame rotation matrix for a yaw rotation about +y."""
+    """Ground-plane yaw rotation matrix consistent with :func:`_yaw_from_box_rotation`.
+
+    The pipeline measures heading as ``atan2(dz, dx)`` of a box's local +x axis
+    (see :func:`_yaw_from_box_rotation`), so a box pointing at heading ``yaw`` has
+    local +x equal to ``[cos yaw, 0, sin yaw]``. That corresponds to a rotation of
+    ``-yaw`` about the world +y axis (a positive ``atan2(dz, dx)`` yaw turns +x
+    toward +z, opposite to the right-handed ``R_y(+yaw)``). Building the matrix
+    this way makes the round trip exact:
+    ``_yaw_from_box_rotation(_yaw_matrix(yaw)) == yaw``. Callers therefore apply a
+    delta ``target_yaw - base_yaw`` and get back a box at ``target_yaw``.
+    """
     c = float(np.cos(yaw))
     s = float(np.sin(yaw))
     return np.array(
-        [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=np.float64
+        [[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]], dtype=np.float64
     )
 
 
@@ -1039,6 +1139,480 @@ def smooth_track_rotations(
 
 
 # --------------------------------------------------------------------------- #
+# Kinematic bicycle-model fitting (vehicle classes)
+# --------------------------------------------------------------------------- #
+DEFAULT_BICYCLE_CLASSES = [
+    "car",
+    "truck",
+    "bus",
+    "trailer",
+    "construction_vehicle",
+]
+
+
+def _bicycle_fit_config(cfg: dict) -> BicycleFitConfig:
+    """Build a :class:`BicycleFitConfig` from the refine-task ``bicycle_fit`` block."""
+    defaults = BicycleFitConfig()
+    return BicycleFitConfig(
+        lr_ratio=float(cfg.get("lr_ratio", defaults.lr_ratio)),
+        segment_len=int(cfg.get("segment_len", defaults.segment_len)),
+        pos_scale=float(cfg.get("pos_scale", defaults.pos_scale)),
+        yaw_scale=float(cfg.get("yaw_scale", defaults.yaw_scale)),
+        huber_delta=float(cfg.get("huber_delta", defaults.huber_delta)),
+        cauchy_c=float(cfg.get("cauchy_c", defaults.cauchy_c)),
+        irls_iters=int(cfg.get("irls_iters", defaults.irls_iters)),
+        lambda_accel=float(cfg.get("lambda_accel", defaults.lambda_accel)),
+        lambda_steer=float(cfg.get("lambda_steer", defaults.lambda_steer)),
+        lambda_accel_mag=float(cfg.get("lambda_accel_mag", defaults.lambda_accel_mag)),
+        lambda_steer_mag=float(cfg.get("lambda_steer_mag", defaults.lambda_steer_mag)),
+        defect_weight=float(cfg.get("defect_weight", defaults.defect_weight)),
+        min_heading_speed=float(cfg.get("min_heading_speed", defaults.min_heading_speed)),
+        max_steer=float(cfg.get("max_steer", defaults.max_steer)),
+    )
+
+
+def select_bicycle_track_ids(
+    tracks: dict[int, dict[int, dict]], cfg: dict
+) -> list[int]:
+    """Track ids eligible for bicycle fitting (vehicle class + long enough)."""
+    classes = set(cfg.get("classes", DEFAULT_BICYCLE_CLASSES))
+    min_frames = int(cfg.get("min_track_frames", 3))
+    ids = []
+    for tid, track in tracks.items():
+        if len(track) < max(min_frames, 2):
+            continue
+        if _track_class(track) in classes:
+            ids.append(tid)
+    return ids
+
+
+def _bicycle_fit_worker(task: tuple) -> tuple:
+    """Process-pool worker: fit one track and return ``(tid, result)``.
+
+    Module-level (picklable) so :func:`apply_bicycle_fit` can dispatch the
+    independent per-track fits across a :class:`ProcessPoolExecutor`.
+    """
+    tid, offsets, positions, yaws, n_steps, dt, wheelbase, cfg = task
+    res = fit_track(
+        offsets, positions, yaws, n_steps=n_steps, dt=dt,
+        wheelbase=wheelbase, cfg=cfg,
+    )
+    return tid, res
+
+
+def _preclean_fit_inputs(
+    offsets: np.ndarray,
+    positions: np.ndarray,
+    yaws: np.ndarray,
+    cfg: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """Remove the two size-scaled detection artefacts before bicycle fitting.
+
+    Large / elongated vehicles suffer two failures the kinematic model cannot
+    represent and that blow up the fit:
+
+    * 180-degree heading flips (front/back box ambiguity) — resolved by pointing
+      each heading along the direction of motion (local where the vehicle moves,
+      the net start->end direction where it is momentarily too slow to trust the
+      local tangent). Heading is ``atan2(dz, dx)`` and ground positions are
+      ``(x, z)``, so motion direction is directly comparable to the box yaw.
+    * lateral position spikes (single-frame bad boxes) — dropped when a point
+      deviates from the offset-interpolation of its temporal neighbours by more
+      than ``preclean_outlier_dist`` meters.
+
+    Returns cleaned ``(offsets, positions, yaws, n_dropped)``. The first and last
+    observations and a minimum of two points are always preserved (they anchor
+    the fit span).
+    """
+    offsets = np.asarray(offsets, dtype=np.int64).copy()
+    positions = np.asarray(positions, dtype=np.float64).reshape(-1, 2).copy()
+    yaws = np.asarray(yaws, dtype=np.float64).reshape(-1).copy()
+    n = offsets.size
+    if n < 3:
+        return offsets, positions, yaws, 0
+
+    def _wrap(a):
+        return (a + np.pi) % (2 * np.pi) - np.pi
+
+    # --- 1. heading unflip -------------------------------------------------- #
+    if bool(cfg.get("preclean_yaw_flip", True)):
+        min_move = float(cfg.get("preclean_min_move", 0.3))
+        d = np.zeros_like(positions)
+        d[1:-1] = positions[2:] - positions[:-2]
+        d[0] = positions[1] - positions[0]
+        d[-1] = positions[-1] - positions[-2]
+        mag = np.linalg.norm(d, axis=1)
+        local_dir = np.arctan2(d[:, 1], d[:, 0])
+        net = positions[-1] - positions[0]
+        global_dir = float(np.arctan2(net[1], net[0]))
+        for i in range(n):
+            ref = local_dir[i] if mag[i] >= min_move else global_dir
+            if abs(_wrap(yaws[i] - ref)) > (np.pi / 2.0):
+                yaws[i] = _wrap(yaws[i] + np.pi)
+
+    # --- 2. position spike rejection --------------------------------------- #
+    outlier_dist = float(cfg.get("preclean_outlier_dist", 2.0))
+    n_dropped = 0
+    if outlier_dist > 0.0:
+        dev = np.zeros(n)
+        for i in range(1, n - 1):
+            span = offsets[i + 1] - offsets[i - 1]
+            t = (offsets[i] - offsets[i - 1]) / span if span > 0 else 0.5
+            pred = positions[i - 1] * (1.0 - t) + positions[i + 1] * t
+            dev[i] = float(np.linalg.norm(positions[i] - pred))
+        flagged = dev > outlier_dist  # interior only; endpoints (i=0,n-1) kept
+        # Cap removal so a genuinely wiggly track is not gutted: keep at most the
+        # worst 40% flagged, and never drop below two observations.
+        max_drop = int(np.floor(0.4 * n))
+        if int(flagged.sum()) > max_drop and max_drop >= 0:
+            worst = np.argsort(dev)[::-1][:max_drop]
+            keep_flag = np.zeros(n, dtype=bool)
+            keep_flag[worst] = True
+            flagged = flagged & keep_flag
+        if flagged.any() and (n - int(flagged.sum())) >= 2:
+            keep = ~flagged
+            offsets = offsets[keep]
+            positions = positions[keep]
+            yaws = yaws[keep]
+            n_dropped = int(flagged.sum())
+
+    return offsets, positions, yaws, n_dropped
+
+
+def _fit_with_trimming(
+    offsets: np.ndarray,
+    positions: np.ndarray,
+    yaws: np.ndarray,
+    n_steps: int,
+    dt: float,
+    wheelbase: float,
+    fit_cfg: "BicycleFitConfig",
+    res0,
+    max_pos_rmse: float,
+    cfg: dict,
+) -> tuple:
+    """Least-trimmed-squares recovery for a fit that failed the consistency gate.
+
+    Iteratively drops the worst single-shoot-residual observations and refits so
+    the continuous rollout can track the retained inliers. Scattered single-frame
+    outliers (the dominant large-vehicle failure) are removed one small batch at
+    a time; the span ``n_steps`` is held fixed so the baked trajectory still
+    covers every original frame (the model fills the dropped ones).
+
+    Returns ``(res, traj, ss_rmse, offsets, positions)`` for the best attempt by
+    RMSE (which may still exceed the gate, leaving the caller to reject).
+    """
+    lr = fit_cfg.lr_ratio
+
+    # Bound each refit: with the finite-difference Jacobian an uncapped solve is
+    # ``100 * n_params`` function evals, which — on a large, now under-constrained
+    # (trimmed) track — grinds for minutes in the trust-region solver. A finite
+    # cap and fewer IRLS passes keep every refit fast; a partial solve is fine
+    # for a fallback attempt.
+    max_nfev = int(cfg.get("trim_refit_max_nfev", 400))
+    refit_cfg = _dc_replace(
+        fit_cfg,
+        solver_max_nfev=max_nfev,
+        irls_iters=min(fit_cfg.irls_iters, 2),
+    )
+
+    def _eval(res, offs, pos):
+        traj = _bicycle_rollout(res.states[0], res.accel, res.steer, dt, wheelbase, lr)
+        resid = np.linalg.norm(traj[offs, :2] - pos, axis=1)
+        rmse = float(np.sqrt(np.mean(resid**2))) if resid.size else float("inf")
+        return traj, resid, rmse
+
+    cur_off, cur_pos, cur_yaw = offsets, positions, yaws
+    res = res0
+    traj, resid, rmse = _eval(res, cur_off, cur_pos)
+    best = (res, traj, rmse, cur_off, cur_pos)
+
+    iters = int(cfg.get("trim_refit_iters", 3))
+    thr = float(cfg.get("trim_refit_resid", 0.0)) or max_pos_rmse
+    min_obs = 4
+    for _ in range(max(iters, 0)):
+        if rmse <= max_pos_rmse:
+            break
+        n_cur = cur_off.size
+        if n_cur <= min_obs:
+            break
+        over = int((resid > thr).sum())
+        if over == 0:
+            over = 1  # RMSE high but no single frame over threshold: drop worst
+        # Drop the worst residuals, at most ~1/3 of the points per iteration and
+        # never below ``min_obs``.
+        budget = min(over, max(n_cur - min_obs, 0), max(int(np.ceil(n_cur / 3)), 1))
+        if budget <= 0:
+            break
+        drop_idx = np.argsort(resid)[::-1][:budget]
+        keep = np.ones(n_cur, dtype=bool)
+        keep[drop_idx] = False
+        if int(keep.sum()) < 2:
+            break
+        cur_off, cur_pos, cur_yaw = cur_off[keep], cur_pos[keep], cur_yaw[keep]
+        res = fit_track(
+            cur_off, cur_pos, cur_yaw, n_steps=n_steps, dt=dt,
+            wheelbase=wheelbase, cfg=refit_cfg,
+        )
+        traj, resid, rmse = _eval(res, cur_off, cur_pos)
+        if rmse < best[2]:
+            best = (res, traj, rmse, cur_off, cur_pos)
+
+    return best
+
+
+def apply_bicycle_fit(
+    tracks: dict[int, dict[int, dict]],
+    frame_keys: list[str],
+    cfg: dict,
+) -> tuple[int, dict]:
+    """Fit a kinematic bicycle model to each vehicle track and write it back.
+
+    For every track passed in (already restricted to vehicle classes by
+    :func:`select_bicycle_track_ids`), fits a CoG bicycle model to the observed
+    ground positions ``(x, z)`` and headings, then overwrites the track's dense
+    per-frame poses with the model rollout. This subsumes gap-filling and
+    translation/rotation smoothing for vehicles: the result is gap-free,
+    denoised, and kinematically consistent.
+
+    * Ground position ``(x, z)`` comes from the fitted state; the up axis ``y``
+      (height) is kept from the tracker predictions, linearly interpolated
+      across gap frames (RANSAC height-plane fitting is handled separately and
+      currently off).
+    * Heading is written as a world-up yaw delta on top of the nearest measured
+      box rotation (preserving roll/pitch); frames whose fitted speed is below
+      ``min_heading_speed`` keep the measured heading.
+
+    Mutates ``tracks`` in place (adds synthesized gap boxes). Returns
+    ``(n_tracks_fitted, report)`` where ``report['params']`` holds the fitted
+    model parameters per track for downstream persistence, and
+    ``report['rejected_ids']`` lists tracks whose fitted rollout failed the
+    consistency gate (``max_fit_pos_rmse``) — those keep their raw boxes so the
+    caller can route them to the legacy fill/smooth path.
+
+    The baked trajectory is a single kinematic rollout from the fitted
+    ``(state0, accel, steer)`` (not the multiple-shooting per-segment states),
+    so the training boxes are free of segment-boundary handoff jumps and are
+    identical to what the persisted params reproduce during extrapolation.
+    """
+    fit_cfg = _bicycle_fit_config(cfg)
+    alpha = float(cfg.get("wheelbase_alpha", 0.6))
+    dt = float(cfg.get("dt", 0.1))
+    # Max RMSE (meters) between the single kinematic rollout and the observed
+    # positions for a fit to be accepted. Unconverged / noise-blown-up fits
+    # (common on long or large-vehicle tracks) exceed this and are rejected so
+    # the track falls back to the legacy fill/smooth path instead of emitting a
+    # broken trajectory.
+    max_pos_rmse = float(cfg.get("max_fit_pos_rmse", 3.0))
+    n_keys = len(frame_keys)
+    ax0, ax1 = GROUND_AXES
+
+    n_fitted = 0
+    n_filled = 0
+    params: dict[str, dict] = {}
+    per_track: dict[str, dict] = {}
+    rejected: list[int] = []
+
+    # Only tracks with >= 2 observed frames are actually fittable.
+    fit_items = [(tid, track) for tid, track in tracks.items() if len(track) >= 2]
+
+    # --- Phase 1: gather per-track fit inputs (cheap, serial) -------------- #
+    tasks: list[tuple] = []
+    prep_by_tid: dict[int, dict] = {}
+    n_precleaned = 0
+    for tid, track in fit_items:
+        frames = sorted(track)
+        first, last = frames[0], frames[-1]
+        n_steps = last - first
+        offsets = np.asarray([f - first for f in frames], dtype=np.int64)
+        positions = np.asarray(
+            [
+                [track[f]["translation"][ax0], track[f]["translation"][ax1]]
+                for f in frames
+            ],
+            dtype=np.float64,
+        )
+        yaws = np.asarray(
+            [_yaw_from_box_rotation(track[f]) for f in frames], dtype=np.float64
+        )
+        sizes = np.asarray([track[f]["size"] for f in frames], dtype=np.float64)
+        wheelbase = wheelbase_from_size(np.median(sizes, axis=0), alpha)
+
+        # Pre-clean size-scaled detection artefacts (180-degree heading flips and
+        # single-frame position spikes) so the kinematic fit is not blown up by
+        # them. The cleaned arrays are reused verbatim by the gate/bake phase.
+        c_off, c_pos, c_yaw, n_drop = _preclean_fit_inputs(offsets, positions, yaws, cfg)
+        n_precleaned += n_drop
+        prep_by_tid[tid] = {
+            "offsets": c_off,
+            "positions": c_pos,
+            "yaws": c_yaw,
+            "n_steps": n_steps,
+            "wheelbase": wheelbase,
+            "first": first,
+            "frames": frames,
+        }
+        tasks.append((tid, c_off, c_pos, c_yaw, n_steps, dt, wheelbase, fit_cfg))
+
+    # --- Phase 2: fit (parallel across processes; serial for tiny batches) - #
+    # ``fit_track`` is independent per track, so the solves parallelize cleanly.
+    # fit_workers: 0 = auto (cpu-1, capped to #tasks); 1 = serial; N = N workers.
+    cfg_workers = int(cfg.get("fit_workers", 0))
+    if cfg_workers <= 0:
+        workers = min(len(tasks), max((os.cpu_count() or 1) - 1, 1))
+    else:
+        workers = min(cfg_workers, len(tasks)) if tasks else 0
+
+    results_by_tid: dict = {}
+    use_pool = workers > 1 and len(tasks) > 1
+
+    if use_pool:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_bicycle_fit_worker, t) for t in tasks]
+            done_iter = as_completed(futures)
+            if _tqdm is not None:
+                done_iter = _tqdm(
+                    done_iter, total=len(futures),
+                    desc=f"🚗 Fitting bicycle model ({workers}w)",
+                    unit="track", dynamic_ncols=True,
+                )
+            for fut in done_iter:
+                tid, res = fut.result()
+                results_by_tid[tid] = res
+    else:
+        serial_iter = tasks
+        if _tqdm is not None and tasks:
+            serial_iter = _tqdm(
+                tasks, desc="🚗 Fitting bicycle model",
+                unit="track", dynamic_ncols=True,
+            )
+        for t in serial_iter:
+            tid, res = _bicycle_fit_worker(t)
+            results_by_tid[tid] = res
+
+    # --- Phase 3: consistency gate + bake into the track boxes (serial) --- #
+    n_trimmed_tracks = 0
+    trim_enabled = bool(cfg.get("trim_refit", True))
+    for tid, track in fit_items:
+        res = results_by_tid[tid]
+        prep = prep_by_tid[tid]
+        offsets = prep["offsets"]
+        positions = prep["positions"]
+        yaws = prep["yaws"]
+        n_steps = prep["n_steps"]
+        wheelbase = prep["wheelbase"]
+        first = prep["first"]
+        frames = prep["frames"]
+
+        # Bake the SINGLE continuous rollout from the fitted (state0, controls)
+        # rather than the multiple-shooting per-segment states. Multiple shooting
+        # is used only to stabilize the optimization; its per-segment states
+        # contain continuity-defect jumps at each segment boundary and, more
+        # importantly, disagree with what the persisted (state0, accel, steer)
+        # params reproduce. Baking the rollout removes the boundary "handoff"
+        # jumps and makes the training boxes identical to the simulator's
+        # on-demand extrapolation.
+        traj = _bicycle_rollout(
+            res.states[0], res.accel, res.steer, dt, wheelbase, fit_cfg.lr_ratio
+        )
+
+        # Consistency / sanity gate: the single rollout must track the (cleaned)
+        # observations within max_pos_rmse. If not, attempt a least-trimmed-
+        # squares recovery — drop the worst-residual observations and refit —
+        # before giving up. Rejected tracks fall back to the legacy path via the
+        # caller.
+        ss_err = traj[offsets, :2] - positions
+        ss_rmse = float(np.sqrt(np.mean(np.sum(ss_err**2, axis=1))))
+        if (not np.isfinite(ss_rmse) or ss_rmse > max_pos_rmse) and trim_enabled:
+            n_before = offsets.size
+            res, traj, ss_rmse, offsets, positions = _fit_with_trimming(
+                offsets, positions, yaws, n_steps, dt, wheelbase, fit_cfg,
+                res, max_pos_rmse, cfg,
+            )
+            if offsets.size < n_before:
+                n_trimmed_tracks += 1
+
+        traj_pos = traj[:, :2]
+        traj_yaw = traj[:, STATE_THETA]
+        traj_valid = traj[:, STATE_V] >= fit_cfg.min_heading_speed
+
+        if not np.isfinite(ss_rmse) or ss_rmse > max_pos_rmse:
+            rejected.append(int(tid))
+            continue
+
+        # Height kept from predictions, interpolated across gaps. Uses the full
+        # observed frames (height is untouched by the position/yaw pre-clean and
+        # trimming, which only drop points from the ground-plane fit inputs).
+        obs_off = np.asarray([f - first for f in frames], dtype=np.int64)
+        obs_y = np.asarray(
+            [track[f]["translation"][UP_AXIS] for f in frames], dtype=np.float64
+        )
+        span = np.arange(n_steps + 1)
+        y_interp = np.interp(span, obs_off, obs_y)
+
+        observed = set(frames)
+        for off in range(n_steps + 1):
+            f = first + off
+            if f in observed:
+                box = track[f]
+                base_rot = box["rotation"]
+            else:
+                nearest = min(observed, key=lambda o: abs(o - f))
+                box = copy.deepcopy(track[nearest])
+                base_rot = box["rotation"]
+                box["interpolated"] = True
+                if 0 <= f < n_keys and "sample_token" in box:
+                    box["sample_token"] = frame_keys[f]
+                track[f] = box
+                n_filled += 1
+
+            t = list(box["translation"])
+            t[ax0] = float(traj_pos[off, 0])
+            t[ax1] = float(traj_pos[off, 1])
+            t[UP_AXIS] = float(y_interp[off])
+            box["translation"] = t
+
+            if bool(traj_valid[off]):
+                base_yaw = _yaw_from_box_rotation({"rotation": base_rot})
+                delta = float(traj_yaw[off] - base_yaw)
+                rot_new = _yaw_matrix(delta) @ quat_wxyz_to_matrix(base_rot)
+                box["rotation"] = _matrix_to_quat_wxyz(rot_new).tolist()
+
+        n_fitted += 1
+        params[str(tid)] = {
+            "wheelbase": float(wheelbase),
+            "lr_ratio": float(fit_cfg.lr_ratio),
+            "dt": float(dt),
+            "first_frame": int(first),
+            "n_steps": int(n_steps),
+            "state0": [float(v) for v in res.states[0]],
+            "accel": [float(v) for v in res.accel],
+            "steer": [float(v) for v in res.steer],
+        }
+        per_track[str(tid)] = {
+            "class": _track_class(track),
+            "n_obs": int(res.n_obs),
+            "success": bool(res.success),
+            "pos_rmse": float(ss_rmse),
+            "yaw_rmse": float(res.yaw_rmse),
+            "wheelbase": float(wheelbase),
+            "first_frame": int(first),
+            "n_frames": int(n_steps + 1),
+        }
+
+    report = {
+        "tracks_fitted": n_fitted,
+        "frames_filled": n_filled,
+        "tracks_precleaned_frames": n_precleaned,
+        "tracks_trimmed": n_trimmed_tracks,
+        "tracks": per_track,
+        "params": params,
+        "rejected_ids": rejected,
+    }
+    return n_fitted, report
+
+
+# --------------------------------------------------------------------------- #
 # Serialization
 # --------------------------------------------------------------------------- #
 def tracks_to_results(
@@ -1062,6 +1636,8 @@ def _write_user_iteration(
     data_root: str,
     camera_names: list[str],
     project_cfg: dict,
+    bicycle_params: dict | None = None,
+    bicycle_alpha: float = 0.6,
 ) -> str:
     """Write one numbered user-refinement snapshot and return its directory."""
     it_dir = os.path.join(root_dir, f"{iteration_idx:03d}")
@@ -1081,6 +1657,23 @@ def _write_user_iteration(
     with open(os.path.join(it_dir, "refine_report_user.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
+    # Persist the fitted bicycle-model params for this iteration (reflecting any
+    # manual edits) so an interrupted interactive session and the simulator can
+    # read the newest parameters without waiting for the loop to finish with
+    # 'done'. Written both into the iteration snapshot and refreshed at the
+    # top-level refine dir (which is what resume and load_rigid_tracks read).
+    if bicycle_params is not None:
+        sidecar = {
+            "frame_keys": frame_keys,
+            "wheelbase_alpha": float(bicycle_alpha),
+            "tracks": bicycle_params,
+        }
+        with open(os.path.join(it_dir, "bicycle_params.json"), "w", encoding="utf-8") as f:
+            json.dump(sidecar, f)
+        top_dir = os.path.dirname(root_dir)
+        with open(os.path.join(top_dir, "bicycle_params.json"), "w", encoding="utf-8") as f:
+            json.dump(sidecar, f)
+
     with open(os.path.join(it_dir, ".success"), "w", encoding="utf-8") as f:
         f.write("User refinement iteration finished successfully.")
 
@@ -1094,10 +1687,12 @@ def _write_user_iteration(
         camera_names=camera_names,
         project_cfg=project_cfg,
     )
+
     with open(os.path.join(it_dir, "project_report.json"), "w", encoding="utf-8") as f:
         json.dump(proj_report, f, indent=2)
 
-    return it_dir
+    frame_mapping = proj_report.get("frame_mapping", {})
+    return it_dir, frame_mapping
 
 
 def _project_results_snapshot(
@@ -1279,16 +1874,145 @@ def _extend_single_track_stopped(
     return n_ext
 
 
-def _remove_track_frames(track: dict[int, dict], amount: int) -> int:
-    """Remove endpoint predictions. Positive=end, negative=start."""
+def _remove_track_frames(track: dict[int, dict], frame_range: tuple[int, int]) -> int:
+    """Remove frames in the given frame index range (inclusive). Returns count removed."""
     frames = sorted(track)
-    if not frames or amount == 0:
+    if not frames:
         return 0
-    n = abs(int(amount))
-    targets = frames[-n:] if amount > 0 else frames[:n]
+    start, end = frame_range
+    # Clamp to valid frame indices in the track
+    start = max(start, min(frames))
+    end = min(end, max(frames))
+    targets = [f for f in frames if start <= f <= end]
     for f in targets:
         track.pop(f, None)
     return len(targets)
+
+
+def _should_bike_fit(track: dict[int, dict], bicycle_cfg: dict) -> bool:
+    """True if a track is a bicycle-fit-eligible vehicle (class + length)."""
+    classes = set(bicycle_cfg.get("classes", DEFAULT_BICYCLE_CLASSES))
+    min_frames = int(bicycle_cfg.get("min_track_frames", 3))
+    return _track_class(track) in classes and len(track) >= max(min_frames, 2)
+
+
+def _refit_track_bicycle(
+    tid: int,
+    track: dict[int, dict],
+    frame_keys: list[str],
+    bicycle_cfg: dict,
+    bicycle_params: dict,
+) -> None:
+    """Re-fit one vehicle track's bicycle model in place and refresh its params.
+
+    Re-runs :func:`apply_bicycle_fit` on the single track so its dense per-frame
+    poses and persisted parameters stay mutually consistent after a structural
+    edit (fuse / model extend). Updates ``bicycle_params[str(tid)]`` in place,
+    dropping the entry if the fit no longer applies.
+    """
+    _, rep = apply_bicycle_fit({tid: track}, frame_keys, bicycle_cfg)
+    entry = rep.get("params", {}).get(str(tid))
+    if entry is not None:
+        bicycle_params[str(tid)] = entry
+    else:
+        bicycle_params.pop(str(tid), None)
+
+
+def _extend_single_track_bicycle(
+    track: dict[int, dict],
+    params_entry: dict,
+    frame_keys: list[str],
+    amount: int,
+) -> int:
+    """Extend one bicycle-fitted track using the kinematic model rollout.
+
+    Rolls the fitted CoG bicycle model past the observed span with constant
+    control (zero acceleration, held steering) so the extension follows the
+    vehicle's last curvature instead of a straight constant-velocity vector.
+    Positive ``amount`` extends after the last frame, negative before the first.
+    Height (up axis) is held at the endpoint value; heading follows the model.
+    Returns the number of frames added.
+    """
+    frames = sorted(track)
+    if len(frames) < 1 or amount == 0:
+        return 0
+
+    wheelbase = float(params_entry["wheelbase"])
+    lr_ratio = float(params_entry["lr_ratio"])
+    dt = float(params_entry["dt"])
+    state0 = np.asarray(params_entry["state0"], dtype=np.float64)
+    accel = np.asarray(params_entry["accel"], dtype=np.float64)
+    steer = np.asarray(params_entry["steer"], dtype=np.float64)
+    states = _bicycle_rollout(state0, accel, steer, dt, wheelbase, lr_ratio)
+
+    n_keys = len(frame_keys)
+    ax0, ax1 = GROUND_AXES
+
+    def _write_box(f: int, state: np.ndarray, base_box: dict) -> None:
+        box = copy.deepcopy(base_box)
+        box["extrapolated"] = True
+        if 0 <= f < n_keys and "sample_token" in box:
+            box["sample_token"] = frame_keys[f]
+        t = list(box["translation"])
+        t[ax0] = float(state[0])
+        t[ax1] = float(state[1])
+        t[UP_AXIS] = float(base_box["translation"][UP_AXIS])
+        box["translation"] = t
+        base_yaw = _yaw_from_box_rotation({"rotation": base_box["rotation"]})
+        delta = float(state[2] - base_yaw)
+        rot_new = _yaw_matrix(delta) @ quat_wxyz_to_matrix(base_box["rotation"])
+        box["rotation"] = _matrix_to_quat_wxyz(rot_new).tolist()
+        track[f] = box
+
+    if amount > 0:
+        last = frames[-1]
+        n_add = 0
+        for k in range(1, amount + 1):
+            f = last + k
+            if f >= n_keys or f in track:
+                break
+            n_add += 1
+        if n_add == 0:
+            return 0
+        end_state = states[-1]
+        last_steer = float(steer[-1]) if steer.size else 0.0
+        ext = _bicycle_rollout(
+            end_state,
+            np.zeros(n_add),
+            np.full(n_add, last_steer),
+            dt,
+            wheelbase,
+            lr_ratio,
+        )
+        base_box = track[last]
+        for k in range(1, n_add + 1):
+            _write_box(last + k, ext[k], base_box)
+        return n_add
+
+    first = frames[0]
+    amt = abs(amount)
+    n_add = 0
+    for k in range(1, amt + 1):
+        f = first - k
+        if f < 0 or f in track:
+            break
+        n_add += 1
+    if n_add == 0:
+        return 0
+    first_steer = float(steer[0]) if steer.size else 0.0
+    # Integrate backward in time by rolling the model with a negative timestep.
+    back = _bicycle_rollout(
+        states[0],
+        np.zeros(n_add),
+        np.full(n_add, first_steer),
+        -dt,
+        wheelbase,
+        lr_ratio,
+    )
+    base_box = track[first]
+    for k in range(1, n_add + 1):
+        _write_box(first - k, back[k], base_box)
+    return n_add
 
 
 def _apply_user_command(
@@ -1298,21 +2022,56 @@ def _apply_user_command(
     default_extend: int,
     vel_window: int,
     frame_keys: list[str],
+    bicycle_params: dict | None = None,
+    bicycle_cfg: dict | None = None,
+    refit_bicycle: bool = True,
+    frame_mapping: dict[str, int] | None = None,
 ) -> str:
-    """Apply one interactive user-refinement command in place."""
+    """Apply one interactive user-refinement command in place.
+
+    When ``bicycle_params`` is provided and bicycle fitting is enabled, edits are
+    kept consistent with the persisted per-track model parameters: filtering
+    drops the track's params, fusing re-fits the merged vehicle track, and
+    extending a fitted vehicle track uses the kinematic model rollout.
+
+    ``refit_bicycle`` gates the expensive per-track bicycle re-fit. During
+    staging (dry-run preview) it is ``False`` so typing a command does not run
+    the fit; the fit runs once when the batch is applied.
+    """
+    bicycle_cfg = bicycle_cfg or {}
+    bike_enabled = (
+        bicycle_params is not None and bool(bicycle_cfg.get("enabled", False))
+    )
+
     if cmd == "filter":
         if not args:
             raise ValueError("Filter expects 'Filter: <class>_<id>'.")
         tid, cls = _validate_selector(tracks, args)
         del tracks[tid]
+        if bicycle_params is not None:
+            bicycle_params.pop(str(tid), None)
         return f"🗑️ Staged filter for {cls}_{tid}."
 
     if cmd == "fuse":
         specs = [s.strip() for s in args.split(",") if s.strip()]
         if len(specs) < 2:
             raise ValueError("Fuse expects at least two selectors.")
+        pre_ids = [_validate_selector(tracks, s)[0] for s in specs]
         canonical, removed = _manual_fuse_tracks(tracks, specs)
-        return f"🔗 Staged fuse into id {canonical}; removed {removed} tracks."
+        refit_note = ""
+        if bike_enabled:
+            for tid in set(pre_ids):
+                if tid != canonical:
+                    bicycle_params.pop(str(tid), None)
+            if _should_bike_fit(tracks[canonical], bicycle_cfg):
+                if refit_bicycle:
+                    _refit_track_bicycle(
+                        canonical, tracks[canonical], frame_keys, bicycle_cfg, bicycle_params
+                    )
+                refit_note = " (re-fit bicycle model)"
+            else:
+                bicycle_params.pop(str(canonical), None)
+        return f"🔗 Staged fuse into id {canonical}; removed {removed} tracks{refit_note}."
 
     if cmd == "extend":
         parts = [s.strip() for s in args.split(",") if s.strip()]
@@ -1326,12 +2085,26 @@ def _apply_user_command(
         frames_before = sorted(tracks[tid])
         first_before = frames_before[0] if frames_before else 0
         last_before = frames_before[-1] if frames_before else -1
-        added = _extend_single_track(
-            track=tracks[tid],
-            frame_keys=frame_keys,
-            amount=amount,
-            vel_window=vel_window,
-        )
+        use_model = bike_enabled and str(tid) in bicycle_params
+        if use_model:
+            added = _extend_single_track_bicycle(
+                track=tracks[tid],
+                params_entry=bicycle_params[str(tid)],
+                frame_keys=frame_keys,
+                amount=amount,
+            )
+            if added > 0 and refit_bicycle and _should_bike_fit(tracks[tid], bicycle_cfg):
+                _refit_track_bicycle(
+                    tid, tracks[tid], frame_keys, bicycle_cfg, bicycle_params
+                )
+        else:
+            added = _extend_single_track(
+                track=tracks[tid],
+                frame_keys=frame_keys,
+                amount=amount,
+                vel_window=vel_window,
+            )
+        mode = " (bicycle model)" if use_model else ""
         if added == 0:
             if amount > 0 and last_before >= (len(frame_keys) - 1):
                 return (
@@ -1343,7 +2116,7 @@ def _apply_user_command(
                     f"↕️ Staged extend for {cls}_{tid} by {amount}; adds 0 frames "
                     "(track already starts at the first frame; use positive amount to extend later frames)."
                 )
-        return f"↕️ Staged extend for {cls}_{tid} by {amount}; adds {added} frames."
+        return f"↕️ Staged extend for {cls}_{tid} by {amount}; adds {added} frames{mode}."
 
     if cmd in {"extend_stoped", "extend_stopped"}:
         parts = [s.strip() for s in args.split(",") if s.strip()]
@@ -1380,20 +2153,57 @@ def _apply_user_command(
     if cmd == "remove":
         parts = [s.strip() for s in args.split(",") if s.strip()]
         if len(parts) < 2:
-            raise ValueError("Remove expects 'Remove: <class>_<id>, <int>'.")
+            raise ValueError("Remove expects 'Remove: <class>_<id>, <start>-<end>'.")
         selector = parts[0]
-        amount = int(parts[1].strip().rstrip(";"))
-        if amount == 0:
-            raise ValueError("Remove amount must be non-zero.")
+        range_str = parts[1].strip().rstrip(";")
+        if "-" not in range_str:
+            raise ValueError("Remove range must be 'start-end' (e.g., '10-50').")
+        try:
+            user_start, user_end = map(int, range_str.split("-"))
+        except ValueError:
+            raise ValueError(f"Invalid frame range '{range_str}'; expected 'start-end'.")
+        if user_start > user_end:
+            user_start, user_end = user_end, user_start
+        
+        # Collect all sequence indices for the requested range
+        frame_indices_to_remove = set()
+        if frame_mapping:
+            for seq_idx in range(user_start, user_end + 1):
+                ts = frame_mapping.get(str(seq_idx))
+                if ts is None:
+                    raise ValueError(
+                        f"Frame index {seq_idx} out of bounds. "
+                        f"Valid range: 0-{max(int(k) for k in frame_mapping.keys()) if frame_mapping else 'unknown'}."
+                    )
+                # frame_mapping maps seq_idx -> timestamp, but tracks are keyed by seq_idx
+                frame_indices_to_remove.add(seq_idx)
+        else:
+            # Fallback: use sequence indices directly
+            for seq_idx in range(user_start, user_end + 1):
+                frame_indices_to_remove.add(seq_idx)
+        
         tid, cls = _validate_selector(tracks, selector)
-        removed = _remove_track_frames(tracks[tid], amount)
+        
+        # Debug: print what we're trying to remove
+        track_frames = sorted(tracks[tid].keys())
+        #print(f"🔍 DEBUG Remove: track {cls}_{tid} has frames {track_frames[:10]}... (total: {len(track_frames)})")
+        #print(f"🔍 DEBUG Remove: trying to remove frame indices {sorted(frame_indices_to_remove)}")
+        #print(f"🔍 DEBUG Remove: frame_mapping keys range: {sorted(int(k) for k in frame_mapping.keys())[:5]}...{sorted(int(k) for k in frame_mapping.keys())[-5:] if frame_mapping else 'None'}")
+        
+        # Remove specific frames by sequence index
+        removed = 0
+        for frame_idx in frame_indices_to_remove:
+            if frame_idx in tracks[tid]:
+                del tracks[tid][frame_idx]
+                removed += 1
+        
         if not tracks[tid]:
             del tracks[tid]
             return (
-                f"✂️ Staged remove for {cls}_{tid} by {amount}; removed {removed} frames "
+                f"✂️ Staged remove for {cls}_{tid} frames {user_start}-{user_end}; removed {removed} frames "
                 "(track became empty and was deleted)."
             )
-        return f"✂️ Staged remove for {cls}_{tid} by {amount}; removed {removed} frames."
+        return f"✂️ Staged remove for {cls}_{tid} frames {user_start}-{user_end}; removed {removed} frames."
 
     raise ValueError(
         "Unknown command. Use Filter/Fuse/Extend/Extend_stopped/Remove/apply/undo/done."
@@ -1402,13 +2212,18 @@ def _apply_user_command(
 
 def _replay_pending_commands(
     tracks: dict[int, dict[int, dict]],
+    params: dict,
     pending_commands: list[str],
     default_extend: int,
     vel_window: int,
     frame_keys: list[str],
-) -> tuple[dict[int, dict[int, dict]], list[str]]:
-    """Return preview tracks/messages after replaying staged commands."""
+    bicycle_cfg: dict,
+    refit_bicycle: bool = True,
+    frame_mapping: dict[str, int] | None = None,
+) -> tuple[dict[int, dict[int, dict]], dict, list[str]]:
+    """Return preview tracks/params/messages after replaying staged commands."""
     preview = copy.deepcopy(tracks)
+    preview_params = copy.deepcopy(params)
     messages: list[str] = []
     for raw in pending_commands:
         raw_clean = raw.strip().rstrip(";").strip()
@@ -1428,9 +2243,13 @@ def _replay_pending_commands(
                 default_extend,
                 vel_window,
                 frame_keys,
+                preview_params,
+                bicycle_cfg,
+                refit_bicycle=refit_bicycle,
+                frame_mapping=frame_mapping,
             )
         )
-    return preview, messages
+    return preview, preview_params, messages
 
 
 def _run_user_refinement_loop(
@@ -1441,18 +2260,29 @@ def _run_user_refinement_loop(
     payload_template: dict,
     data_root: str,
     camera_names: list[str],
-) -> tuple[dict, dict]:
-    """Interactive post-refinement loop with undo and numbered snapshots."""
+    bicycle_params: dict | None = None,
+    bicycle_cfg: dict | None = None,
+    allow_refit_bicycle: bool = False,
+) -> tuple[dict, dict, dict]:
+    """Interactive post-refinement loop with undo and numbered snapshots.
+
+    Returns ``(final_results, summary, final_bicycle_params)``. Manual edits keep
+    the persisted bicycle-model parameters consistent: filtering drops a track's
+    params, fusing re-fits the merged vehicle track, and extending a fitted
+    vehicle track rolls the model forward/backward.
+    """
     user_cfg = cfg.get("user_refinement", {}) or {}
+    bicycle_cfg = dict(bicycle_cfg or {})
+    params: dict = copy.deepcopy(bicycle_params) if bicycle_params else {}
+    bike_alpha = float(bicycle_cfg.get("wheelbase_alpha", 0.6))
     if not bool(user_cfg.get("enabled", False)):
         return refined_results, {
             "enabled": False,
             "iterations": 0,
             "commands_applied": 0,
-        }
+        }, params
 
-    tracks = build_tracks(copy.deepcopy(refined_results))
-    history: list[dict[int, dict[int, dict]]] = []
+    history: list[tuple[dict[int, dict[int, dict]], dict]] = []
     commands: list[str] = []
     applied_batch_sizes: list[int] = []
     pending_commands: list[str] = []
@@ -1461,7 +2291,8 @@ def _run_user_refinement_loop(
     default_extend = int(user_cfg.get("default_extend", 5))
     project_cfg = cfg.get("project", {}) or {}
 
-    root_dir = os.path.join(output_dir, str(user_cfg.get("output_dir", "user_refinement")))
+    root_dir = output_dir
+    #root_dir = os.path.join(output_dir, str(user_cfg.get("output_dir", "user_refinement_what?")))
     os.makedirs(root_dir, exist_ok=True)
     command_log_path = os.path.join(root_dir, "commands_applied.txt")
     existing_iters: list[int] = []
@@ -1473,9 +2304,41 @@ def _run_user_refinement_loop(
             existing_iters.append(int(name))
         except ValueError:
             continue
+
+    # Resume: if a previous session left numbered snapshots in this (config-
+    # hashed) refine dir, continue editing from the latest one instead of
+    # discarding those manual edits and restarting from the automatic base.
+    resume = bool(user_cfg.get("resume_from_latest", True))
+    resumed_from: int | None = None
+    if resume and existing_iters:
+        latest = max(existing_iters)
+        snap_json = os.path.join(root_dir, f"{latest:03d}", "track_3d_refined_colmap.json")
+        if os.path.exists(snap_json):
+            try:
+                with open(snap_json, encoding="utf-8") as f:
+                    snap_data = json.load(f)
+                resumed_results = snap_data.get("results", snap_data)
+                tracks = build_tracks(copy.deepcopy(resumed_results))
+                resumed_from = latest
+                # Prefer the previous session's persisted bicycle params (they
+                # reflect its manual edits) over this run's fresh auto fit.
+                sidecar_path = os.path.join(output_dir, "bicycle_params.json")
+                if os.path.exists(sidecar_path):
+                    with open(sidecar_path, encoding="utf-8") as f:
+                        sidecar = json.load(f)
+                    saved_params = sidecar.get("tracks", {}) or {}
+                    if saved_params:
+                        params = copy.deepcopy(saved_params)
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                print(f"⚠️ Could not resume from {snap_json}: {exc}. Starting fresh.")
+                resumed_from = None
+
+    if resumed_from is None:
+        tracks = build_tracks(copy.deepcopy(refined_results))
+
     start_idx = (max(existing_iters) + 1) if existing_iters else 0
     iter_idx = start_idx
-    first_dir = _write_user_iteration(
+    first_dir, frame_mapping = _write_user_iteration(
         root_dir=root_dir,
         base_payload=payload_template,
         tracks=tracks,
@@ -1485,16 +2348,24 @@ def _run_user_refinement_loop(
         data_root=data_root,
         camera_names=camera_names,
         project_cfg=project_cfg,
+        bicycle_params=params,
+        bicycle_alpha=bike_alpha,
     )
 
     print("\n🧭 Interactive user refinement enabled.")
+    if resumed_from is not None:
+        print(
+            f"♻️ Resumed from previous user-refinement snapshot "
+            f"{resumed_from:03d} ({len(tracks)} tracks)."
+        )
     print(f"📂 Iteration {iter_idx:03d} saved to: {first_dir}")
     print("Commands:")
     print("  Filter: <class>_<id>")
     print("  Fuse: <class>_<id>, <class>_<id> [, ...]")
     print(f"  Extend: <class>_<id>[, <int>] (default int={default_extend})")
     print("  Extend_stopped: <class>_<id>, <int>")
-    print("  Remove: <class>_<id>, <int> (positive=end, negative=start)")
+    max_frame_idx = max(int(k) for k in frame_mapping) if frame_mapping else 0
+    print(f"  Remove: <class>_<id>, <start>-<end> (frame indices 0-{max_frame_idx})")
     print("  apply")
     print("  undo")
     print("  done")
@@ -1529,13 +2400,13 @@ def _run_user_refinement_loop(
                 if not history:
                     print("⚠️ Nothing to undo.")
                     continue
-                tracks = history.pop()
+                tracks, params = history.pop()
                 if applied_batch_sizes:
                     n_drop = applied_batch_sizes.pop()
                     if n_drop > 0:
                         del commands[-n_drop:]
                 iter_idx += 1
-                out_dir = _write_user_iteration(
+                out_dir, frame_mapping = _write_user_iteration(
                     root_dir=root_dir,
                     base_payload=payload_template,
                     tracks=tracks,
@@ -1545,6 +2416,8 @@ def _run_user_refinement_loop(
                     data_root=data_root,
                     camera_names=camera_names,
                     project_cfg=project_cfg,
+                    bicycle_params=params,
+                    bicycle_alpha=bike_alpha,
                 )
                 command_log_lines.append(f"iter {iter_idx:03d} | undo")
                 print(f"↩️ Undo applied. Snapshot: {out_dir}")
@@ -1554,21 +2427,26 @@ def _run_user_refinement_loop(
                 if not pending_commands:
                     print("⚠️ No staged commands to apply.")
                     continue
-                preview_tracks, _ = _replay_pending_commands(
+                preview_tracks, preview_params, _ = _replay_pending_commands(
                     tracks,
+                    params,
                     pending_commands,
                     default_extend,
                     vel_window,
                     frame_keys,
+                    bicycle_cfg,
+                    frame_mapping=frame_mapping,
+                    refit_bicycle=allow_refit_bicycle,
                 )
-                history.append(copy.deepcopy(tracks))
+                history.append((copy.deepcopy(tracks), copy.deepcopy(params)))
                 tracks = preview_tracks
+                params = preview_params
                 commands.extend(pending_commands)
                 applied_batch = list(pending_commands)
                 applied_batch_sizes.append(len(applied_batch))
                 pending_commands.clear()
                 iter_idx += 1
-                out_dir = _write_user_iteration(
+                out_dir, frame_mapping = _write_user_iteration(
                     root_dir=root_dir,
                     base_payload=payload_template,
                     tracks=tracks,
@@ -1578,6 +2456,8 @@ def _run_user_refinement_loop(
                     data_root=data_root,
                     camera_names=camera_names,
                     project_cfg=project_cfg,
+                    bicycle_params=params,
+                    bicycle_alpha=bike_alpha,
                 )
                 command_log_lines.append(
                     f"iter {iter_idx:03d} | apply | " + " ; ".join(applied_batch)
@@ -1590,12 +2470,16 @@ def _run_user_refinement_loop(
                     "Unknown command. Use Filter/Fuse/Extend/Extend_stopped/Remove/apply/undo/done."
                 )
 
-            preview_tracks, _ = _replay_pending_commands(
+            preview_tracks, preview_params, _ = _replay_pending_commands(
                 tracks,
+                params,
                 pending_commands,
                 default_extend,
                 vel_window,
                 frame_keys,
+                bicycle_cfg,
+                refit_bicycle=allow_refit_bicycle,
+                frame_mapping=frame_mapping,
             )
             stage_msg = _apply_user_command(
                 preview_tracks,
@@ -1604,6 +2488,10 @@ def _run_user_refinement_loop(
                 default_extend,
                 vel_window,
                 frame_keys,
+                preview_params,
+                bicycle_cfg,
+                refit_bicycle=allow_refit_bicycle,
+                frame_mapping=frame_mapping,
             )
             pending_commands.append(raw)
             print(stage_msg)
@@ -1632,7 +2520,7 @@ def _run_user_refinement_loop(
         f.write(f"commands_applied_total: {len(commands)}\n")
         f.write("\n")
 
-    return final_results, summary
+    return final_results, summary, params
 
 
 def _build_track_change_summary(
@@ -1725,7 +2613,7 @@ def _build_track_change_summary(
     return [summary[k] for k in sorted(summary)]
 
 
-def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
+def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") -> tuple[dict, dict]:
     """Run fusion then filtering. Returns (refined_results, report).
 
     Operates on a deep copy so the caller's ``results`` (and its box dicts) are
@@ -1735,6 +2623,8 @@ def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
     frame_keys, _ = _frame_index(results)
     tracks = build_tracks(results)
     n_in = len(tracks)
+
+    bicycle_cfg = cfg.get("bicycle_fit", {}) or {}
 
     mapping = fuse_tracks(
         tracks,
@@ -1748,6 +2638,10 @@ def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
         persistent_merge_dist=float(cfg.get("persistent_merge_dist", 3.5)),
         containment_frac=float(cfg.get("containment_frac", 0.7)),
         divergence_cap=float(cfg.get("divergence_cap", 6.0)),
+        model_assisted_gap=bool(bicycle_cfg.get("model_assisted_gap", False)),
+        gap_model_alpha=float(bicycle_cfg.get("wheelbase_alpha", 0.6)),
+        gap_model_lr_ratio=float(bicycle_cfg.get("lr_ratio", 0.5)),
+        gap_model_dt=float(bicycle_cfg.get("dt", 0.1)),
     )
     fused, fusion_report = apply_fusion(
         tracks,
@@ -1767,13 +2661,75 @@ def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
         min_rel_displacement=float(cfg.get("min_rel_displacement", 0.0)),
     )
 
+    # Optional interactive user edits before bicycle fitting to remove outliers.
+    refined_kept = kept
+    if bool(cfg.get("user_refinement", {}).get("enabled", False)) and output_dir:
+        cameras = list(cfg.get("project", {}).get("cameras", []) or [])
+        bicycle_cfg_user = cfg.get("bicycle_fit", {}) or {}
+        user_refinement_dir = os.path.join(output_dir, "user_refinement")
+        refined_kept_results, user_report_pre, _ = _run_user_refinement_loop(
+            refined_results=tracks_to_results(kept, frame_keys),
+            frame_keys=frame_keys,
+            cfg=cfg,
+            output_dir=user_refinement_dir,
+            payload_template={},
+            data_root=data_root,
+            camera_names=cameras,
+            bicycle_params={},
+            bicycle_cfg=bicycle_cfg_user,
+            allow_refit_bicycle=False,
+        )
+        refined_kept = build_tracks(refined_kept_results)
+        kept = refined_kept
+
+    # Vehicle tracks are refined by a per-track kinematic bicycle-model fit
+    # (gap-fill + denoise + kinematic consistency in one), which supersedes the
+    # heuristic fill/extend/smooth stages for those classes. Non-vehicle tracks
+    # (and vehicle tracks too short to fit) keep the legacy path below.
+    bicycle_enabled = bool(bicycle_cfg.get("enabled", False))
+    bicycle_report: dict = {}
+    fit_ids: set[int] = set()
+    if bicycle_enabled:
+        fit_ids = set(select_bicycle_track_ids(kept, bicycle_cfg))
+        fit_kept = {tid: kept[tid] for tid in fit_ids}
+        _, bicycle_report = apply_bicycle_fit(fit_kept, frame_keys, bicycle_cfg)
+        # Fits rejected by the consistency gate keep their raw boxes (never
+        # baked) — route them to the legacy fill/smooth path below.
+        rejected_ids = set(bicycle_report.get("rejected_ids", []))
+        params = bicycle_report.get("params", {})
+        fit_ids -= rejected_ids
+
+    # Optional interactive user edits after bicycle fitting to refine kinematic results.
+    refined_kept = kept
+    if bool(cfg.get("user_refinement", {}).get("enabled", False)) and bool(cfg.get("user_refinement", {}).get("post_bicycle_fit", False)) and output_dir:
+        cameras = list(cfg.get("project", {}).get("cameras", []) or [])
+        bicycle_cfg_user = cfg.get("bicycle_fit", {}) or {}
+        user_refinement_post_dir = os.path.join(output_dir, "user_refinement_post_bicycle")
+        refined_kept_results, user_report_post, _ = _run_user_refinement_loop(
+            refined_results=tracks_to_results(kept, frame_keys),
+            frame_keys=frame_keys,
+            cfg=cfg,
+            output_dir=user_refinement_post_dir,
+            payload_template={},
+            data_root=data_root,
+            camera_names=cameras,
+            bicycle_params=params,
+            bicycle_cfg=bicycle_cfg_user,
+            allow_refit_bicycle=True,
+        )
+        refined_kept = build_tracks(refined_kept_results)
+        kept = refined_kept
+
+    # Legacy heuristic path, applied only to tracks NOT handled by the fit.
+    legacy_kept = {tid: t for tid, t in kept.items() if tid not in fit_ids}
+
     # Interpolate interior frame gaps so each kept track is continuous within its
     # lifespan (the tracker frequently drops single frames). Done after filtering
     # so we never waste work on tracks that get dropped.
     n_filled = 0
     filled_details: list[dict] = []
     if bool(cfg.get("fill_gaps", True)):
-        n_filled, filled_details = fill_track_gaps(kept, frame_keys)
+        n_filled, filled_details = fill_track_gaps(legacy_kept, frame_keys)
 
     # Extrapolate a bounded number of frames past each track's ends to cover the
     # fisheye FOV edges / far-away dropouts the (narrower-FOV) tracker misses.
@@ -1781,7 +2737,7 @@ def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
     extended_details: list[dict] = []
     if int(cfg.get("extend_frames", 0)) > 0:
         n_extended, extended_details = extend_track_ends(
-            kept,
+            legacy_kept,
             frame_keys,
             extend_frames=int(cfg.get("extend_frames", 0)),
             vel_window=int(cfg.get("extend_velocity_window", 3)),
@@ -1792,7 +2748,7 @@ def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
     n_smoothed = 0
     if int(cfg.get("pose_smooth_window", 0)) > 1:
         n_smoothed = smooth_track_translations(
-            kept, window=int(cfg.get("pose_smooth_window", 0))
+            legacy_kept, window=int(cfg.get("pose_smooth_window", 0))
         )
 
     # Optional yaw-only pose smoothing. Can either smooth the raw box yaw, or
@@ -1801,7 +2757,7 @@ def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
     n_rot_smoothed = 0
     if bool(cfg.get("pose_smooth_rotation", False)):
         n_rot_smoothed = smooth_track_rotations(
-            kept,
+            legacy_kept,
             window=int(
                 cfg.get(
                     "pose_smooth_rotation_window", cfg.get("pose_smooth_window", 0)
@@ -1830,6 +2786,7 @@ def refine(results: dict, cfg: dict) -> tuple[dict, dict]:
         "extended_frames": extended_details,
         "frames_smoothed": n_smoothed,
         "rotations_smoothed": n_rot_smoothed,
+        "bicycle_fit": bicycle_report,
         "track_summary": _build_track_change_summary(
             fusion_report=fusion_report,
             kept_ids=sorted(int(k) for k in kept.keys()),
@@ -1879,23 +2836,16 @@ def main(cfg: DictConfig) -> None:
         data = json.load(f)
     results = data.get("results", data)
 
-    refined_results, report = refine(results, cfg.refine_task)
-
-    # Optional interactive user edits (filter/fuse/extend/undo) after the
-    # automatic refinement. Writes numbered snapshots under user_refinement/.
-    frame_keys, _ = _frame_index(results)
+    # Prepare data_root and cameras for user_refinement loop inside refine()
     data_root = cfg.refine_task.get("data_root", "") or cfg.dataset.base_dir
+    data_root = to_absolute_path(data_root)
     cameras = list(cfg.refine_task.get("project", {}).get("cameras", []) or []) or list(cfg.dataset.cameras)
-    refined_results, user_report = _run_user_refinement_loop(
-        refined_results=refined_results,
-        frame_keys=frame_keys,
-        cfg=cfg.refine_task,
-        output_dir=output_dir,
-        payload_template=dict(data),
-        data_root=to_absolute_path(data_root),
-        camera_names=cameras,
-    )
-    report["user_refinement"] = user_report
+
+    refined_results, report = refine(results, cfg.refine_task, output_dir, data_root)
+
+    # Note: user_refinement now runs BEFORE bicycle_fit inside refine() to allow
+    # manual curation of outliers before fitting to a kinematic model.
+    frame_keys, _ = _frame_index(refined_results)
 
     # Per-instance ground-plane height fitting (RANSAC).
     # Removes tracker height jitter by fitting Y = a·X + b·Z + c per vehicle
@@ -1938,6 +2888,26 @@ def main(cfg: DictConfig) -> None:
     out_json = os.path.join(output_dir, "track_3d_refined_colmap.json")
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(out, f)
+
+    # Persist the fitted bicycle-model parameters to a sidecar so the simulator
+    # can extrapolate trajectories on demand. Kept separate from the refined-box
+    # JSON (whose contract downstream loaders depend on) and out of the main
+    # report (whose per-frame control arrays would bloat it). ``bicycle_params``
+    # was extracted before the interactive loop and reflects any manual edits.
+    n_bike = report.get("bicycle_fit", {}).get("tracks_fitted", 0)
+    if report.get("bicycle_fit", {}).get("tracks_fitted", 0) > 0:
+        sidecar = {
+            "frame_keys": frame_keys,
+            "wheelbase_alpha": float(
+                (cfg.refine_task.get("bicycle_fit", {}) or {}).get("wheelbase_alpha", 0.6)
+            ),
+            "tracks": report.get("bicycle_fit", {}).get("tracks", {}),
+        }
+        with open(
+            os.path.join(output_dir, "bicycle_params.json"), "w", encoding="utf-8"
+        ) as f:
+            json.dump(sidecar, f)
+
     with open(os.path.join(output_dir, "refine_report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
@@ -1949,6 +2919,7 @@ def main(cfg: DictConfig) -> None:
         f", extended {report['frames_extended']} end frames"
         f", smoothed {report['frames_smoothed']} frames"
         f", rotation-smoothed {report['rotations_smoothed']} frames"
+        f", bicycle-fitted {n_bike} vehicle tracks"
     )
     with open(os.path.join(output_dir, ".success"), "w", encoding="utf-8") as f:
         f.write("Refinement finished successfully.")

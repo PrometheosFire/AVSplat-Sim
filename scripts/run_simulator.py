@@ -287,6 +287,21 @@ class SimulatorRuntime:
             ),
         )
 
+        # On-demand rigid extrapolation past the baked span via the fitted
+        # kinematic bicycle model (Step 1.5). Only active when the checkpoint
+        # actually carries fitted params (``rigid_bicycle``). ``rigid_extrap_frames``
+        # extends the rigid timeline by that many synthesized frames before it
+        # loops; 0 disables extrapolation while keeping baked playback.
+        self.rigid_extrapolate = bool(sim_cfg.get("extrapolate_rigid", True)) and (
+            self.rigid_state is not None
+            and self.rigid_state.get("bicycle") is not None
+        )
+        self.rigid_extrap_frames = max(0, int(sim_cfg.get("rigid_extrap_frames", 0)))
+        # Effective rigid loop length: baked frames + extrapolation horizon.
+        self.rigid_loop_frames = self.num_rigid_frames + (
+            self.rigid_extrap_frames if self.rigid_extrapolate else 0
+        )
+
         self.renderer = StandaloneRenderer(
             splats=self.splats,
             sh_degree=render_cfg.get("render", {}).get("sh_degree", 3),
@@ -408,7 +423,9 @@ class SimulatorRuntime:
 
         if self.num_rigid_frames > 0 and not self.rigid_paused:
             if self.mode != "replay" or self.advance_rigid_in_replay:
-                self.rigid_frame_idx = (self.rigid_frame_idx + 1) % self.num_rigid_frames
+                self.rigid_frame_idx = (self.rigid_frame_idx + 1) % max(
+                    self.rigid_loop_frames, 1
+                )
 
     def _reset_ego(self) -> None:
         self.ego_frame_idx = 0
@@ -442,10 +459,12 @@ class SimulatorRuntime:
         )
 
     def _update_status(self) -> None:
+        extrapolating = self.rigid_frame_idx >= self.num_rigid_frames
         self.status_handle.content = (
             f"**mode**: {self.mode}  \n"
             f"**ego_frame**: {self.ego_frame_idx}/{self.num_ego_frames - 1}  \n"
-            f"**rigid_frame**: {self.rigid_frame_idx}/{max(self.num_rigid_frames - 1, 0)}  \n"
+            f"**rigid_frame**: {self.rigid_frame_idx}/{max(self.rigid_loop_frames - 1, 0)}"
+            f"{' (extrapolated)' if extrapolating else ''}  \n"
             f"**rigid_paused**: {self.rigid_paused}  \n"
             f"**speed_mps**: {self.bicycle.speed_mps:.2f}  \n"
             f"**offset_xz_m**: ({self.bicycle.x_m:.2f}, {self.bicycle.z_m:.2f})"

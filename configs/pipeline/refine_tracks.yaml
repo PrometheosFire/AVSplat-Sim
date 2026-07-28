@@ -138,13 +138,98 @@ pose_smooth_rotation_min_speed: 0.05
 # Each accepted modification writes a numbered snapshot under
 # <refine_dir>/user_refinement/NNN/track_3d_refined_colmap.json.
 user_refinement:
-  enabled: false
-  output_dir: "user_refinement"
+  enabled: true
+  output_dir: "user_refinement_hello?"
   default_extend: 5
   extend_velocity_window: 3
+  post_bicycle_fit: true
+  # If true, when re-running with the SAME configs (same step-15 hash), the
+  # interactive loop continues from the newest existing user_refinement snapshot
+  # instead of restarting from the automatic-refinement base — so manual edits
+  # from a previous session are preserved. Set false to always start fresh.
+  resume_from_latest: true
   # If true and enabled=false, downstream stages may still consume the newest
   # user_refinement snapshot found in step-15 outputs for this scene.
   prefer_latest_when_disabled: true
+
+# --- Kinematic bicycle-model fitting (vehicle classes) ---
+# Replaces gap-fill + translation/rotation smoothing for vehicle-class tracks
+# with a per-track kinematic bicycle-model fit (multiple-shooting batch MAP
+# smoothing). The fitted trajectory is dense (gaps filled by the model rollout),
+# denoised, and kinematically consistent (no sideways slides / impossible
+# turns). Height (up axis) is kept from the tracker predictions; heading is
+# written as a world-up yaw delta on the measured box rotation, with a fallback
+# to the measured heading when the fitted speed is below min_heading_speed.
+# The fitted per-track parameters are written to bicycle_params.json so the
+# simulator can extrapolate trajectories on demand.
+bicycle_fit:
+  enabled: true
+  # Classes fitted with the bicycle model; everything else keeps the legacy
+  # fill/extend/smooth path. Vehicle tracks shorter than min_track_frames also
+  # fall back to the legacy path.
+  classes: [car, truck, bus, trailer, construction_vehicle]
+  min_track_frames: 3
+  # Model-assisted fusion: when true, the velocity gap-handoff fusion signal
+  # also tries a bicycle (constant-turn) extrapolation of the ending track, so a
+  # vehicle that briefly disappears mid-corner is still matched to its
+  # reappearance. Uses wheelbase_alpha / lr_ratio / dt below.
+  model_assisted_gap: true
+  # Wheelbase estimate L = wheelbase_alpha * max(size_x, size_y). There is no
+  # direct wheelbase measurement; max() avoids width/length axis-order ambiguity.
+  wheelbase_alpha: 0.45
+  lr_ratio: 0.5          # CoG-to-rear-axle fraction lr / L (0.5 = box center)
+  dt: 0.1                # seconds per frame
+  segment_len: 50        # frames per multiple-shooting segment
+  # Measurement residual normalizers (meters / radians): the robust-loss
+  # transition scale for position and heading residuals.
+  pos_scale: 0.5
+  yaw_scale: 0.15
+  huber_delta: 1.345     # position influence transition (normalized units)
+  cauchy_c: 2.3849       # heading influence transition (heavier tails)
+  irls_iters: 3          # robust re-weighting (IRLS) outer iterations
+  # Control-smoothness priors — the dominant regularizer. Larger = smoother
+  # trajectory / stronger noise rejection (too large rounds off sharp turns).
+  lambda_accel: 4.0
+  lambda_steer: 6.0
+  lambda_accel_mag: 0.02
+  lambda_steer_mag: 0.05
+  defect_weight: 100.0   # segment-continuity constraint weight
+  # Below this fitted speed (m/s) the heading is untrustworthy and the measured
+  # box yaw is kept instead of the fitted heading.
+  min_heading_speed: 0.3
+  max_steer: 0.7         # |steering| bound (~40 deg) for numerical stability
+  # --- Pre-cleaning of size-scaled detection artefacts (before fitting) ---
+  # Large/elongated vehicles suffer two failures the kinematic model cannot
+  # represent: 180-degree box heading flips (front/back ambiguity) and single-
+  # frame lateral position spikes. Cleaning them before the fit is what lets big
+  # vehicles (buses/trucks) pass the consistency gate instead of being rejected.
+  preclean_yaw_flip: true       # point each heading along the motion direction
+  preclean_min_move: 0.3        # min per-frame motion (m) to trust local heading
+  preclean_outlier_dist: 2.0    # drop obs deviating > this (m) from neighbour interp; 0 disables
+  # Trimmed refit (least-trimmed squares): if the single-shoot rollout still
+  # fails the consistency gate after pre-cleaning, iteratively drop the worst-
+  # residual observations and refit before falling back to legacy smoothing.
+  # Minimizes rejected tracks without loosening the gate.
+  trim_refit: false
+  trim_refit_iters: 3
+  trim_refit_resid: 0.0         # per-frame drop threshold (m); 0 = use max_fit_pos_rmse
+  # Per-solve function-eval cap for the trimmed refits. Bounds each fallback
+  # solve so an under-constrained (trimmed) large track cannot grind for minutes
+  # in the trust-region solver; a partial solve is acceptable for a fallback.
+  trim_refit_max_nfev: 400
+  # Consistency gate: the fitted trajectory that gets baked is a SINGLE
+  # kinematic rollout from (state0, accel, steer) — identical to what the
+  # simulator reproduces from the persisted params, and free of the
+  # multiple-shooting segment-boundary jumps. If that rollout cannot follow the
+  # observations within max_fit_pos_rmse meters (unconverged / noise-blown-up
+  # fit, common on long or large-vehicle tracks) even after pre-clean +
+  # trimmed refit, the bicycle fit is rejected and the track falls back to the
+  # legacy fill/smooth path.
+  max_fit_pos_rmse: 100.0
+  # Parallelism for the per-track fits (independent solves). 0 = auto
+  # (cpu_count-1, capped to the number of tracks); 1 = serial; N = N worker
+  # processes. Output is identical regardless of worker count.
+  fit_workers: 0
 
 # --- Per-instance height plane fitting ---
 # Run AFTER user refinement. For each vehicle track, fits Y = a·X + b·Z + c

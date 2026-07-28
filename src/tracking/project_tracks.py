@@ -237,20 +237,46 @@ def project_tracks(
     max_frames: int | None = None,
     max_view_angle: float = 80.0,
 ) -> dict:
-    """Render boxes onto frames per camera. Returns a small summary report."""
+    """Render boxes onto frames per camera. Returns a small summary report.
+    
+    Also creates a frame_mapping.json file mapping sequence indices (0, 1, 2, ...)
+    to actual frame timestamps for use in the refinement interactive loop.
+    """
     cameras, images = _load_colmap_scene(_resolve_sparse_dir(data_root))
     cam_calib, poses = _build_camera_tables(cameras, images, camera_names)
 
-    tokens = sorted(results.keys(), key=lambda k: int(k.split("_")[-1]))
+    tokens_all = sorted(results.keys(), key=lambda k: int(k.split("_")[-1]))
+    
+    # Create comprehensive frame_mapping BEFORE sampling (includes ALL sequence indices)
+    frame_mapping = {
+        str(frame_idx): int(token.split("_")[-1])
+        for frame_idx, token in enumerate(tokens_all)
+    }
+    
+    #print(f"🔍 DEBUG project_tracks: tokens_all has {len(tokens_all)} frames")
+    #print(f"🔍 DEBUG project_tracks: frame_mapping first 5 entries: {dict(list(frame_mapping.items())[:5])}")
+    #print(f"🔍 DEBUG project_tracks: frame_mapping last 5 entries: {dict(list(frame_mapping.items())[-5:])}")
+    #print(f"🔍 DEBUG project_tracks: frame_mapping keys range: 0-{max(int(k) for k in frame_mapping.keys())}")
+    
+    # Sample frames for rendering if needed
     if max_frames:
-        step = max(1, len(tokens) // max_frames)
-        tokens = tokens[::step]
+        step = max(1, len(tokens_all) // max_frames)
+        tokens = tokens_all[::step]
+    else:
+        tokens = tokens_all
 
     drawn_total = 0
     frames_written = 0
     cams = camera_names or sorted({n for (n, _) in poses})
+    
+    # Create set of sampled tokens for quick lookup
+    sampled_tokens_set = set(tokens)
 
-    for token in tokens:
+    for seq_idx, token in enumerate(tokens_all):
+        # Only render sampled frames
+        if token not in sampled_tokens_set:
+            continue
+        
         ts = int(token.split("_")[-1])
         boxes = results[token]
         for camera in cams:
@@ -278,16 +304,35 @@ def project_tracks(
                 box.pop("_pose", None)
                 box.pop("_label_seed", None)
 
+            # Add frame number label at bottom-left (showing sequence index 0-N)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.8
+            thickness = 2
+            text = f"Frame: {seq_idx}"
+            text_size, _ = cv2.getTextSize(text, font, font_scale, thickness)
+            pad = 10
+            x = pad
+            y = h - pad
+            cv2.putText(img, text, (x, y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
             cam_out = os.path.join(output_dir, camera)
             os.makedirs(cam_out, exist_ok=True)
             cv2.imwrite(os.path.join(cam_out, f"{ts}.jpg"), img)
             frames_written += 1
+
+    # Write frame mapping (sequence index -> timestamp) for refinement loop
+    if frames_written > 0:
+        mapping_file = os.path.join(output_dir, "frame_mapping.json")
+        os.makedirs(os.path.dirname(mapping_file), exist_ok=True)
+        with open(mapping_file, "w", encoding="utf-8") as f:
+            json.dump(frame_mapping, f, indent=2)
 
     return {
         "frames_written": frames_written,
         "boxes_drawn": drawn_total,
         "cameras": cams,
         "tokens_rendered": len(tokens),
+        "frame_mapping": frame_mapping,
     }
 
 

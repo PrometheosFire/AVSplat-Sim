@@ -243,7 +243,42 @@ def load_rigid_state_from_checkpoint(
     rigid = ckpt.get("rigid_nodes")
     if rigid is None:
         return None
-    return {k: v.to(device) for k, v in rigid.items()}
+    state = {k: v.to(device) for k, v in rigid.items()}
+    # Attach the kinematic-bicycle extrapolation params (Step 1.5 fit), if the
+    # checkpoint carries them. Stored as plain numpy data under a non-tensor key
+    # (``bicycle``) so it survives the tensor-only ``.to(device)`` mapping above;
+    # used by ``rigid_bicycle_pose`` to extrapolate poses past the baked span.
+    extrap = ckpt.get("rigid_bicycle")
+    if extrap is not None:
+        state["bicycle"] = extrap
+    return state
+
+
+def rigid_bicycle_pose(
+    rigid_state: Dict[str, torch.Tensor], instance_col: int, frame_idx: int
+) -> Optional[tuple]:
+    """Extrapolated ``(trans (3,), quat_wxyz (4,))`` (numpy) in the training frame.
+
+    Rolls the fitted kinematic bicycle model to ``frame_idx`` (any index,
+    including past the observed span) for instance column ``instance_col``.
+    Returns ``None`` when the checkpoint has no fitted model for this instance.
+    Mirrors ``RigidNodes.get_bicycle_pose`` on the flattened checkpoint state.
+    """
+    extrap = rigid_state.get("bicycle") if rigid_state is not None else None
+    if extrap is None:
+        return None
+    entry = extrap["instances"].get(int(instance_col))
+    if entry is None:
+        return None
+    from dynamic.rigid_tracks import bicycle_pose_at_frame
+
+    return bicycle_pose_at_frame(
+        entry,
+        extrap["transform_scale"],
+        extrap["transform_rotation"],
+        extrap["transform_translation"],
+        int(frame_idx),
+    )
 
 
 @torch.no_grad()
@@ -258,17 +293,36 @@ def rigid_world_gaussians(
     Returns activated ``means/quats/scales/opacities/colors`` ready to concat with
     the background, or ``None`` if no instance is present this frame.
     """
-    from dynamic.rigid_nodes import quat_multiply, quat_normalize, quat_to_rotmat
-
     fv = rigid_state["instances_fv"]  # (T, M) bool
     num_frames = fv.shape[0]
     if not (0 <= frame_idx < num_frames):
         raise ValueError(
             f"timestep {frame_idx} out of range for rigid poses [0, {num_frames})."
         )
+    return _rigid_world_gaussians_from_pose(
+        rigid_state,
+        rigid_state["poses.trans"][frame_idx],
+        rigid_state["poses.quats"][frame_idx],
+        fv[frame_idx],
+    )
+
+
+def _rigid_world_gaussians_from_pose(
+    rigid_state: Dict[str, torch.Tensor],
+    pose_trans: torch.Tensor,  # (M, 3)
+    pose_quats: torch.Tensor,  # (M, 4) wxyz
+    fv_frame: torch.Tensor,  # (M,) bool
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Core: pose the local Gaussians of instances marked valid in ``fv_frame``.
+
+    Shared by the baked-frame path (:func:`rigid_world_gaussians`) and the
+    bicycle-extrapolated path (:func:`rigid_world_gaussians_extrapolated`); the
+    only difference between the two is where the per-instance poses come from.
+    """
+    from dynamic.rigid_nodes import quat_multiply, quat_normalize, quat_to_rotmat
 
     point_ids = rigid_state["point_ids"]  # (N,)
-    active = fv[frame_idx][point_ids]  # (N,)
+    active = fv_frame[point_ids]  # (N,)
     if not bool(active.any()):
         return None
 
@@ -282,8 +336,8 @@ def rigid_world_gaussians(
         [rigid_state["gauss.sh0"][idx], rigid_state["gauss.shN"][idx]], dim=1
     )
 
-    pose_t = rigid_state["poses.trans"][frame_idx][inst_a]  # (P, 3)
-    pose_q = quat_normalize(rigid_state["poses.quats"][frame_idx][inst_a])  # (P, 4)
+    pose_t = pose_trans[inst_a]  # (P, 3)
+    pose_q = quat_normalize(pose_quats[inst_a])  # (P, 4)
     R = quat_to_rotmat(pose_q)  # (P, 3, 3)
     means_world = torch.bmm(R, local_means.unsqueeze(-1)).squeeze(-1) + pose_t
     quats_world = quat_multiply(pose_q, local_quats)
@@ -294,6 +348,54 @@ def rigid_world_gaussians(
         "opacities": opacities,
         "colors": colors,
     }
+
+
+def rigid_world_gaussians_extrapolated(
+    rigid_state: Dict[str, torch.Tensor], frame_idx: int
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Rigid world Gaussians for any frame index, extrapolating past the baked span.
+
+    For an in-range ``frame_idx`` this is exactly :func:`rigid_world_gaussians`
+    (baked optimized poses). For an out-of-range index it rolls the fitted
+    kinematic bicycle model (from the checkpoint's ``rigid_bicycle`` params) to
+    synthesize each instance's pose. Only instances that (a) have a fitted model
+    and (b) were valid at the nearest boundary frame are carried; instances
+    without a model (e.g. pedestrians) simply vanish past the observed span.
+    Returns ``None`` when nothing is active or no bicycle params are present.
+    """
+    fv = rigid_state["instances_fv"]  # (T, M) bool
+    num_frames = fv.shape[0]
+    if 0 <= frame_idx < num_frames:
+        return rigid_world_gaussians(rigid_state, frame_idx)
+
+    if rigid_state.get("bicycle") is None:
+        return None
+
+    device = rigid_state["poses.trans"].device
+    num_inst = fv.shape[1]
+    # Carry forward from the last baked frame (forward extrapolation) or backward
+    # from the first (backward extrapolation): its validity gates which instances
+    # persist, and its poses seed the columns we do not extrapolate.
+    boundary = num_frames - 1 if frame_idx >= num_frames else 0
+    fv_boundary = fv[boundary]  # (M,)
+    pose_trans = rigid_state["poses.trans"][boundary].clone()  # (M, 3)
+    pose_quats = rigid_state["poses.quats"][boundary].clone()  # (M, 4)
+    fv_frame = torch.zeros(num_inst, dtype=torch.bool, device=device)
+
+    for m in range(num_inst):
+        if not bool(fv_boundary[m]):
+            continue
+        pose = rigid_bicycle_pose(rigid_state, m, frame_idx)
+        if pose is None:
+            continue
+        t_np, q_np = pose
+        pose_trans[m] = torch.as_tensor(t_np, dtype=pose_trans.dtype, device=device)
+        pose_quats[m] = torch.as_tensor(q_np, dtype=pose_quats.dtype, device=device)
+        fv_frame[m] = True
+
+    return _rigid_world_gaussians_from_pose(
+        rigid_state, pose_trans, pose_quats, fv_frame
+    )
 
 
 @torch.no_grad()
@@ -501,9 +603,13 @@ class StandaloneRenderer:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], dim=1)
 
         # Composite dynamic rigid objects (vehicles) at the requested timestep.
-        # In rigid_white mode, this is the only foreground content.
+        # In rigid_white mode, this is the only foreground content. Frame indices
+        # past the baked span are handled by rolling the fitted kinematic bicycle
+        # model (on-demand extrapolation), falling back to baked poses in range.
         if self.rigid_state is not None and rigid_frame_idx is not None:
-            rigid = rigid_world_gaussians(self.rigid_state, int(rigid_frame_idx))
+            rigid = rigid_world_gaussians_extrapolated(
+                self.rigid_state, int(rigid_frame_idx)
+            )
             if rigid is not None:
                 means = torch.cat([means, rigid["means"]], dim=0)
                 quats = torch.cat([quats, rigid["quats"]], dim=0)
@@ -512,8 +618,14 @@ class StandaloneRenderer:
                 colors = torch.cat([colors, rigid["colors"]], dim=0)
 
         # Debug overlay: draw per-instance 3D boxes as semi-transparent Gaussians
-        # (same rasterization pass -> aligns exactly with the render).
-        if draw_boxes and self.rigid_state is not None and rigid_frame_idx is not None:
+        # (same rasterization pass -> aligns exactly with the render). Only drawn
+        # for baked (in-range) frames; extrapolated frames have no box overlay.
+        if (
+            draw_boxes
+            and self.rigid_state is not None
+            and rigid_frame_idx is not None
+            and 0 <= int(rigid_frame_idx) < self.rigid_state["instances_fv"].shape[0]
+        ):
             boxes = rigid_box_edge_gaussians(self.rigid_state, int(rigid_frame_idx))
             if boxes is not None:
                 means = torch.cat([means, boxes["means"]], dim=0)
@@ -629,10 +741,15 @@ class StandaloneRenderer:
         desc = f"Rendering {shift_name}/{safe_cam_name}"
         for i in tqdm.trange(len(camtoworlds), desc=desc):
             # Per-frame rigid index: animate (i) unless a freeze frame is given.
+            # Indices past the baked span extrapolate via the fitted bicycle model
+            # when the checkpoint carries params; otherwise vehicles drop out.
             rigid_frame_idx = None
             if self.rigid_state is not None:
                 rf = freeze_timestep if freeze_timestep is not None else i
-                rigid_frame_idx = rf if 0 <= rf < num_rigid_frames else None
+                if 0 <= rf < num_rigid_frames:
+                    rigid_frame_idx = rf
+                elif rf >= num_rigid_frames and self.rigid_state.get("bicycle") is not None:
+                    rigid_frame_idx = rf
 
             frame = self.render_frame(
                 camtoworld=camtoworlds[i],

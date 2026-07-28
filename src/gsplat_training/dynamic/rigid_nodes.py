@@ -23,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .rigid_tracks import RigidTracks
+from .rigid_tracks import RigidTracks, bicycle_pose_at_frame
 
 # Local Gaussian parameter keys (order-independent); used for checkpoint resizing.
 RIGID_GAUSS_PARAM_KEYS = ("means", "scales", "quats", "opacities", "sh0", "shN")
@@ -89,6 +89,28 @@ def _instance_palette(num_instances: int, device) -> Tensor:
         for i in range(max(1, num_instances))
     ]
     return torch.tensor(colors, dtype=torch.float32, device=device)
+
+
+def _build_bicycle_extrap(tracks: RigidTracks) -> Optional[dict]:
+    """Package the fitted bicycle params + similarity transform for extrapolation.
+
+    Returns a plain, checkpoint-serializable dict (numpy arrays / floats) or
+    ``None`` when the tracks carry no bicycle params. Instances are keyed by
+    integer column index ``m``, matching ``poses`` / ``instances_fv`` columns.
+    """
+    params = getattr(tracks, "bicycle_params", None)
+    if not params:
+        return None
+    return {
+        "transform_scale": float(tracks.transform_scale),
+        "transform_rotation": np.asarray(
+            tracks.transform_rotation, dtype=np.float64
+        ).reshape(3, 3),
+        "transform_translation": np.asarray(
+            tracks.transform_translation, dtype=np.float64
+        ).reshape(3),
+        "instances": {int(m): entry for m, entry in params.items()},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +181,13 @@ class RigidNodes(nn.Module):
         # according to rigid_pose_smoothing strategy.
         self.unicycle = None
         self.bicycle = None
+
+        # Optional kinematic-bicycle extrapolation params (COLMAP frame), fitted
+        # at refinement time (Step 1.5) and loaded from the ``bicycle_params.json``
+        # sidecar. Plain, non-learnable data used ONLY to extrapolate poses past
+        # the observed span for the simulator/renderer (see get_bicycle_pose).
+        # ``None`` when no sidecar accompanied the tracks.
+        self.bicycle_extrap: Optional[dict] = _build_bicycle_extrap(tracks)
         
         # Store reference sizes for validation (sizes must never change per-frame).
         # Register as buffer so it moves to device with .to(device).
@@ -271,6 +300,56 @@ class RigidNodes(nn.Module):
             "colors": colors,
             "gaussian_idx": idx,
         }
+
+    # ------------------------------------------------------------------
+    # Kinematic-bicycle extrapolation (simulator / renderer)
+    # ------------------------------------------------------------------
+    def has_bicycle_extrap(self, instance_col: Optional[int] = None) -> bool:
+        """Whether fitted bicycle params are available (optionally for one column)."""
+        if self.bicycle_extrap is None:
+            return False
+        if instance_col is None:
+            return True
+        return int(instance_col) in self.bicycle_extrap["instances"]
+
+    def get_bicycle_pose(
+        self, instance_col: int, frame_idx: int
+    ) -> Optional[tuple]:
+        """Extrapolated ``(trans (3,), quat_wxyz (4,))`` in the training frame.
+
+        Rolls the fitted kinematic bicycle model to ``frame_idx`` (any index,
+        including past the observed span) for instance column ``instance_col``.
+        Returns numpy arrays, or ``None`` when this instance has no fitted model.
+        Non-differentiable — intended for on-demand simulation/rendering, not
+        training.
+        """
+        if self.bicycle_extrap is None:
+            return None
+        entry = self.bicycle_extrap["instances"].get(int(instance_col))
+        if entry is None:
+            return None
+        extrap = self.bicycle_extrap
+        return bicycle_pose_at_frame(
+            entry,
+            extrap["transform_scale"],
+            extrap["transform_rotation"],
+            extrap["transform_translation"],
+            int(frame_idx),
+        )
+
+    def bicycle_extrap_state(self) -> Optional[dict]:
+        """Serializable bicycle-extrapolation params for the checkpoint, or ``None``.
+
+        Kept OUT of ``state_dict`` because the per-instance control sequences are
+        variable-length (one entry per instance, not a fixed tensor). Saved under a
+        separate top-level checkpoint key by the runner; old checkpoints simply
+        lack it and extrapolation is disabled.
+        """
+        return self.bicycle_extrap
+
+    def load_bicycle_extrap_state(self, state: Optional[dict]) -> None:
+        """Restore bicycle-extrapolation params previously saved by the runner."""
+        self.bicycle_extrap = state
 
     @torch.no_grad()
     def get_box_edge_gaussians(

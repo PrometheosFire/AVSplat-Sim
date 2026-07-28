@@ -212,11 +212,20 @@ def main(cfg: DictConfig):
     if not refine_task_cfg.get("enabled", True):
         print("⏭️ Refinement disabled via refine_task.enabled=false")
     else:
+        # user_refinement settings must NOT fork the refine cache dir: the
+        # automatic refinement output (fuse/filter/fit) is identical regardless
+        # of them. Keeping the dir stable across the user_refinement toggle is
+        # what lets a later 'enabled=false + resume_from_latest' run reuse the
+        # manual-edit snapshots created by an earlier 'enabled=true' run
+        # (instead of forking a fresh dir and re-running the model fit).
+        refine_hash_cfg = {
+            k: v for k, v in refine_task_cfg.items() if k != "user_refinement"
+        }
         step15_params = {
             "dataset": dataset_cfg,
             "tracker": tracker_cfg,
             "track_task": track_task_cfg,
-            "refine_task": refine_task_cfg,
+            "refine_task": refine_hash_cfg,
         }
         step15_hash = generate_config_hash(step15_params)
         refine_dir = os.path.join(base_results_dir, f"15_refine_{step15_hash}")
@@ -233,6 +242,7 @@ def main(cfg: DictConfig):
         prefer_latest_when_disabled = bool(
             user_refine_cfg.get("prefer_latest_when_disabled", False)
         )
+        resume_from_latest = bool(user_refine_cfg.get("resume_from_latest", False))
         base_cache_hit = os.path.exists(refine_success)
         cache_hit = base_cache_hit and not user_refine_enabled
 
@@ -270,6 +280,10 @@ def main(cfg: DictConfig):
 
         selected_refined_json = ""
         if user_refine_enabled:
+            selected_refined_json = _latest_user_refined_json(refine_dir)
+        elif resume_from_latest:
+            # Reuse only from THIS refine dir (stable across the user_refinement
+            # toggle thanks to the hash exclusion above).
             selected_refined_json = _latest_user_refined_json(refine_dir)
         elif prefer_latest_when_disabled:
             selected_refined_json = (
@@ -312,6 +326,14 @@ def main(cfg: DictConfig):
                 print(f"🧑‍🔧 Using latest user refinement snapshot: {refined_tracks_json}")
             else:
                 print("ℹ️ User refinement enabled but no snapshots found; using base refined JSON.")
+        elif resume_from_latest:
+            latest_user_json = _latest_user_refined_json(refine_dir)
+            if latest_user_json:
+                refined_tracks_json = latest_user_json
+                print(
+                    "🧑‍🔧 Reusing latest user-refinement snapshot from this "
+                    f"refine dir (resume_from_latest): {refined_tracks_json}"
+                )
         elif prefer_latest_when_disabled:
             latest_user_json = (
                 _latest_user_refined_json(refine_dir)

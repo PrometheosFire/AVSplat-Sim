@@ -539,7 +539,6 @@ class Runner:
             return
 
         from dynamic import (
-            BicycleSmoother,
             RigidDensifier,
             RigidNodes,
             UnicycleSmoother,
@@ -623,33 +622,19 @@ class Runner:
                 f"opt_pos={uc.opt_pos}, prefit={getattr(cfg, 'unicycle_prefit_iters', 100)} iters."
             )
         elif smoothing == "bicycle":
-            bc = BicycleSmoother(
-                self.rigid_tracks,
-                opt_pos=bool(getattr(cfg, "bicycle_opt_pos", True)),
-                wheelbase_mode=str(
-                    getattr(cfg, "bicycle_wheelbase_mode", "fixed_from_bbox_long_edge")
-                ),
-                wheelbase_alpha=float(getattr(cfg, "bicycle_wheelbase_alpha", 0.60)),
-                yaw_anchor_w=float(getattr(cfg, "bicycle_yaw_anchor_w", 5e-3)),
-                device=self.device,
-            )
-            self.rigid_nodes.bicycle = bc
-            self.bicycle_optimizers = self.rigid_nodes.create_bicycle_optimizers(
-                lr_speed=float(getattr(cfg, "bicycle_lr_speed", 1e-3)),
-                lr_steer=float(getattr(cfg, "bicycle_lr_steer", 1e-4)),
-                lr_center=float(getattr(cfg, "bicycle_lr_center", 1e-3)),
-            )
-            bc.prefit(
-                n_iters=int(getattr(cfg, "bicycle_prefit_iters", 100)),
-                reg_w=float(getattr(cfg, "bicycle_prefit_reg_w", 5e-3)),
-                pos_w=float(getattr(cfg, "bicycle_prefit_pos_w", 1e-3)),
-                lr_speed=float(getattr(cfg, "bicycle_lr_speed", 1e-3)),
-                lr_steer=float(getattr(cfg, "bicycle_lr_steer", 1e-4)),
-                lr_center=float(getattr(cfg, "bicycle_lr_center", 1e-3)),
-            )
-            print(
-                f"[Bicycle] Smoother attached: {self.rigid_nodes.num_instances} instances, "
-                f"opt_pos={bc.opt_pos}, prefit={getattr(cfg, 'bicycle_prefit_iters', 100)} iters."
+            # Retired: the training-time bicycle smoother/coupling has been
+            # replaced by the Step 1.5 refinement bicycle-model fit
+            # (src/tracking/bicycle_fit.py), which is now the single source of
+            # kinematically-consistent vehicle poses. Training consumes those
+            # denoised poses directly; re-fitting a bicycle model in the loss is
+            # redundant and can fight the refinement. Use "finite_diff" (light
+            # temporal smoothness) or "unicycle" instead.
+            raise ValueError(
+                "rigid_pose_smoothing='bicycle' has been retired. Vehicle "
+                "trajectories are now fit with the kinematic bicycle model in "
+                "Step 1.5 track refinement (bicycle_fit in "
+                "configs/pipeline/refine_tracks.yaml). Set rigid_pose_smoothing "
+                "to 'finite_diff' (default) or 'unicycle'."
             )
 
         self.rigid_densifier = RigidDensifier(
@@ -1038,6 +1023,11 @@ class Runner:
                     self.rigid_nodes.unicycle.load_state_dict(ckpt["unicycle_smoother"])
                 if self.rigid_nodes.bicycle is not None and "bicycle_smoother" in ckpt:
                     self.rigid_nodes.bicycle.load_state_dict(ckpt["bicycle_smoother"])
+                if "rigid_bicycle" in ckpt:
+                    # Kinematic-bicycle extrapolation params (Step 1.5 fit): plain
+                    # per-instance data used for on-demand simulator/renderer
+                    # extrapolation. Additive; older checkpoints simply omit it.
+                    self.rigid_nodes.load_bicycle_extrap_state(ckpt["rigid_bicycle"])
                 all_optimizers = self.rigid_nodes.create_optimizers(
                     batch_size=cfg.batch_size,
                     means_lr=cfg.means_lr,
@@ -1396,6 +1386,13 @@ class Runner:
                         data["unicycle_smoother"] = self.rigid_nodes.unicycle.state_dict()
                     if self.rigid_nodes.bicycle is not None:
                         data["bicycle_smoother"] = self.rigid_nodes.bicycle.state_dict()
+                    # Kinematic-bicycle extrapolation params (Step 1.5 fit): stored
+                    # separately from state_dict() because the per-instance control
+                    # sequences are variable-length. Enables on-demand pose
+                    # extrapolation past the observed span in the simulator/renderer.
+                    bicycle_extrap = self.rigid_nodes.bicycle_extrap_state()
+                    if bicycle_extrap is not None:
+                        data["rigid_bicycle"] = bicycle_extrap
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
