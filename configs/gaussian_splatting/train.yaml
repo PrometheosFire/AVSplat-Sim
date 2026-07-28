@@ -110,7 +110,7 @@ rigid_cull_out_of_bound: true
 #                now the single source of kinematically-consistent vehicle poses.
 #                Selecting it raises an error. Training consumes the refined
 #                poses directly (rigid_smooth_w: 0.0 = no extra smoothing).
-rigid_pose_smoothing: finite_diff
+rigid_pose_smoothing: finite_diff #TODO REMOVE
 
 # Unicycle smoother (only active when rigid_pose_smoothing: unicycle).
 unicycle_opt_pos: false          # also optimize planar centers X/Z
