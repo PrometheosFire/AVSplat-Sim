@@ -20,6 +20,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import shutil
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace as _dc_replace
@@ -1639,7 +1640,13 @@ def _write_user_iteration(
     bicycle_params: dict | None = None,
     bicycle_alpha: float = 0.6,
 ) -> str:
-    """Write one numbered user-refinement snapshot and return its directory."""
+    """Write one numbered user-refinement snapshot and return its directory.
+
+    Writes only the numbered snapshot under ``root_dir/NNN/``. The refine-root
+    copy that downstream stages read is written once, at the end of refinement
+    (see ``main``) — i.e. after the final ``done`` and after the bicycle fit —
+    not on every ``apply``.
+    """
     it_dir = os.path.join(root_dir, f"{iteration_idx:03d}")
     os.makedirs(it_dir, exist_ok=True)
 
@@ -1658,10 +1665,8 @@ def _write_user_iteration(
         json.dump(report, f, indent=2)
 
     # Persist the fitted bicycle-model params for this iteration (reflecting any
-    # manual edits) so an interrupted interactive session and the simulator can
-    # read the newest parameters without waiting for the loop to finish with
-    # 'done'. Written both into the iteration snapshot and refreshed at the
-    # top-level refine dir (which is what resume and load_rigid_tracks read).
+    # manual edits) into the numbered snapshot so resume can restore them. The
+    # refine-root sidecar is written once at the end of refinement (main).
     if bicycle_params is not None:
         sidecar = {
             "frame_keys": frame_keys,
@@ -1669,9 +1674,6 @@ def _write_user_iteration(
             "tracks": bicycle_params,
         }
         with open(os.path.join(it_dir, "bicycle_params.json"), "w", encoding="utf-8") as f:
-            json.dump(sidecar, f)
-        top_dir = os.path.dirname(root_dir)
-        with open(os.path.join(top_dir, "bicycle_params.json"), "w", encoding="utf-8") as f:
             json.dump(sidecar, f)
 
     with open(os.path.join(it_dir, ".success"), "w", encoding="utf-8") as f:
@@ -2510,6 +2512,7 @@ def _run_user_refinement_loop(
         "history_depth": len(history),
         "output_root": root_dir,
         "command_log": command_log_path,
+        "latest_iteration_dir": os.path.join(root_dir, f"{iter_idx:03d}"),
     }
 
     with open(command_log_path, "a", encoding="utf-8") as f:
@@ -2626,6 +2629,10 @@ def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") 
 
     bicycle_cfg = cfg.get("bicycle_fit", {}) or {}
 
+    # Path of the final interactive user_refinement iteration; its already-
+    # rendered projection is symlinked as the refine-root projection by main().
+    final_user_iteration_dir: str | None = None
+
     mapping = fuse_tracks(
         tracks,
         iou_thr=float(cfg.get("iou_thr", 0.3)),
@@ -2681,6 +2688,7 @@ def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") 
         )
         refined_kept = build_tracks(refined_kept_results)
         kept = refined_kept
+        final_user_iteration_dir = user_report_pre.get("latest_iteration_dir")
 
     # Vehicle tracks are refined by a per-track kinematic bicycle-model fit
     # (gap-fill + denoise + kinematic consistency in one), which supersedes the
@@ -2705,7 +2713,7 @@ def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") 
         cameras = list(cfg.get("project", {}).get("cameras", []) or [])
         bicycle_cfg_user = cfg.get("bicycle_fit", {}) or {}
         user_refinement_post_dir = os.path.join(output_dir, "user_refinement_post_bicycle")
-        refined_kept_results, user_report_post, _ = _run_user_refinement_loop(
+        refined_kept_results, user_report_post, final_params = _run_user_refinement_loop(
             refined_results=tracks_to_results(kept, frame_keys),
             frame_keys=frame_keys,
             cfg=cfg,
@@ -2719,6 +2727,12 @@ def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") 
         )
         refined_kept = build_tracks(refined_kept_results)
         kept = refined_kept
+        final_user_iteration_dir = user_report_post.get("latest_iteration_dir")
+        # The post-fit interactive loop may re-fit / drop / add per-track models;
+        # its returned params are the authoritative final set that main() persists
+        # to the refine-root bicycle_params.json sidecar.
+        if bicycle_enabled:
+            bicycle_report["params"] = final_params
 
     # Legacy heuristic path, applied only to tracks NOT handled by the fit.
     legacy_kept = {tid: t for tid, t in kept.items() if tid not in fit_ids}
@@ -2787,6 +2801,7 @@ def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") 
         "frames_smoothed": n_smoothed,
         "rotations_smoothed": n_rot_smoothed,
         "bicycle_fit": bicycle_report,
+        "user_refinement_latest_dir": final_user_iteration_dir,
         "track_summary": _build_track_change_summary(
             fusion_report=fusion_report,
             kept_ids=sorted(int(k) for k in kept.keys()),
@@ -2872,16 +2887,38 @@ def main(cfg: DictConfig) -> None:
         )
     report["height_plane_fit"] = height_fit_report
 
-    # Always render projections for the final refined output so refinement
-    # quality can be inspected visually, even outside the orchestrator.
-    proj_report = _project_results_snapshot(
-        results=refined_results,
-        data_root=to_absolute_path(data_root),
-        output_dir=os.path.join(output_dir, "projected"),
-        camera_names=cameras,
-        project_cfg=cfg.refine_task.get("project", {}) or {},
-    )
-    report["projection"] = proj_report
+    # Projection for the final refined output (visual inspection only). When an
+    # interactive user_refinement iteration already rendered this exact
+    # trajectory — and no height-plane-fit changed the poses afterwards —
+    # symlink the refine-root projection to that latest iteration instead of
+    # re-rendering every frame. Otherwise render fresh (user_refinement disabled,
+    # or height-plane-fit reprojected the poses).
+    root_projected = os.path.join(output_dir, "projected")
+    latest_dir = report.get("user_refinement_latest_dir")
+    latest_projected = os.path.join(latest_dir, "projected") if latest_dir else ""
+    if latest_projected and os.path.isdir(latest_projected) and not height_fit_report:
+        if os.path.islink(root_projected) or os.path.isfile(root_projected):
+            os.unlink(root_projected)
+        elif os.path.isdir(root_projected):
+            shutil.rmtree(root_projected)
+        rel_target = os.path.relpath(latest_projected, start=output_dir)
+        os.symlink(rel_target, root_projected, target_is_directory=True)
+        it_proj_report = os.path.join(latest_dir, "project_report.json")
+        if os.path.isfile(it_proj_report):
+            with open(it_proj_report, encoding="utf-8") as f:
+                report["projection"] = json.load(f)
+        else:
+            report["projection"] = {"symlink_to": rel_target}
+        print(f"🔗 Refine-root projection symlinked to {rel_target}")
+    else:
+        proj_report = _project_results_snapshot(
+            results=refined_results,
+            data_root=to_absolute_path(data_root),
+            output_dir=root_projected,
+            camera_names=cameras,
+            project_cfg=cfg.refine_task.get("project", {}) or {},
+        )
+        report["projection"] = proj_report
 
     out = dict(data)
     out["results"] = refined_results
@@ -2892,16 +2929,18 @@ def main(cfg: DictConfig) -> None:
     # Persist the fitted bicycle-model parameters to a sidecar so the simulator
     # can extrapolate trajectories on demand. Kept separate from the refined-box
     # JSON (whose contract downstream loaders depend on) and out of the main
-    # report (whose per-frame control arrays would bloat it). ``bicycle_params``
-    # was extracted before the interactive loop and reflects any manual edits.
+    # report (whose per-frame control arrays would bloat it). ``params`` holds
+    # the per-track kinematic state (state0/accel/steer) and reflects any manual
+    # edits / re-fits made during the interactive loop.
     n_bike = report.get("bicycle_fit", {}).get("tracks_fitted", 0)
-    if report.get("bicycle_fit", {}).get("tracks_fitted", 0) > 0:
+    bike_params = report.get("bicycle_fit", {}).get("params", {}) or {}
+    if bike_params:
         sidecar = {
             "frame_keys": frame_keys,
             "wheelbase_alpha": float(
                 (cfg.refine_task.get("bicycle_fit", {}) or {}).get("wheelbase_alpha", 0.6)
             ),
-            "tracks": report.get("bicycle_fit", {}).get("tracks", {}),
+            "tracks": bike_params,
         }
         with open(
             os.path.join(output_dir, "bicycle_params.json"), "w", encoding="utf-8"

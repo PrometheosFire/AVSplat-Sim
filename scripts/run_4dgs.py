@@ -35,55 +35,6 @@ def _latest_checkpoint(ckpt_dir: str) -> str:
     return os.path.join(ckpt_dir, ckpts[-1]) if ckpts else ""
 
 
-def _latest_user_refined_json(refine_dir: str) -> str:
-    """Return latest numbered user-refinement JSON, or "" if unavailable."""
-    root = os.path.join(refine_dir, "user_refinement")
-    if not os.path.isdir(root):
-        return ""
-
-    iters: list[tuple[int, str]] = []
-    for name in os.listdir(root):
-        path = os.path.join(root, name)
-        if not os.path.isdir(path):
-            continue
-        try:
-            idx = int(name)
-        except ValueError:
-            continue
-        cand = os.path.join(path, "track_3d_refined_colmap.json")
-        ok = os.path.exists(cand) and os.path.exists(os.path.join(path, ".success"))
-        if ok:
-            iters.append((idx, cand))
-
-    if not iters:
-        return ""
-    iters.sort(key=lambda x: x[0])
-    return iters[-1][1]
-
-
-def _latest_user_refined_json_any(base_results_dir: str) -> str:
-    """Return newest user-refined JSON across all step-15 folders for a scene."""
-    if not os.path.isdir(base_results_dir):
-        return ""
-    best_path = ""
-    best_mtime = -1.0
-    for name in os.listdir(base_results_dir):
-        if not name.startswith("15_refine_"):
-            continue
-        refine_dir = os.path.join(base_results_dir, name)
-        cand = _latest_user_refined_json(refine_dir)
-        if not cand:
-            continue
-        try:
-            mt = os.path.getmtime(cand)
-        except OSError:
-            continue
-        if mt > best_mtime:
-            best_mtime = mt
-            best_path = cand
-    return best_path
-
-
 def ensure_ncore_dataset(cfg, dataset_cfg: dict, overrides, explicit: str = "") -> str:
     """Create (or reuse) the ncore dataset for the 4DGS pipeline.
 
@@ -161,7 +112,6 @@ def main(cfg: DictConfig):
     script_path = os.path.abspath("src/tracking/run_tracking.py")
     refine_script = os.path.abspath("src/tracking/refine_tracks.py")
     viz_script = os.path.abspath("src/tracking/visualize_tracks.py")
-    project_script = os.path.abspath("src/tracking/project_tracks.py")
 
     env = os.environ.copy()
     env["PYTHONPATH"] = os.path.abspath(".")
@@ -239,10 +189,6 @@ def main(cfg: DictConfig):
         refined_tracks_json = os.path.join(refine_dir, "track_3d_refined_colmap.json")
         user_refine_cfg = refine_task_cfg.get("user_refinement", {}) or {}
         user_refine_enabled = bool(user_refine_cfg.get("enabled", False))
-        prefer_latest_when_disabled = bool(
-            user_refine_cfg.get("prefer_latest_when_disabled", False)
-        )
-        resume_from_latest = bool(user_refine_cfg.get("resume_from_latest", False))
         base_cache_hit = os.path.exists(refine_success)
         cache_hit = base_cache_hit and not user_refine_enabled
 
@@ -278,26 +224,16 @@ def main(cfg: DictConfig):
 
             print(f"✅ Refinement saved to {refine_dir}")
 
-        selected_refined_json = ""
-        if user_refine_enabled:
-            selected_refined_json = _latest_user_refined_json(refine_dir)
-        elif resume_from_latest:
-            # Reuse only from THIS refine dir (stable across the user_refinement
-            # toggle thanks to the hash exclusion above).
-            selected_refined_json = _latest_user_refined_json(refine_dir)
-        elif prefer_latest_when_disabled:
-            selected_refined_json = (
-                _latest_user_refined_json(refine_dir)
-                or _latest_user_refined_json_any(base_results_dir)
-            )
-        selected_refined_json = selected_refined_json or refined_tracks_json
-
+        # The refinement step always writes the final tracks (fused + filtered +
+        # bicycle-fit + any interactive user edits) and its bicycle_params.json
+        # sidecar to the refine-dir root, so downstream always reads the root
+        # regardless of whether interactive user_refinement ran.
         if not cache_hit and viz_cfg.get("refined", True):
             subprocess.run(
                 [
                     python_exec,
                     viz_script,
-                    f"refine_task.viz_input_json={selected_refined_json}",
+                    f"refine_task.viz_input_json={refined_tracks_json}",
                     f"refine_task.viz_output_path={os.path.join(viz_dir, 'bev_refined.png')}",
                     *overrides,
                 ],
@@ -305,46 +241,10 @@ def main(cfg: DictConfig):
                 check=True,
             )
 
-        # Optional: project refined boxes back onto the camera frames.
-        if not cache_hit and viz_cfg.get("project", True):
-            subprocess.run(
-                [
-                    python_exec,
-                    project_script,
-                    f"refine_task.project_input_json={selected_refined_json}",
-                    f"refine_task.project_output_dir={os.path.join(refine_dir, 'projected')}",
-                    *overrides,
-                ],
-                env=env,
-                check=True,
-            )
-
-        if user_refine_enabled:
-            latest_user_json = _latest_user_refined_json(refine_dir)
-            if latest_user_json:
-                refined_tracks_json = latest_user_json
-                print(f"🧑‍🔧 Using latest user refinement snapshot: {refined_tracks_json}")
-            else:
-                print("ℹ️ User refinement enabled but no snapshots found; using base refined JSON.")
-        elif resume_from_latest:
-            latest_user_json = _latest_user_refined_json(refine_dir)
-            if latest_user_json:
-                refined_tracks_json = latest_user_json
-                print(
-                    "🧑‍🔧 Reusing latest user-refinement snapshot from this "
-                    f"refine dir (resume_from_latest): {refined_tracks_json}"
-                )
-        elif prefer_latest_when_disabled:
-            latest_user_json = (
-                _latest_user_refined_json(refine_dir)
-                or _latest_user_refined_json_any(base_results_dir)
-            )
-            if latest_user_json:
-                refined_tracks_json = latest_user_json
-                print(
-                    "🧑‍🔧 Using latest user refinement snapshot while "
-                    f"user_refinement is disabled: {refined_tracks_json}"
-                )
+        # Projecting refined boxes onto the camera frames is done by the
+        # refinement step itself, which writes <refine_dir>/projected (symlinking
+        # to the latest user_refinement iteration's already-rendered projection
+        # when available). No separate projection pass is needed here.
 
     # ==========================================
     # STEP 20: 4D GAUSSIAN SPLATTING TRAINING (with dynamic rigid annotations)

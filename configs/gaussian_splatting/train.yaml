@@ -113,7 +113,7 @@ rigid_cull_out_of_bound: true
 rigid_pose_smoothing: finite_diff #TODO REMOVE
 
 # Unicycle smoother (only active when rigid_pose_smoothing: unicycle).
-unicycle_opt_pos: false          # also optimize planar centers X/Z
+unicycle_opt_pos: true          # also optimize planar centers X/Z
 unicycle_prefit_iters: 1000      # standalone pre-fit before 4DGS training (0=skip)
 unicycle_prefit_reg_w: 5.0e-3
 unicycle_prefit_pos_w: 1.0e-3
@@ -128,7 +128,7 @@ unicycle_lr_center: 1.0e-3
 # Bicycle smoother — RETIRED (rigid_pose_smoothing: bicycle now raises). The
 # kinematic bicycle fit lives in Step 1.5 refinement. These keys are kept inert
 # only for backward-compatible config loading and have no effect.
-bicycle_opt_pos: false
+bicycle_opt_pos: true
 bicycle_prefit_iters: 500
 bicycle_prefit_reg_w: 1.0e-2
 bicycle_prefit_pos_w: 2.0e-4
@@ -147,6 +147,6 @@ bicycle_wheelbase_alpha: 0.60
 
 
 strategy:
-  cap_max: 1000000        # Default cap
+  cap_max: 2000000        # Default cap
   min_opacity: 0.005        # Default pruning opacity
 

@@ -59,55 +59,6 @@ def _find_latest_checkpoint(ckpt_dir: str) -> str:
     return os.path.join(ckpt_dir, ckpts[-1]) if ckpts else ""
 
 
-def _latest_user_refined_json(refine_dir: str) -> str:
-    """Return latest numbered user-refinement JSON, or "" if unavailable."""
-    root = os.path.join(refine_dir, "user_refinement")
-    if not os.path.isdir(root):
-        return ""
-
-    iters: list[tuple[int, str]] = []
-    for name in os.listdir(root):
-        path = os.path.join(root, name)
-        if not os.path.isdir(path):
-            continue
-        try:
-            idx = int(name)
-        except ValueError:
-            continue
-        cand = os.path.join(path, "track_3d_refined_colmap.json")
-        ok = os.path.exists(cand) and os.path.exists(os.path.join(path, ".success"))
-        if ok:
-            iters.append((idx, cand))
-
-    if not iters:
-        return ""
-    iters.sort(key=lambda x: x[0])
-    return iters[-1][1]
-
-
-def _latest_user_refined_json_any(base_results_dir: str) -> str:
-    """Return newest user-refined JSON across all step-15 folders for a scene."""
-    if not os.path.isdir(base_results_dir):
-        return ""
-    best_path = ""
-    best_mtime = -1.0
-    for name in os.listdir(base_results_dir):
-        if not name.startswith("15_refine_"):
-            continue
-        refine_dir = os.path.join(base_results_dir, name)
-        cand = _latest_user_refined_json(refine_dir)
-        if not cand:
-            continue
-        try:
-            mt = os.path.getmtime(cand)
-        except OSError:
-            continue
-        if mt > best_mtime:
-            best_mtime = mt
-            best_path = cand
-    return best_path
-
-
 def _resolve_cached_inputs(cfg: DictConfig) -> tuple[str, str]:
     """Resolve simulator inputs from the same cache hashes used by the orchestrator."""
     dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
@@ -124,28 +75,28 @@ def _resolve_cached_inputs(cfg: DictConfig) -> tuple[str, str]:
     ncore_hash = hashlib.md5(f"ncore_ego_{ego_masks_dir}".encode()).hexdigest()[:8]
     ncore_dir = os.path.join(base_results_dir, f"03_ncore_dataset_{ncore_hash}")
 
+    # user_refinement settings must NOT fork the refine cache dir (same rule as
+    # run_4dgs.py): the automatic refinement output is identical regardless of
+    # them, and keeping the hash stable is what lets the simulator locate the
+    # refine dir created during training even when user_refinement differs
+    # (e.g. enabled=false for the sim run).
+    refine_hash_cfg = {
+        k: v for k, v in refine_task_cfg.items() if k != "user_refinement"
+    }
     step15_hash = generate_config_hash(
         {
             "dataset": dataset_cfg,
             "tracker": tracker_cfg,
             "track_task": track_task_cfg,
-            "refine_task": refine_task_cfg,
+            "refine_task": refine_hash_cfg,
         }
     )
     refine_dir = os.path.join(base_results_dir, f"15_refine_{step15_hash}")
+    # Downstream always reads the refine-dir root: the refinement step mirrors the
+    # latest (fused/filtered/fit + any interactive user edits) tracks and the
+    # bicycle_params.json sidecar there, so there is no need to dig into
+    # user_refinement/NNN/ snapshots.
     refined_tracks_json = os.path.join(refine_dir, "track_3d_refined_colmap.json")
-    user_cfg = refine_task_cfg.get("user_refinement", {}) or {}
-    if bool(user_cfg.get("enabled", False)):
-        latest_user_json = _latest_user_refined_json(refine_dir)
-        if latest_user_json:
-            refined_tracks_json = latest_user_json
-    elif bool(user_cfg.get("prefer_latest_when_disabled", False)):
-        latest_user_json = (
-            _latest_user_refined_json(refine_dir)
-            or _latest_user_refined_json_any(base_results_dir)
-        )
-        if latest_user_json:
-            refined_tracks_json = latest_user_json
 
     scene_root = os.path.abspath(dataset_cfg["base_dir"])
     step20_hash = generate_config_hash(

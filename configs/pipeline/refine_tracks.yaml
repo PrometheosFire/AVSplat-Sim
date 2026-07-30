@@ -136,10 +136,11 @@ pose_smooth_rotation_min_speed: 0.05
 #   apply
 #   done
 # Each accepted modification writes a numbered snapshot under
-# <refine_dir>/user_refinement/NNN/track_3d_refined_colmap.json.
+# <refine_dir>/user_refinement/NNN/. When refinement finishes, the final tracks
+# JSON, projection and bicycle_params.json are written to the <refine_dir> root,
+# which is what all downstream stages (4DGS training, simulator) read.
 user_refinement:
   enabled: true
-  output_dir: "user_refinement_hello?"
   default_extend: 5
   extend_velocity_window: 3
   post_bicycle_fit: true
@@ -148,9 +149,6 @@ user_refinement:
   # instead of restarting from the automatic-refinement base — so manual edits
   # from a previous session are preserved. Set false to always start fresh.
   resume_from_latest: true
-  # If true and enabled=false, downstream stages may still consume the newest
-  # user_refinement snapshot found in step-15 outputs for this scene.
-  prefer_latest_when_disabled: true
 
 # --- Kinematic bicycle-model fitting (vehicle classes) ---
 # Replaces gap-fill + translation/rotation smoothing for vehicle-class tracks
