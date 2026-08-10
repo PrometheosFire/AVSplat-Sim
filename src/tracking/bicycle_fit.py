@@ -21,7 +21,7 @@ predictions.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -71,10 +71,11 @@ class BicycleFitConfig:
     lambda_steer_mag: float = 0.05  # small pull of steer toward 0
     # Continuity (defect) weight for stitching segments. Large = hard constraint.
     defect_weight: float = 100.0
-    # Below this fitted speed (m/s) the heading is untrustworthy; caller should
-    # fall back to the measured yaw.
-    min_heading_speed: float = 0.3
     max_steer: float = 0.7  # |delta| bound (~40 deg) for stability
+    # Acceleration box bounds (m/s^2) enforced by the trf solver, so one bad
+    # observation cannot drive a non-physical speed runaway.
+    accel_min: float = -6.0
+    accel_max: float = 4.0
     # Per-solve function-eval cap. ``None`` lets scipy use ``100 * n_params``;
     # a finite-difference Jacobian needs ~``n_params`` evals per iteration, so a
     # small cap silently under-converges.
@@ -95,9 +96,9 @@ class BicycleFitResult:
     """Output of :func:`fit_track`.
 
     ``states`` are the fitted per-frame states ``[x, z, theta, v]`` over the full
-    span (length ``n_steps + 1``); gaps are filled implicitly by the rollout.
-    ``valid_heading`` marks frames whose fitted speed exceeds
-    ``min_heading_speed`` (caller falls back to measured yaw elsewhere).
+    span (length ``n_steps + 1``); gaps are filled implicitly by the rollout. The
+    fitted heading is used on every frame — there is no speed threshold below
+    which the caller reverts to the measured box yaw.
     """
 
     success: bool
@@ -109,7 +110,6 @@ class BicycleFitResult:
     pos_rmse: float
     yaw_rmse: float
     n_obs: int
-    valid_heading: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=bool))
     message: str = ""
 
     @property
@@ -266,6 +266,7 @@ def _make_residual_fn(
     dt: float,
     wheelbase: float,
     cfg: BicycleFitConfig,
+    yaw_w: np.ndarray,
 ):
     """Build the residual closure and helpers for a fixed problem structure."""
     n_nodes = len(node_frames)
@@ -297,7 +298,7 @@ def _make_residual_fn(
         pos_res = (pred[:, :2] - obs_pos) / cfg.pos_scale
         yaw_res = wrap_angle(pred[:, STATE_THETA] - obs_yaw) / cfg.yaw_scale
         pos_res = pos_res * np.sqrt(w_pos)[:, None]
-        yaw_res = yaw_res * np.sqrt(w_yaw)
+        yaw_res = yaw_res * np.sqrt(w_yaw) * yaw_w
 
         # Continuity: wrap the heading component of each defect.
         defects = defects.copy()
@@ -429,6 +430,7 @@ def _make_ss_residual_fn(
     dt: float,
     wheelbase: float,
     cfg: BicycleFitConfig,
+    yaw_w: np.ndarray,
 ):
     """Residual closure for the *single-shooting* polish.
 
@@ -459,7 +461,7 @@ def _make_ss_residual_fn(
         pos_res = (pred[:, :2] - obs_pos) / cfg.pos_scale
         yaw_res = wrap_angle(pred[:, STATE_THETA] - obs_yaw) / cfg.yaw_scale
         pos_res = pos_res * np.sqrt(w_pos)[:, None]
-        yaw_res = yaw_res * np.sqrt(w_yaw)
+        yaw_res = yaw_res * np.sqrt(w_yaw) * yaw_w
 
         d_accel = cfg.lambda_accel * np.diff(accel)
         d_steer = cfg.lambda_steer * np.diff(steer)
@@ -530,6 +532,22 @@ def _build_ss_jac_sparsity(obs_frames: np.ndarray, n_steps: int):
     return S.tocsr()
 
 
+def _param_bounds(n_state: int, n_steps: int, cfg: BicycleFitConfig):
+    """Box bounds for a ``[state..., (accel, steer) * n_steps]`` parameter vector.
+
+    States are left unbounded; controls are bounded so the trf solver keeps
+    acceleration and steering physical without any post-hoc clipping.
+    """
+    n = n_state + 2 * n_steps
+    lb = np.full(n, -np.inf)
+    ub = np.full(n, np.inf)
+    lb[n_state::2] = cfg.accel_min
+    ub[n_state::2] = cfg.accel_max
+    lb[n_state + 1::2] = -cfg.max_steer
+    ub[n_state + 1::2] = cfg.max_steer
+    return lb, ub
+
+
 def _single_shooting_polish(
     state0: np.ndarray,
     accel: np.ndarray,
@@ -541,6 +559,7 @@ def _single_shooting_polish(
     dt: float,
     wheelbase: float,
     cfg: BicycleFitConfig,
+    yaw_w: np.ndarray,
 ):
     """Refine ``(state0, accel, steer)`` with an IRLS single-shooting solve.
 
@@ -551,15 +570,19 @@ def _single_shooting_polish(
     raised).
     """
     residuals, measurement_residuals, unpack = _make_ss_residual_fn(
-        frames, positions, yaws, n_steps, dt, wheelbase, cfg
+        frames, positions, yaws, n_steps, dt, wheelbase, cfg, yaw_w
     )
     jac_sparsity = _build_ss_jac_sparsity(frames, n_steps)
+    lb, ub = _param_bounds(STATE_DIM, n_steps, cfg)
 
     n_obs = int(len(frames))
     w_pos = np.ones(n_obs)
     w_yaw = np.ones(n_obs)
-    p = np.concatenate(
-        [np.asarray(state0, dtype=np.float64), np.stack([accel, steer], axis=1).ravel()]
+    p = np.clip(
+        np.concatenate(
+            [np.asarray(state0, dtype=np.float64), np.stack([accel, steer], axis=1).ravel()]
+        ),
+        lb, ub,
     )
     result = None
     for _ in range(max(cfg.irls_iters, 1)):
@@ -572,6 +595,7 @@ def _single_shooting_polish(
                 loss="linear",
                 jac_sparsity=jac_sparsity,
                 tr_solver="lsmr",
+                bounds=(lb, ub),
                 max_nfev=cfg.polish_max_nfev,
             )
         except Exception:  # pragma: no cover - solver robustness
@@ -597,6 +621,7 @@ def fit_track(
     dt: float,
     wheelbase: float,
     cfg: BicycleFitConfig | None = None,
+    yaw_weights: np.ndarray | None = None,
 ) -> BicycleFitResult:
     """Fit a CoG bicycle model to one track's observations.
 
@@ -623,12 +648,16 @@ def fit_track(
     positions = np.asarray(positions, dtype=np.float64).reshape(-1, 2)
     yaws = np.asarray(yaws, dtype=np.float64).reshape(-1)
     n_obs = int(frames.size)
+    # Per-observation orientation weight; 0 drops an untrustworthy heading.
+    if yaw_weights is None:
+        yaw_weights = np.ones(n_obs)
+    else:
+        yaw_weights = np.asarray(yaw_weights, dtype=np.float64).reshape(-1)
 
     init_states = _initial_track_states(frames, positions, yaws, n_steps, dt)
 
     # Degenerate spans: nothing to optimize, return the initialization.
     if n_steps < 1 or n_obs < 2:
-        speeds = init_states[:, STATE_V]
         return BicycleFitResult(
             success=False,
             states=init_states,
@@ -639,7 +668,6 @@ def fit_track(
             pos_rmse=float("nan"),
             yaw_rmse=float("nan"),
             n_obs=n_obs,
-            valid_heading=speeds >= cfg.min_heading_speed,
             message="span too short to fit",
         )
 
@@ -650,9 +678,11 @@ def fit_track(
     p0 = np.concatenate([init_states[node_frames].ravel(), init_ctrl.ravel()])
 
     residuals, measurement_residuals, unpack = _make_residual_fn(
-        frames, positions, yaws, n_steps, node_frames, dt, wheelbase, cfg
+        frames, positions, yaws, n_steps, node_frames, dt, wheelbase, cfg, yaw_weights
     )
     jac_sparsity = _build_jac_sparsity(frames, n_steps, node_frames)
+    lb, ub = _param_bounds(len(node_frames) * STATE_DIM, n_steps, cfg)
+    p0 = np.clip(p0, lb, ub)
 
     # IRLS: alternate a least-squares solve with a robust re-weighting of the
     # measurement residuals (Huber for position, Cauchy for yaw).
@@ -671,6 +701,7 @@ def fit_track(
                 loss="linear",
                 jac_sparsity=jac_sparsity,
                 tr_solver="lsmr",
+                bounds=(lb, ub),
                 max_nfev=cfg.solver_max_nfev,
             )
         except Exception as exc:  # pragma: no cover - solver robustness
@@ -687,7 +718,6 @@ def fit_track(
         message = message or str(result.message)
 
     nodes, accel, steer = unpack(p)
-    steer = np.clip(steer, -cfg.max_steer, cfg.max_steer)
     frame_states, _ = _rollout_all_segments(
         nodes, accel, steer, node_frames, dt, wheelbase, cfg.lr_ratio
     )
@@ -713,10 +743,9 @@ def fit_track(
 
         s0_p, accel_p, steer_p, ss_result = _single_shooting_polish(
             frame_states[0], accel, steer, frames, positions, yaws,
-            n_steps, dt, wheelbase, cfg,
+            n_steps, dt, wheelbase, cfg, yaw_weights,
         )
         if ss_result is not None:
-            steer_p = np.clip(steer_p, -cfg.max_steer, cfg.max_steer)
             pol_states = rollout(s0_p, accel_p, steer_p, dt, wheelbase, cfg.lr_ratio)
             if _baked_pos_rmse(pol_states) <= _baked_pos_rmse(ms_states):
                 accel, steer, frame_states = accel_p, steer_p, pol_states
@@ -748,6 +777,5 @@ def fit_track(
         pos_rmse=pos_rmse,
         yaw_rmse=yaw_rmse,
         n_obs=n_obs,
-        valid_heading=frame_states[:, STATE_V] >= cfg.min_heading_speed,
         message=message,
     )

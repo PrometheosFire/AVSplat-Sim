@@ -156,8 +156,8 @@ user_refinement:
 # smoothing). The fitted trajectory is dense (gaps filled by the model rollout),
 # denoised, and kinematically consistent (no sideways slides / impossible
 # turns). Height (up axis) is kept from the tracker predictions; heading is
-# written as a world-up yaw delta on the measured box rotation, with a fallback
-# to the measured heading when the fitted speed is below min_heading_speed.
+# written as a world-up yaw delta on the measured box rotation, on every frame
+# (there is no speed threshold below which the measured yaw is kept instead).
 # The fitted per-track parameters are written to bicycle_params.json so the
 # simulator can extrapolate trajectories on demand.
 bicycle_fit:
@@ -167,35 +167,94 @@ bicycle_fit:
   # fall back to the legacy path.
   classes: [car, truck, bus, trailer, construction_vehicle]
   min_track_frames: 3
+  # --- Fit output representation & debug ---
+  # Which fitted trajectory is written to the tracks and to everything downstream
+  # (4DGS training boxes + simulator extrapolation). Both are fully supported;
+  # they only differ when polish_single_shooting is false.
+  #   "rollout" — integrate state0 + accel/steer. Exactly kinematically feasible
+  #      and seam-free, but drifts off the detections when the fit's segment
+  #      defects do not vanish (see .chats/session_bicycle_model_fitting.md §8.2).
+  #      The sidecar carries only (state0, accel, steer).
+  #   "states"  — the optimized per-frame X,Z (+ theta) straight from the
+  #      multiple-shooting solve. Hugs the detections, but is stitched from
+  #      segments, so it can kink at each segment boundary (every segment_len
+  #      frames) — check refine_report.json -> bicycle_fit.tracks.*.states_seam_max
+  #      (meters) for the worst kink per track, since sub-box discontinuities are
+  #      what smear dynamic Gaussians. The sidecar additionally carries the
+  #      per-frame states so the simulator reproduces the baked span exactly and
+  #      only extrapolates with the model past the ends.
+  bake_source: rollout
+  # Single-shooting polish: after multiple shooting, re-fit (state0, controls)
+  # against a pure single rollout so res.states == the baked rollout. TRUE makes
+  # "states" and "rollout" identical; FALSE gives the genuinely different pair
+  # (states hugs the detections; rollout is smooth / simulator-reproducible).
+  polish_single_shooting: false
+  polish_max_nfev: 400
+  # Debug: in each user_refinement_post_bicycle/NNN/, also write NNN/rollout/ and
+  # NNN/states/ (tracks JSON + projected bboxes) to compare both representations
+  # visually. Adds 2 extra projection renders per iteration.
+  debug_bake_variants: true
   # Model-assisted fusion: when true, the velocity gap-handoff fusion signal
   # also tries a bicycle (constant-turn) extrapolation of the ending track, so a
   # vehicle that briefly disappears mid-corner is still matched to its
   # reappearance. Uses wheelbase_alpha / lr_ratio / dt below.
   model_assisted_gap: true
-  # Wheelbase estimate L = wheelbase_alpha * max(size_x, size_y). There is no
-  # direct wheelbase measurement; max() avoids width/length axis-order ambiguity.
+  # ====================================================================
+  # Parameters below directly shape the per-track fit. Each notes the
+  # effect of raising (^) vs lowering (v) it.
+  # ====================================================================
+  # Wheelbase L = wheelbase_alpha * max(size_x, size_y) (no direct measurement;
+  # max() avoids width/length axis-order ambiguity).
+  #   ^ longer wheelbase -> gentler turn per steer (straighter; can under-fit tight corners)
+  #   v shorter wheelbase -> tighter turns allowed (can over-curve / wander)
   wheelbase_alpha: 0.45
-  lr_ratio: 0.5          # CoG-to-rear-axle fraction lr / L (0.5 = box center)
-  dt: 0.1                # seconds per frame
-  segment_len: 50        # frames per multiple-shooting segment
-  # Measurement residual normalizers (meters / radians): the robust-loss
-  # transition scale for position and heading residuals.
+  # CoG-to-rear-axle fraction lr / L (0.5 = box center).
+  #   ^ CoG toward front -> more side-slip in curves | v toward rear -> less slip
+  lr_ratio: 0.5
+  dt: 0.1                # seconds per frame (fixed by frame rate; not a tuning knob)
+  # Multiple-shooting segment length (frames).
+  #   ^ fewer/longer segments -> better bake continuity but stiffer & less stable on curves
+  #   v more/shorter segments -> more stable solve but more segment seams (bake drift; polish mitigates)
+  segment_len: 25
+  # Position residual normalizer (m); only the pos_scale : yaw_scale ratio matters.
+  #   ^ trusts position LESS (looser/smoother, drifts off points) | v trusts position MORE (hugs obs, keeps noise)
   pos_scale: 0.5
-  yaw_scale: 0.15
-  huber_delta: 1.345     # position influence transition (normalized units)
-  cauchy_c: 2.3849       # heading influence transition (heavier tails)
-  irls_iters: 3          # robust re-weighting (IRLS) outer iterations
-  # Control-smoothness priors — the dominant regularizer. Larger = smoother
-  # trajectory / stronger noise rejection (too large rounds off sharp turns).
+  # Heading residual normalizer (rad) — a DIVISOR, i.e. inverse weight on yaw.
+  #   ^ trusts yaw LESS (>=1e3 ~= ignore yaw) | v trusts yaw MORE (0 = divide-by-zero crash; floor ~0.05)
+  yaw_scale: 1000000
+  # Position robust (Huber) transition, in normalized residual units.
+  #   ^ tolerates position outliers (they pull the fit more) | v rejects them sooner (more robust, may drop good pts)
+  huber_delta: 1.345
+  # Heading robust (Cauchy) transition, normalized units (heavier tails than Huber).
+  #   ^ tolerates yaw outliers | v rejects yaw outliers sooner
+  cauchy_c: 2.3849
+  # Robust re-weighting (IRLS) outer iterations.
+  #   ^ stronger outlier down-weighting (slower) | v faster, less robust
+  irls_iters: 3
+  # --- Control-smoothness priors (the dominant regularizer) ---
+  # Acceleration-change (jerk) smoothness.
+  #   ^ smoother speed (too high rounds off real accel/brake) | v follows speed noise
   lambda_accel: 4.0
+  # Steering-rate smoothness.
+  #   ^ smoother heading (too high rounds off sharp turns) | v follows heading noise / wiggles
   lambda_steer: 6.0
+  # Soft pull of acceleration toward 0.
+  #   ^ biases toward constant speed | v freer speed changes
   lambda_accel_mag: 0.02
+  # Soft pull of steering toward 0.
+  #   ^ biases toward straight-line motion | v freer turning
   lambda_steer_mag: 0.05
-  defect_weight: 100.0   # segment-continuity constraint weight
-  # Below this fitted speed (m/s) the heading is untrustworthy and the measured
-  # box yaw is kept instead of the fitted heading.
-  min_heading_speed: 0.3
-  max_steer: 0.7         # |steering| bound (~40 deg) for numerical stability
+  # Segment-continuity (defect) constraint weight.
+  #   ^ tighter stitching (stiffer, worse conditioning) | v looser stitching (more stable solve, larger bake drift)
+  defect_weight: 1000.0
+  # |steering| bound (~40 deg), enforced by the solver.
+  #   ^ allows tighter turns (risk of instability) | v caps turn rate (may under-fit sharp corners)
+  max_steer: 0.7
+  # Acceleration box bounds (m/s^2), enforced by the solver so one bad detection
+  # cannot drive a non-physical speed runaway (comfort ~[-3, 2]; default allows hard braking).
+  #   wider -> allows harder accel/brake (more runaway risk) | narrower -> more physical, may under-fit hard braking
+  accel_min: -6.0
+  accel_max: 4.0
   # --- Pre-cleaning of size-scaled detection artefacts (before fitting) ---
   # Large/elongated vehicles suffer two failures the kinematic model cannot
   # represent: 180-degree box heading flips (front/back ambiguity) and single-
@@ -204,6 +263,13 @@ bicycle_fit:
   preclean_yaw_flip: true       # point each heading along the motion direction
   preclean_min_move: 0.3        # min per-frame motion (m) to trust local heading
   preclean_outlier_dist: 2.0    # drop obs deviating > this (m) from neighbour interp; 0 disables
+  # Gross bad first/last box (span anchor): the fit hard-anchors on the endpoints,
+  # so a teleported first/last detection forces a non-physical speed/accel runaway
+  # that corrupts the whole rollout. Drop an endpoint deviating > this (m) from a
+  # linear extrapolation of its two inner neighbours (the fit rolls over the frame
+  # and the bake repairs it). More lenient than the interior test since endpoint
+  # extrapolation is noisier on curves. 0 disables.
+  preclean_endpoint_dist: 3.0
   # Trimmed refit (least-trimmed squares): if the single-shoot rollout still
   # fails the consistency gate after pre-cleaning, iteratively drop the worst-
   # residual observations and refit before falling back to legacy smoothing.

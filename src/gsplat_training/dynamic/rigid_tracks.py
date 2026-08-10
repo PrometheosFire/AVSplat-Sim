@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -193,11 +194,24 @@ def bicycle_pose_at_frame(
     span reproduce the fit; frames past the end continue with zero acceleration
     and the last steering angle; frames before the start integrate backwards.
 
+    When ``entry`` carries ``states_traj``, those baked per-frame states are used
+    verbatim inside the span — so this reproduces the boxes 4DGS actually trained
+    on instead of a second, slightly different trajectory. Extrapolation past
+    either end still integrates the model, but anchored on the baked endpoint so
+    it joins the span without a jump.
+
+    Note that the sidecar stores the fitted states for *every* track regardless
+    of how the boxes were baked; :func:`_build_bicycle_params` is what decides
+    whether they are authoritative (from the sidecar's ``bake_source``) and only
+    then attaches them here. Do not re-derive that choice from their presence.
+
     Args:
         entry: Per-instance params — ``wheelbase``, ``lr_ratio``, ``dt``,
             ``first_frame``, ``n_steps``, ``state0`` (4,), ``accel`` (n,),
             ``steer`` (n,), plus reference height ``ref_y`` and rotation
             ``ref_rot`` (3x3, COLMAP) taken from the last observed frame.
+            Optionally ``states_traj`` (n_steps + 1, 4) — the baked per-frame
+            states ``[x, z, theta, v]``.
         transform_scale/rotation/translation: COLMAP -> training similarity
             (``x' = s * R @ x + t``).
         frame_idx: Global (training) frame index to evaluate.
@@ -216,8 +230,20 @@ def bicycle_pose_at_frame(
     accel = np.asarray(entry["accel"], dtype=np.float64)
     steer = np.asarray(entry["steer"], dtype=np.float64)
 
-    # States across the fitted span: shape (n_steps + 1, 4).
+    # States across the fitted span: shape (n_steps + 1, 4). Prefer the baked
+    # states when the sidecar carries them (see the note above); fall back to the
+    # controls' rollout if they are absent or their length disagrees with the
+    # span, since a mismatch would silently misindex every pose.
     states = _roll(state0, accel, steer, dt, wheelbase, lr_ratio)
+    baked = entry.get("states_traj")
+    if baked is not None and len(baked):
+        arr = np.asarray(baked, dtype=np.float64)
+        if arr.ndim == 2 and arr.shape[0] == states.shape[0] and arr.shape[1] >= 3:
+            if arr.shape[1] < 4:
+                # Legacy 3-column [x, z, theta]: take the speed the extrapolation
+                # needs from the model rollout.
+                arr = np.column_stack([arr[:, :3], states[:, 3]])
+            states = arr
     offset = int(frame_idx) - first
 
     if 0 <= offset <= n_steps:
@@ -427,6 +453,12 @@ def _build_bicycle_params(
 ]:
     """Read the bicycle sidecar and index its params by instance column.
 
+    Each track in the sidecar carries both fitted representations — the controls
+    ``(state0, accel, steer)`` and the per-frame ``states_traj``. The sidecar's
+    ``bake_source`` says which one the refinement baked into the boxes, and only
+    that one is attached to the returned entries, so the simulator reproduces the
+    trajectory 4DGS trained on rather than the other one.
+
     Returns ``(params_by_col, scale, R, t)`` or ``(None, None, None, None)`` when
     no sidecar is present or its frame ordering does not match this run.
     """
@@ -440,6 +472,14 @@ def _build_bicycle_params(
     if frame_keys is not None and list(frame_keys) != list(track_tokens):
         return None, None, None, None
 
+    # Which representation the refinement actually baked into the boxes. Both
+    # always ship in the sidecar, so the presence of ``states_traj`` says nothing
+    # about which one is authoritative — only this field does. Sidecars written
+    # before the field existed were always rollout-baked.
+    bake_source = str(sidecar.get("bake_source", "rollout")).strip().lower()
+    use_states = bake_source == "states"
+    n_states_missing = 0
+
     params_by_col: Dict[int, dict] = {}
     for tid_str, raw in sidecar["tracks"].items():
         tid = int(tid_str)
@@ -449,7 +489,7 @@ def _build_bicycle_params(
         ref = ref_pose.get(col)
         if ref is None:
             continue
-        params_by_col[col] = {
+        entry = {
             "wheelbase": float(raw["wheelbase"]),
             "lr_ratio": float(raw["lr_ratio"]),
             "dt": float(raw["dt"]),
@@ -461,6 +501,34 @@ def _build_bicycle_params(
             "ref_y": ref[1],
             "ref_rot": ref[2],
         }
+        # Attached ONLY under the ``states`` bake, so that the extrapolation
+        # reproduces exactly the span that was baked. Under the ``rollout`` bake
+        # the states are present but not authoritative, and attaching them would
+        # make the simulator contradict the boxes 4DGS trained on.
+        if use_states:
+            baked = raw.get("states_traj")
+            arr = np.asarray(baked, dtype=np.float64) if baked else None
+            if (
+                arr is not None
+                and arr.ndim == 2
+                and arr.shape[0] == int(raw["n_steps"]) + 1
+            ):
+                entry["states_traj"] = arr
+            else:
+                # Stale / desynced sidecar: fall this instance back to the
+                # controls' rollout rather than misindexing every one of its
+                # poses. Counted so the mismatch is reported, not swallowed.
+                n_states_missing += 1
+        params_by_col[col] = entry
+
+    if n_states_missing:
+        warnings.warn(
+            f"bicycle sidecar declares bake_source='states' but {n_states_missing} "
+            "instance(s) have no usable states_traj; those fall back to the "
+            "controls' rollout and will not match their baked boxes.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     if not params_by_col:
         return None, None, None, None

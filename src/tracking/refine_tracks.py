@@ -41,7 +41,7 @@ from src.tracking.track_geometry import (
 from src.tracking.bicycle_fit import BicycleFitConfig, fit_track
 from src.tracking.bicycle_kinematics import rollout as _bicycle_rollout
 from src.tracking.bicycle_kinematics import wheelbase_from_size
-from src.tracking.bicycle_kinematics import STATE_THETA, STATE_V
+from src.tracking.bicycle_kinematics import STATE_DIM, STATE_THETA, STATE_V
 
 try:  # Optional progress bar; falls back to a plain loop if unavailable.
     from tqdm import tqdm as _tqdm
@@ -748,7 +748,9 @@ def _endpoint_velocity_3d(
     return vel
 
 
-def _extrap_box(base_box: dict, new_trans: np.ndarray, token: str | None) -> dict:
+def _extrap_box(
+    base_box: dict, new_trans: np.ndarray, token: str | None, zero_velocity: bool = False
+) -> dict:
     """Copy a keyframe box at a new translation (rotation/size held constant)."""
     import copy
 
@@ -758,6 +760,8 @@ def _extrap_box(base_box: dict, new_trans: np.ndarray, token: str | None) -> dic
     nb["extrapolated"] = True  # synthesized beyond the observed track span
     if token is not None and "sample_token" in nb:
         nb["sample_token"] = token
+    if zero_velocity and nb.get("velocity") is not None:
+        nb["velocity"] = [0.0 for _ in nb["velocity"]]
     return nb
 
 
@@ -1167,8 +1171,13 @@ def _bicycle_fit_config(cfg: dict) -> BicycleFitConfig:
         lambda_accel_mag=float(cfg.get("lambda_accel_mag", defaults.lambda_accel_mag)),
         lambda_steer_mag=float(cfg.get("lambda_steer_mag", defaults.lambda_steer_mag)),
         defect_weight=float(cfg.get("defect_weight", defaults.defect_weight)),
-        min_heading_speed=float(cfg.get("min_heading_speed", defaults.min_heading_speed)),
         max_steer=float(cfg.get("max_steer", defaults.max_steer)),
+        accel_min=float(cfg.get("accel_min", defaults.accel_min)),
+        accel_max=float(cfg.get("accel_max", defaults.accel_max)),
+        polish_single_shooting=bool(
+            cfg.get("polish_single_shooting", defaults.polish_single_shooting)
+        ),
+        polish_max_nfev=int(cfg.get("polish_max_nfev", defaults.polish_max_nfev)),
     )
 
 
@@ -1221,9 +1230,10 @@ def _preclean_fit_inputs(
       deviates from the offset-interpolation of its temporal neighbours by more
       than ``preclean_outlier_dist`` meters.
 
-    Returns cleaned ``(offsets, positions, yaws, n_dropped)``. The first and last
-    observations and a minimum of two points are always preserved (they anchor
-    the fit span).
+    Returns cleaned ``(offsets, positions, yaws, n_dropped)``. A minimum of four
+    observations is always preserved. Gross outliers at the span anchors (first /
+    last obs) are dropped too (stage 0): the fit hard-anchors on them, so a single
+    bad endpoint otherwise forces a non-physical speed/accel runaway.
     """
     offsets = np.asarray(offsets, dtype=np.int64).copy()
     positions = np.asarray(positions, dtype=np.float64).reshape(-1, 2).copy()
@@ -1234,6 +1244,41 @@ def _preclean_fit_inputs(
 
     def _wrap(a):
         return (a + np.pi) % (2 * np.pi) - np.pi
+
+    n_dropped = 0
+
+    # --- 0. endpoint outlier rejection -------------------------------------- #
+    # The interior spike test (stage 2) never touches the span anchors, yet the
+    # fit hard-anchors ``state0`` / the end state on them. A single gross bad
+    # endpoint (e.g. a teleported first box) therefore forces a non-physical
+    # speed/accel runaway that corrupts the entire rollout. Drop such an endpoint
+    # by comparing it to a linear extrapolation of its two adjacent inner
+    # survivors; the fit then rolls over the now-unobserved frame and the bake
+    # repairs it. Iterated so a short run of bad leading/trailing boxes is peeled.
+    endpoint_dist = float(cfg.get("preclean_endpoint_dist", 3.0))
+    if endpoint_dist > 0.0:
+        def _endpoint_dev(end_i: int, a: int, b: int) -> float:
+            denom = float(offsets[b] - offsets[a])
+            t = (offsets[end_i] - offsets[a]) / denom if denom != 0.0 else 0.0
+            pred = positions[a] + (positions[b] - positions[a]) * t
+            return float(np.linalg.norm(positions[end_i] - pred))
+
+        for _ in range(4):  # peel at most 4 endpoints total (safety bound)
+            m = offsets.size
+            if m < 4:
+                break
+            dev_first = _endpoint_dev(0, 1, 2)
+            dev_last = _endpoint_dev(m - 1, m - 2, m - 3)
+            if max(dev_first, dev_last) <= endpoint_dist:
+                break
+            drop = 0 if dev_first >= dev_last else (m - 1)
+            keep = np.ones(m, dtype=bool)
+            keep[drop] = False
+            offsets = offsets[keep]
+            positions = positions[keep]
+            yaws = yaws[keep]
+            n_dropped += 1
+        n = offsets.size
 
     # --- 1. heading unflip -------------------------------------------------- #
     if bool(cfg.get("preclean_yaw_flip", True)):
@@ -1253,7 +1298,6 @@ def _preclean_fit_inputs(
 
     # --- 2. position spike rejection --------------------------------------- #
     outlier_dist = float(cfg.get("preclean_outlier_dist", 2.0))
-    n_dropped = 0
     if outlier_dist > 0.0:
         dev = np.zeros(n)
         for i in range(1, n - 1):
@@ -1275,7 +1319,7 @@ def _preclean_fit_inputs(
             offsets = offsets[keep]
             positions = positions[keep]
             yaws = yaws[keep]
-            n_dropped = int(flagged.sum())
+            n_dropped += int(flagged.sum())
 
     return offsets, positions, yaws, n_dropped
 
@@ -1362,6 +1406,39 @@ def _fit_with_trimming(
     return best
 
 
+def _states_traj_rows(states: np.ndarray) -> list[list[float]]:
+    """Serialize fitted states as ``[[x, z, theta, v], ...]`` JSON rows."""
+    return [
+        [float(s[0]), float(s[1]), float(s[STATE_THETA]), float(s[STATE_V])]
+        for s in np.asarray(states, dtype=np.float64)
+    ]
+
+
+def _states_seam_max(res) -> float:
+    """Worst position kink at an interior multiple-shooting segment boundary (m).
+
+    The ``states`` bake writes the per-segment fitted states, which are stitched
+    only by soft defect residuals and therefore meet with a small kink at each
+    shooting node. Gaussian splatting is sensitive to exactly this kind of
+    sub-box discontinuity — it smears the dynamic object — so the worst seam is
+    reported per track to make the rollout-vs-states choice measurable rather
+    than visual. Measured as the second difference of position at the interior
+    nodes, minus the track's median second difference (the smooth-motion
+    baseline ``a * dt^2``), so genuine curvature is not counted as a seam.
+    Returns ``0.0`` for a single continuous rollout (no interior nodes).
+    """
+    states = np.asarray(res.states, dtype=np.float64)
+    nodes = np.asarray(res.node_frames, dtype=np.int64)
+    interior = nodes[(nodes > 0) & (nodes < states.shape[0] - 1)]
+    if interior.size == 0 or states.shape[0] < 3:
+        return 0.0
+    p = states[:, :2]
+    curvature = np.linalg.norm(p[2:] - 2.0 * p[1:-1] + p[:-2], axis=1)  # index i -> frame i+1
+    baseline = float(np.median(curvature))
+    seam = curvature[interior - 1]
+    return float(max(np.max(seam) - baseline, 0.0))
+
+
 def apply_bicycle_fit(
     tracks: dict[int, dict[int, dict]],
     frame_keys: list[str],
@@ -1381,8 +1458,8 @@ def apply_bicycle_fit(
       across gap frames (RANSAC height-plane fitting is handled separately and
       currently off).
     * Heading is written as a world-up yaw delta on top of the nearest measured
-      box rotation (preserving roll/pitch); frames whose fitted speed is below
-      ``min_heading_speed`` keep the measured heading.
+      box rotation (preserving roll/pitch), on every frame — there is no speed
+      threshold below which the measured heading is kept instead.
 
     Mutates ``tracks`` in place (adds synthesized gap boxes). Returns
     ``(n_tracks_fitted, report)`` where ``report['params']`` holds the fitted
@@ -1399,6 +1476,11 @@ def apply_bicycle_fit(
     fit_cfg = _bicycle_fit_config(cfg)
     alpha = float(cfg.get("wheelbase_alpha", 0.6))
     dt = float(cfg.get("dt", 0.1))
+    # Which fitted trajectory is baked into the boxes: "rollout" (the single
+    # kinematic rollout the simulator reproduces from the params) or "states"
+    # (the multiple-shooting fitted X,Z; tighter to detections, differs from
+    # rollout only when the single-shooting polish is off).
+    bake_source = str(cfg.get("bake_source", "rollout")).strip().lower()
     # Max RMSE (meters) between the single kinematic rollout and the observed
     # positions for a fit to be accepted. Unconverged / noise-blown-up fits
     # (common on long or large-vehicle tracks) exceed this and are rejected so
@@ -1533,9 +1615,11 @@ def apply_bicycle_fit(
             if offsets.size < n_before:
                 n_trimmed_tracks += 1
 
-        traj_pos = traj[:, :2]
-        traj_yaw = traj[:, STATE_THETA]
-        traj_valid = traj[:, STATE_V] >= fit_cfg.min_heading_speed
+        # Gate uses the single rollout (what the persisted params reproduce);
+        # the baked boxes use the configured source.
+        bake_traj = res.states if bake_source == "states" else traj
+        traj_pos = bake_traj[:, :2]
+        traj_yaw = bake_traj[:, STATE_THETA]
 
         if not np.isfinite(ss_rmse) or ss_rmse > max_pos_rmse:
             rejected.append(int(tid))
@@ -1573,11 +1657,15 @@ def apply_bicycle_fit(
             t[UP_AXIS] = float(y_interp[off])
             box["translation"] = t
 
-            if bool(traj_valid[off]):
-                base_yaw = _yaw_from_box_rotation({"rotation": base_rot})
-                delta = float(traj_yaw[off] - base_yaw)
-                rot_new = _yaw_matrix(delta) @ quat_wxyz_to_matrix(base_rot)
-                box["rotation"] = _matrix_to_quat_wxyz(rot_new).tolist()
+            # The fitted heading is written on every frame. There used to be a
+            # min_heading_speed gate that kept the measured box yaw on slow
+            # frames; it is gone, so the yaw comes from one source across the
+            # whole span and the variant re-bake in ``_variant_results`` produces
+            # boxes identical to these.
+            base_yaw = _yaw_from_box_rotation({"rotation": base_rot})
+            delta = float(traj_yaw[off] - base_yaw)
+            rot_new = _yaw_matrix(delta) @ quat_wxyz_to_matrix(base_rot)
+            box["rotation"] = _matrix_to_quat_wxyz(rot_new).tolist()
 
         n_fitted += 1
         params[str(tid)] = {
@@ -1589,6 +1677,14 @@ def apply_bicycle_fit(
             "state0": [float(v) for v in res.states[0]],
             "accel": [float(v) for v in res.accel],
             "steer": [float(v) for v in res.steer],
+            # Fitted per-frame state [x, z, theta, v] (the multiple-shooting
+            # states). Always stored alongside the controls so a track carries
+            # BOTH representations — the rollout is derivable from
+            # (state0, accel, steer), the direct X,Z estimate from these — and
+            # switching ``bake_source`` never requires re-fitting. ``v`` is kept
+            # so extrapolation past the span can anchor on the baked endpoint
+            # rather than restarting from the controls' rollout.
+            "states_traj": _states_traj_rows(res.states),
         }
         per_track[str(tid)] = {
             "class": _track_class(track),
@@ -1596,6 +1692,8 @@ def apply_bicycle_fit(
             "success": bool(res.success),
             "pos_rmse": float(ss_rmse),
             "yaw_rmse": float(res.yaw_rmse),
+            # Only meaningful for the "states" bake; 0.0 under a single rollout.
+            "states_seam_max": _states_seam_max(res),
             "wheelbase": float(wheelbase),
             "first_frame": int(first),
             "n_frames": int(n_steps + 1),
@@ -1627,6 +1725,57 @@ def tracks_to_results(
     return results
 
 
+def _variant_results(
+    tracks: dict[int, dict[int, dict]],
+    frame_keys: list[str],
+    bicycle_params: dict,
+    mode: str,
+) -> dict:
+    """Rebuild results with fitted vehicle boxes re-baked from one representation.
+
+    ``mode='rollout'`` uses the single kinematic rollout of the persisted
+    ``(state0, accel, steer)``; ``mode='states'`` uses the stored multiple-
+    shooting fitted ``[x, z, theta]``. Non-fitted tracks are left unchanged.
+    """
+    ax0, ax1 = GROUND_AXES
+    variant = copy.deepcopy(tracks)
+    for tid_str, entry in (bicycle_params or {}).items():
+        try:
+            tid = int(tid_str)
+        except (TypeError, ValueError):
+            continue
+        track = variant.get(tid)
+        if track is None:
+            continue
+        first = int(entry.get("first_frame", 0))
+        if mode == "states":
+            st = entry.get("states_traj")
+            if not st:
+                continue
+            arr = np.asarray(st, dtype=np.float64)
+            xz, th = arr[:, :2], arr[:, 2]
+        else:
+            traj = _bicycle_rollout(
+                np.asarray(entry["state0"], dtype=np.float64),
+                np.asarray(entry["accel"], dtype=np.float64),
+                np.asarray(entry["steer"], dtype=np.float64),
+                float(entry["dt"]), float(entry["wheelbase"]), float(entry["lr_ratio"]),
+            )
+            xz, th = traj[:, :2], traj[:, STATE_THETA]
+        for off in range(xz.shape[0]):
+            box = track.get(first + off)
+            if box is None:
+                continue
+            t = list(box["translation"])
+            t[ax0], t[ax1] = float(xz[off, 0]), float(xz[off, 1])
+            box["translation"] = t
+            base_rot = box["rotation"]
+            base_yaw = _yaw_from_box_rotation({"rotation": base_rot})
+            rot_new = _yaw_matrix(float(th[off] - base_yaw)) @ quat_wxyz_to_matrix(base_rot)
+            box["rotation"] = _matrix_to_quat_wxyz(rot_new).tolist()
+    return tracks_to_results(variant, frame_keys)
+
+
 def _write_user_iteration(
     root_dir: str,
     base_payload: dict,
@@ -1639,6 +1788,8 @@ def _write_user_iteration(
     project_cfg: dict,
     bicycle_params: dict | None = None,
     bicycle_alpha: float = 0.6,
+    debug_variants: bool = False,
+    bake_source: str = "rollout",
 ) -> str:
     """Write one numbered user-refinement snapshot and return its directory.
 
@@ -1670,6 +1821,7 @@ def _write_user_iteration(
     if bicycle_params is not None:
         sidecar = {
             "frame_keys": frame_keys,
+            "bake_source": bake_source,
             "wheelbase_alpha": float(bicycle_alpha),
             "tracks": bicycle_params,
         }
@@ -1692,6 +1844,42 @@ def _write_user_iteration(
 
     with open(os.path.join(it_dir, "project_report.json"), "w", encoding="utf-8") as f:
         json.dump(proj_report, f, indent=2)
+
+    # Write the two bake variants (controls rollout vs fitted X,Z states) side by
+    # side so their effect can be compared. Each variant dir is a COMPLETE,
+    # self-contained refinement output — tracks JSON, its own sidecar stamped
+    # with that dir's own ``bake_source``, and the projection — so training or
+    # the simulator can be pointed straight at either one, and so ``main`` can
+    # promote the configured one to the refine root verbatim. Identical to each
+    # other unless the single-shooting polish is off.
+    if debug_variants and bicycle_params:
+        for mode in ("rollout", "states"):
+            sub = os.path.join(it_dir, mode)
+            os.makedirs(sub, exist_ok=True)
+            v_out = dict(base_payload)
+            v_out["results"] = _variant_results(tracks, frame_keys, bicycle_params, mode)
+            with open(os.path.join(sub, "track_3d_refined_colmap.json"), "w", encoding="utf-8") as f:
+                json.dump(v_out, f)
+            # Same params either way — both representations are always stored;
+            # only ``bake_source`` differs, and that is what tells a consumer
+            # which one these boxes were built from.
+            with open(os.path.join(sub, "bicycle_params.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "frame_keys": frame_keys,
+                        "bake_source": mode,
+                        "wheelbase_alpha": float(bicycle_alpha),
+                        "tracks": bicycle_params,
+                    },
+                    f,
+                )
+            v_proj = _project_results_snapshot(
+                results=v_out["results"], data_root=data_root,
+                output_dir=os.path.join(sub, "projected"),
+                camera_names=camera_names, project_cfg=project_cfg,
+            )
+            with open(os.path.join(sub, "project_report.json"), "w", encoding="utf-8") as f:
+                json.dump(v_proj, f, indent=2)
 
     frame_mapping = proj_report.get("frame_mapping", {})
     return it_dir, frame_mapping
@@ -1720,12 +1908,73 @@ def _project_results_snapshot(
     )
 
 
+def _latest_user_snapshot(root_dir: str) -> tuple[int | None, str]:
+    """Newest usable user-refinement snapshot under ``root_dir``.
+
+    Returns ``(iteration_index, snapshot_dir)`` for the highest-numbered ``NNN/``
+    directory that actually contains a tracks JSON, or ``(None, "")`` when there
+    is none. Numbered directories without the JSON are skipped rather than
+    failing the resume, since an interrupted run can leave one behind before it
+    was written.
+    """
+    if not os.path.isdir(root_dir):
+        return None, ""
+    best: int | None = None
+    for name in os.listdir(root_dir):
+        path = os.path.join(root_dir, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            idx = int(name)
+        except ValueError:
+            continue
+        if not os.path.exists(os.path.join(path, "track_3d_refined_colmap.json")):
+            continue
+        if best is None or idx > best:
+            best = idx
+    if best is None:
+        return None, ""
+    return best, os.path.join(root_dir, f"{best:03d}")
+
+
+def _snapshot_bicycle_params(snapshot_dir: str, refine_root: str = "") -> dict:
+    """Fitted bicycle params belonging to a snapshot, else the refine root's.
+
+    The snapshot's own sidecar is preferred because it reflects that iteration's
+    manual edits; the refine-root sidecar (written by a previous *completed* run)
+    is only a fallback. Returns ``{}`` when neither is readable or both are empty.
+    """
+    candidates = [os.path.join(snapshot_dir, "bicycle_params.json")]
+    if refine_root:
+        candidates.append(os.path.join(refine_root, "bicycle_params.json"))
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                tracks = (json.load(f) or {}).get("tracks", {}) or {}
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if tracks:
+            return copy.deepcopy(tracks)
+    return {}
+
+
 def _parse_track_selector(text: str) -> tuple[str, int]:
-    """Parse ``<class>_<id>`` selectors (class can include underscores)."""
+    """Parse ``<class>_<id>`` (or ``<class> <id>``) selectors."""
     token = text.strip()
-    cls, sep, raw_id = token.rpartition("_")
-    if not sep or not cls:
-        raise ValueError(f"Invalid selector '{text}'. Expected '<class>_<id>'.")
+    cls = ""
+    raw_id = ""
+    if "_" in token:
+        cls, _, raw_id = token.rpartition("_")
+    else:
+        parts = token.rsplit(None, 1)
+        if len(parts) == 2:
+            cls, raw_id = parts[0], parts[1]
+    if not cls or not raw_id:
+        raise ValueError(
+            f"Invalid selector '{text}'. Expected '<class>_<id>' (or '<class> <id>')."
+        )
     try:
         tid = int(raw_id)
     except ValueError as exc:
@@ -1733,18 +1982,63 @@ def _parse_track_selector(text: str) -> tuple[str, int]:
     return cls, tid
 
 
+def _resolve_track_id(
+    tracks: dict[int, dict[int, dict]],
+    cls: str,
+    shown_tid: int,
+) -> int:
+    """Resolve selector id to internal track key.
+
+    Fast path uses the track-map key directly. Fallback searches per-box
+    ``tracking_id`` so selectors match projected labels when key/box ids diverge.
+    """
+    # Prefer the id users see in projected labels (per-box tracking_id).
+    matches: list[int] = []
+    for key_tid, track in tracks.items():
+        has_visible_id = any(
+            int(box.get("tracking_id", -1)) == shown_tid for box in track.values()
+        )
+        if not has_visible_id:
+            continue
+        current_cls = _track_class(track)
+        if current_cls == cls:
+            matches.append(int(key_tid))
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        opts = ", ".join(f"{cls}_{tid}" for tid in sorted(matches)[:10])
+        raise ValueError(
+            f"Selector '{cls}_{shown_tid}' is ambiguous (matches multiple tracks: {opts})."
+        )
+
+    # Backward-compatible fallback: allow selecting by track-map key.
+    if shown_tid in tracks:
+        return shown_tid
+
+    # Helpful not-found context: show a small class-filtered sample.
+    class_ids = sorted(
+        tid for tid, tr in tracks.items() if _track_class(tr) == cls
+    )
+    sample = ", ".join(str(t) for t in class_ids[:15])
+    suffix = "..." if len(class_ids) > 15 else ""
+    raise ValueError(
+        f"Track id {shown_tid} not found for class '{cls}'. "
+        f"Available {cls} ids: [{sample}{suffix}]"
+    )
+
+
 def _validate_selector(
     tracks: dict[int, dict[int, dict]],
     selector: str,
 ) -> tuple[int, str]:
     """Resolve selector to (track_id, current_track_class), validating class."""
-    cls, tid = _parse_track_selector(selector)
-    if tid not in tracks:
-        raise ValueError(f"Track id {tid} not found.")
+    cls, shown_tid = _parse_track_selector(selector)
+    tid = _resolve_track_id(tracks, cls, shown_tid)
     current = _track_class(tracks[tid])
     if cls != current:
         raise ValueError(
-            f"Selector class mismatch for id {tid}: got '{cls}', current is '{current}'."
+            f"Selector class mismatch for id {shown_tid}: got '{cls}', current is '{current}'."
         )
     return tid, current
 
@@ -1859,7 +2153,7 @@ def _extend_single_track_stopped(
             if f >= n_keys or f in track:
                 break
             token = frame_keys[f]
-            track[f] = _extrap_box(base_box, base_t, token)
+            track[f] = _extrap_box(base_box, base_t, token, zero_velocity=True)
             n_ext += 1
         return n_ext
 
@@ -1871,9 +2165,60 @@ def _extend_single_track_stopped(
         if f < 0 or f in track:
             break
         token = frame_keys[f]
-        track[f] = _extrap_box(base_box, base_t, token)
+        track[f] = _extrap_box(base_box, base_t, token, zero_velocity=True)
         n_ext += 1
     return n_ext
+
+
+def _append_stop_to_params(entry: dict, n_add: int, at_end: bool) -> None:
+    """Extend the persisted model with ``n_add`` stopped (v=0) frames.
+
+    Forward: decelerate to rest on the first appended step, then hold. Backward:
+    re-anchor the model at rest at the start position (car parked before start).
+    Any baked ``states_traj`` is extended in lockstep with held-position, zero-
+    speed rows, matching the stopped boxes ``_extend_single_track_stopped``
+    writes, so the two representations stay the same length and agree.
+    """
+    if n_add <= 0:
+        return
+    baked = entry.get("states_traj")
+    if baked:
+        rows = [[float(c) for c in r] for r in baked]
+
+        def _at_rest(row: list[float]) -> list[float]:
+            held = list(row)
+            if len(held) > STATE_V:  # tolerate the legacy 3-column [x, z, theta]
+                held[STATE_V] = 0.0
+            return held
+
+        if at_end:
+            entry["states_traj"] = rows + [_at_rest(rows[-1]) for _ in range(n_add)]
+        else:
+            entry["states_traj"] = [_at_rest(rows[0]) for _ in range(n_add)] + rows
+    dt = float(entry["dt"])
+    wheelbase = float(entry["wheelbase"])
+    lr_ratio = float(entry["lr_ratio"])
+    accel = [float(a) for a in entry["accel"]]
+    steer = [float(s) for s in entry["steer"]]
+    if at_end:
+        states = _bicycle_rollout(
+            np.asarray(entry["state0"], dtype=np.float64),
+            np.asarray(accel, dtype=np.float64),
+            np.asarray(steer, dtype=np.float64),
+            dt, wheelbase, lr_ratio,
+        )
+        v_end = float(states[-1, STATE_V])
+        entry["accel"] = accel + [(-v_end / dt) if dt else 0.0] + [0.0] * (n_add - 1)
+        entry["steer"] = steer + [0.0] * n_add
+        entry["n_steps"] = int(entry["n_steps"]) + n_add
+    else:
+        s0 = [float(v) for v in entry["state0"]]
+        v_first = s0[STATE_V]
+        entry["state0"] = [s0[0], s0[1], s0[2], 0.0]
+        entry["accel"] = [0.0] * (n_add - 1) + [(v_first / dt) if dt else 0.0] + accel
+        entry["steer"] = [0.0] * n_add + steer
+        entry["n_steps"] = int(entry["n_steps"]) + n_add
+        entry["first_frame"] = int(entry["first_frame"]) - n_add
 
 
 def _remove_track_frames(track: dict[int, dict], frame_range: tuple[int, int]) -> int:
@@ -1898,21 +2243,95 @@ def _should_bike_fit(track: dict[int, dict], bicycle_cfg: dict) -> bool:
     return _track_class(track) in classes and len(track) >= max(min_frames, 2)
 
 
+def _load_pristine_tracks(refine_output_dir: str) -> dict[int, dict[int, dict]]:
+    """Pre-fit (unfitted) tracks from the newest ``user_refinement`` snapshot.
+
+    These are the boxes as they stood *before* :func:`apply_bicycle_fit` — after
+    fusion/filtering, but still the tracker's own detections. They are the
+    observations a re-fit must be run against: the fit overwrites box
+    translations in place, so by the time the post-fit loop is running, the
+    tracks hold the model's own output and re-fitting them would just fit the
+    model to itself.
+
+    Returns ``{}`` when no pre-fit snapshot is available (the caller then falls
+    back to the current boxes and warns).
+    """
+    if not refine_output_dir:
+        return {}
+    _, snap_dir = _latest_user_snapshot(os.path.join(refine_output_dir, "user_refinement"))
+    if not snap_dir:
+        return {}
+    snap_json = os.path.join(snap_dir, "track_3d_refined_colmap.json")
+    try:
+        with open(snap_json, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"⚠️ Could not read pre-fit observations from {snap_json}: {exc}")
+        return {}
+    return build_tracks(data.get("results", data))
+
+
+def _observation_track(
+    tid: int,
+    track: dict[int, dict],
+    pristine: dict[int, dict[int, dict]] | None,
+) -> tuple[dict[int, dict], bool]:
+    """Observations to re-fit ``tid`` against: pre-fit boxes at surviving frames.
+
+    Restricting the pre-fit boxes to the frames still present in the edited
+    track is what makes ``Remove`` meaningful — the dropped frames stop being
+    observations instead of merely being deleted from an already-baked
+    trajectory. Frames added by ``Extend`` are synthetic and have no pre-fit
+    counterpart, so they simply contribute no observation.
+
+    Returns ``(observations, used_pristine)``. Falls back to the track's current
+    boxes when no usable pre-fit data exists, in which case ``used_pristine`` is
+    ``False`` and the fit is only cosmetic.
+    """
+    src = (pristine or {}).get(int(tid))
+    if src:
+        obs = {f: box for f, box in src.items() if f in track}
+        if len(obs) >= 2:
+            return obs, True
+    return track, False
+
+
 def _refit_track_bicycle(
     tid: int,
     track: dict[int, dict],
     frame_keys: list[str],
     bicycle_cfg: dict,
     bicycle_params: dict,
+    pristine: dict[int, dict[int, dict]] | None = None,
 ) -> None:
     """Re-fit one vehicle track's bicycle model in place and refresh its params.
 
-    Re-runs :func:`apply_bicycle_fit` on the single track so its dense per-frame
-    poses and persisted parameters stay mutually consistent after a structural
-    edit (fuse / model extend). Updates ``bicycle_params[str(tid)]`` in place,
-    dropping the entry if the fit no longer applies.
+    Re-runs :func:`apply_bicycle_fit` so the track's dense per-frame poses and
+    persisted parameters stay mutually consistent after a structural edit (fuse /
+    remove). The fit is run against the PRE-FIT observations (see
+    :func:`_observation_track`) rather than the track's current boxes, which are
+    themselves a previous fit's output; the resulting poses are then baked onto
+    the live track. Updates ``bicycle_params[str(tid)]`` in place, dropping the
+    entry if the fit no longer applies.
     """
-    _, rep = apply_bicycle_fit({tid: track}, frame_keys, bicycle_cfg)
+    obs, used_pristine = _observation_track(tid, track, pristine)
+    if not used_pristine:
+        print(
+            f"⚠️ No pre-fit observations for track {tid}; re-fitting against the "
+            "already-fitted boxes (result is cosmetic, not a true re-fit)."
+        )
+        _, rep = apply_bicycle_fit({tid: track}, frame_keys, bicycle_cfg)
+    else:
+        # Fit a private copy of the observations so apply_bicycle_fit's in-place
+        # bake does not touch the pre-fit snapshot, then transfer the fitted
+        # poses onto the live track. Only frames the live track still has are
+        # written; the fit's own gap-filling cannot resurrect removed frames.
+        fit_track_boxes = copy.deepcopy(obs)
+        _, rep = apply_bicycle_fit({tid: fit_track_boxes}, frame_keys, bicycle_cfg)
+        for f, fitted in fit_track_boxes.items():
+            if f in track:
+                track[f]["translation"] = list(fitted["translation"])
+                track[f]["rotation"] = list(fitted["rotation"])
     entry = rep.get("params", {}).get(str(tid))
     if entry is not None:
         bicycle_params[str(tid)] = entry
@@ -1946,6 +2365,19 @@ def _extend_single_track_bicycle(
     accel = np.asarray(params_entry["accel"], dtype=np.float64)
     steer = np.asarray(params_entry["steer"], dtype=np.float64)
     states = _bicycle_rollout(state0, accel, steer, dt, wheelbase, lr_ratio)
+
+    # Under the "states" bake the visible track ends at the fitted state, not at
+    # the controls' rollout (the two differ whenever the polish is off), so the
+    # extension has to continue from the baked endpoint or it starts with a jump.
+    # When present, the baked states are also extended in lockstep below so they
+    # keep covering the whole (now longer) span.
+    baked = None
+    raw_baked = params_entry.get("states_traj")
+    if raw_baked:
+        cand = np.asarray(raw_baked, dtype=np.float64)
+        if cand.ndim == 2 and cand.shape == (states.shape[0], STATE_DIM):
+            baked = cand
+            states = cand
 
     n_keys = len(frame_keys)
     ax0, ax1 = GROUND_AXES
@@ -1989,6 +2421,15 @@ def _extend_single_track_bicycle(
         base_box = track[last]
         for k in range(1, n_add + 1):
             _write_box(last + k, ext[k], base_box)
+        # Extend the persisted model over the appended frames with the same
+        # (zero-accel, held-steer) controls, so params match without a re-fit.
+        params_entry["accel"] = [float(a) for a in accel] + [0.0] * n_add
+        params_entry["steer"] = [float(s) for s in steer] + [last_steer] * n_add
+        params_entry["n_steps"] = int(params_entry.get("n_steps", accel.shape[0])) + n_add
+        if baked is not None:
+            params_entry["states_traj"] = _states_traj_rows(
+                np.vstack([baked, ext[1:]])
+            )
         return n_add
 
     first = frames[0]
@@ -2014,6 +2455,19 @@ def _extend_single_track_bicycle(
     base_box = track[first]
     for k in range(1, n_add + 1):
         _write_box(first - k, back[k], base_box)
+    # Re-anchor the model to the new first frame (same held-steer arc), so the
+    # params cover the prepended frames without a re-fit.
+    params_entry["state0"] = [float(v) for v in back[n_add]]
+    params_entry["accel"] = [0.0] * n_add + [float(a) for a in accel]
+    params_entry["steer"] = [first_steer] * n_add + [float(s) for s in steer]
+    params_entry["n_steps"] = int(params_entry.get("n_steps", accel.shape[0])) + n_add
+    params_entry["first_frame"] = int(params_entry.get("first_frame", first)) - n_add
+    if baked is not None:
+        # ``back`` is indexed backwards in time (``back[k]`` is frame first - k),
+        # so reverse it to prepend in chronological order.
+        params_entry["states_traj"] = _states_traj_rows(
+            np.vstack([back[n_add:0:-1], baked])
+        )
     return n_add
 
 
@@ -2028,6 +2482,7 @@ def _apply_user_command(
     bicycle_cfg: dict | None = None,
     refit_bicycle: bool = True,
     frame_mapping: dict[str, int] | None = None,
+    pristine: dict[int, dict[int, dict]] | None = None,
 ) -> str:
     """Apply one interactive user-refinement command in place.
 
@@ -2039,6 +2494,10 @@ def _apply_user_command(
     ``refit_bicycle`` gates the expensive per-track bicycle re-fit. During
     staging (dry-run preview) it is ``False`` so typing a command does not run
     the fit; the fit runs once when the batch is applied.
+
+    ``pristine`` holds the pre-fit (unfitted) tracks that re-fits use as their
+    observations; it is kept in step with ``tracks`` here, so a fuse unions the
+    merged tracks' observations under the canonical id.
     """
     bicycle_cfg = bicycle_cfg or {}
     bike_enabled = (
@@ -2052,6 +2511,8 @@ def _apply_user_command(
         del tracks[tid]
         if bicycle_params is not None:
             bicycle_params.pop(str(tid), None)
+        if pristine is not None:
+            pristine.pop(tid, None)
         return f"🗑️ Staged filter for {cls}_{tid}."
 
     if cmd == "fuse":
@@ -2060,6 +2521,19 @@ def _apply_user_command(
             raise ValueError("Fuse expects at least two selectors.")
         pre_ids = [_validate_selector(tracks, s)[0] for s in specs]
         canonical, removed = _manual_fuse_tracks(tracks, specs)
+        # Union the merged tracks' pre-fit observations under the canonical id,
+        # so the re-fit below sees every real detection of the fused object
+        # rather than only the surviving id's. Frames already held by the
+        # canonical track win, matching _manual_fuse_tracks' own precedence.
+        if pristine is not None:
+            merged_obs = dict(pristine.get(canonical, {}))
+            for tid in set(pre_ids):
+                if tid == canonical:
+                    continue
+                for f, box in (pristine.pop(tid, {}) or {}).items():
+                    merged_obs.setdefault(f, box)
+            if merged_obs:
+                pristine[canonical] = merged_obs
         refit_note = ""
         if bike_enabled:
             for tid in set(pre_ids):
@@ -2068,9 +2542,12 @@ def _apply_user_command(
             if _should_bike_fit(tracks[canonical], bicycle_cfg):
                 if refit_bicycle:
                     _refit_track_bicycle(
-                        canonical, tracks[canonical], frame_keys, bicycle_cfg, bicycle_params
+                        canonical, tracks[canonical], frame_keys, bicycle_cfg,
+                        bicycle_params, pristine,
                     )
-                refit_note = " (re-fit bicycle model)"
+                    refit_note = " (re-fit bicycle model)"
+                else:
+                    refit_note = " (bicycle re-fit on apply)"
             else:
                 bicycle_params.pop(str(canonical), None)
         return f"🔗 Staged fuse into id {canonical}; removed {removed} tracks{refit_note}."
@@ -2089,16 +2566,14 @@ def _apply_user_command(
         last_before = frames_before[-1] if frames_before else -1
         use_model = bike_enabled and str(tid) in bicycle_params
         if use_model:
+            # Artificial frames from the model rollout; the params are extended
+            # in place (no re-fit — these frames are synthesized, not observed).
             added = _extend_single_track_bicycle(
                 track=tracks[tid],
                 params_entry=bicycle_params[str(tid)],
                 frame_keys=frame_keys,
                 amount=amount,
             )
-            if added > 0 and refit_bicycle and _should_bike_fit(tracks[tid], bicycle_cfg):
-                _refit_track_bicycle(
-                    tid, tracks[tid], frame_keys, bicycle_cfg, bicycle_params
-                )
         else:
             added = _extend_single_track(
                 track=tracks[tid],
@@ -2139,6 +2614,10 @@ def _apply_user_command(
             frame_keys=frame_keys,
             amount=amount,
         )
+        # Reflect the stop (velocity 0 over the added frames) in the persisted
+        # model so the simulator also stops the car; no re-fit needed.
+        if bike_enabled and added > 0 and str(tid) in bicycle_params:
+            _append_stop_to_params(bicycle_params[str(tid)], added, at_end=(amount > 0))
         if added == 0:
             if amount > 0 and last_before >= (len(frame_keys) - 1):
                 return (
@@ -2201,11 +2680,51 @@ def _apply_user_command(
         
         if not tracks[tid]:
             del tracks[tid]
+            if bicycle_params is not None:
+                bicycle_params.pop(str(tid), None)
             return (
                 f"✂️ Staged remove for {cls}_{tid} frames {user_start}-{user_end}; removed {removed} frames "
                 "(track became empty and was deleted)."
             )
-        return f"✂️ Staged remove for {cls}_{tid} frames {user_start}-{user_end}; removed {removed} frames."
+
+        # Re-fit the surviving frames so the model reflects the removal (the goal
+        # of remove is to drop bad detections). Deferred to 'apply' like fuse.
+        refit_note = ""
+        if bike_enabled and str(tid) in bicycle_params:
+            if _should_bike_fit(tracks[tid], bicycle_cfg):
+                if refit_bicycle:
+                    _refit_track_bicycle(
+                        tid, tracks[tid], frame_keys, bicycle_cfg,
+                        bicycle_params, pristine,
+                    )
+                    # Guard against re-fit regenerating interior holes: keep
+                    # explicit user removals authoritative.
+                    reintroduced = 0
+                    for frame_idx in frame_indices_to_remove:
+                        if frame_idx in tracks[tid]:
+                            del tracks[tid][frame_idx]
+                            reintroduced += 1
+                    if not tracks[tid]:
+                        del tracks[tid]
+                        bicycle_params.pop(str(tid), None)
+                        return (
+                            f"✂️ Staged remove for {cls}_{tid} frames {user_start}-{user_end}; removed {removed} frames "
+                            "(re-fit regenerated removed frames; removals enforced and track became empty)."
+                        )
+                    if reintroduced > 0:
+                        # Model controls now disagree with explicit holes.
+                        bicycle_params.pop(str(tid), None)
+                        refit_note = (
+                            f" (re-fit regenerated {reintroduced} removed frames; "
+                            "removals enforced, bicycle params dropped)"
+                        )
+                    else:
+                        refit_note = " (re-fit bicycle model; state0 refreshed)"
+                else:
+                    refit_note = " (bicycle re-fit on apply)"
+            else:
+                bicycle_params.pop(str(tid), None)
+        return f"✂️ Staged remove for {cls}_{tid} frames {user_start}-{user_end}; removed {removed} frames{refit_note}."
 
     raise ValueError(
         "Unknown command. Use Filter/Fuse/Extend/Extend_stopped/Remove/apply/undo/done."
@@ -2222,10 +2741,16 @@ def _replay_pending_commands(
     bicycle_cfg: dict,
     refit_bicycle: bool = True,
     frame_mapping: dict[str, int] | None = None,
-) -> tuple[dict[int, dict[int, dict]], dict, list[str]]:
-    """Return preview tracks/params/messages after replaying staged commands."""
+    pristine: dict[int, dict[int, dict]] | None = None,
+) -> tuple[dict[int, dict[int, dict]], dict, list[str], dict | None]:
+    """Return preview tracks/params/messages after replaying staged commands.
+
+    ``pristine`` is replayed on a copy too, so a staged (not yet applied) fuse
+    cannot mutate the real observation map.
+    """
     preview = copy.deepcopy(tracks)
     preview_params = copy.deepcopy(params)
+    preview_pristine = copy.deepcopy(pristine) if pristine is not None else None
     messages: list[str] = []
     for raw in pending_commands:
         raw_clean = raw.strip().rstrip(";").strip()
@@ -2249,9 +2774,10 @@ def _replay_pending_commands(
                 bicycle_cfg,
                 refit_bicycle=refit_bicycle,
                 frame_mapping=frame_mapping,
+                pristine=preview_pristine,
             )
         )
-    return preview, preview_params, messages
+    return preview, preview_params, messages, preview_pristine
 
 
 def _run_user_refinement_loop(
@@ -2265,6 +2791,7 @@ def _run_user_refinement_loop(
     bicycle_params: dict | None = None,
     bicycle_cfg: dict | None = None,
     allow_refit_bicycle: bool = False,
+    refine_output_dir: str = "",
 ) -> tuple[dict, dict, dict]:
     """Interactive post-refinement loop with undo and numbered snapshots.
 
@@ -2272,6 +2799,11 @@ def _run_user_refinement_loop(
     the persisted bicycle-model parameters consistent: filtering drops a track's
     params, fusing re-fits the merged vehicle track, and extending a fitted
     vehicle track rolls the model forward/backward.
+
+    ``refine_output_dir`` is the refine root, used to locate the pre-fit
+    observations that bicycle re-fits are run against (see
+    :func:`_load_pristine_tracks`). Only meaningful for the post-fit loop, where
+    the tracks already hold fitted poses.
     """
     user_cfg = cfg.get("user_refinement", {}) or {}
     bicycle_cfg = dict(bicycle_cfg or {})
@@ -2284,7 +2816,19 @@ def _run_user_refinement_loop(
             "commands_applied": 0,
         }, params
 
-    history: list[tuple[dict[int, dict[int, dict]], dict]] = []
+    # Pre-fit observations for bicycle re-fits. Empty in the pre-fit loop (the
+    # tracks there ARE the observations) and whenever no pre-fit snapshot exists,
+    # in which case _refit_track_bicycle warns and falls back to current boxes.
+    pristine: dict[int, dict[int, dict]] = (
+        _load_pristine_tracks(refine_output_dir) if allow_refit_bicycle else {}
+    )
+    if allow_refit_bicycle:
+        if pristine:
+            print(f"📌 Loaded pre-fit observations for {len(pristine)} tracks (re-fit source).")
+        else:
+            print("⚠️ No pre-fit observations found; bicycle re-fits will use fitted boxes.")
+
+    history: list[tuple[dict[int, dict[int, dict]], dict, dict]] = []
     commands: list[str] = []
     applied_batch_sizes: list[int] = []
     pending_commands: list[str] = []
@@ -2292,6 +2836,10 @@ def _run_user_refinement_loop(
     vel_window = int(user_cfg.get("extend_velocity_window", cfg.get("extend_velocity_window", 3)))
     default_extend = int(user_cfg.get("default_extend", 5))
     project_cfg = cfg.get("project", {}) or {}
+    debug_variants = bool((cfg.get("bicycle_fit", {}) or {}).get("debug_bake_variants", False))
+    bake_source = str(
+        (cfg.get("bicycle_fit", {}) or {}).get("bake_source", "rollout")
+    ).strip().lower()
 
     root_dir = output_dir
     #root_dir = os.path.join(output_dir, str(user_cfg.get("output_dir", "user_refinement_what?")))
@@ -2312,10 +2860,10 @@ def _run_user_refinement_loop(
     # discarding those manual edits and restarting from the automatic base.
     resume = bool(user_cfg.get("resume_from_latest", True))
     resumed_from: int | None = None
-    if resume and existing_iters:
-        latest = max(existing_iters)
-        snap_json = os.path.join(root_dir, f"{latest:03d}", "track_3d_refined_colmap.json")
-        if os.path.exists(snap_json):
+    if resume:
+        latest, snap_dir = _latest_user_snapshot(root_dir)
+        if latest is not None:
+            snap_json = os.path.join(snap_dir, "track_3d_refined_colmap.json")
             try:
                 with open(snap_json, encoding="utf-8") as f:
                     snap_data = json.load(f)
@@ -2323,14 +2871,15 @@ def _run_user_refinement_loop(
                 tracks = build_tracks(copy.deepcopy(resumed_results))
                 resumed_from = latest
                 # Prefer the previous session's persisted bicycle params (they
-                # reflect its manual edits) over this run's fresh auto fit.
-                sidecar_path = os.path.join(output_dir, "bicycle_params.json")
-                if os.path.exists(sidecar_path):
-                    with open(sidecar_path, encoding="utf-8") as f:
-                        sidecar = json.load(f)
-                    saved_params = sidecar.get("tracks", {}) or {}
-                    if saved_params:
-                        params = copy.deepcopy(saved_params)
+                # reflect its manual edits) over this run's fresh auto fit. This
+                # restore is load-bearing: ``refine`` may have skipped the
+                # (expensive) fit precisely because this snapshot exists, in
+                # which case these are the ONLY params there are.
+                saved_params = _snapshot_bicycle_params(
+                    snap_dir, os.path.dirname(root_dir)
+                )
+                if saved_params:
+                    params = saved_params
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 print(f"⚠️ Could not resume from {snap_json}: {exc}. Starting fresh.")
                 resumed_from = None
@@ -2352,6 +2901,8 @@ def _run_user_refinement_loop(
         project_cfg=project_cfg,
         bicycle_params=params,
         bicycle_alpha=bike_alpha,
+        debug_variants=debug_variants,
+        bake_source=bake_source,
     )
 
     print("\n🧭 Interactive user refinement enabled.")
@@ -2402,7 +2953,7 @@ def _run_user_refinement_loop(
                 if not history:
                     print("⚠️ Nothing to undo.")
                     continue
-                tracks, params = history.pop()
+                tracks, params, pristine = history.pop()
                 if applied_batch_sizes:
                     n_drop = applied_batch_sizes.pop()
                     if n_drop > 0:
@@ -2420,6 +2971,8 @@ def _run_user_refinement_loop(
                     project_cfg=project_cfg,
                     bicycle_params=params,
                     bicycle_alpha=bike_alpha,
+                    debug_variants=debug_variants,
+                    bake_source=bake_source,
                 )
                 command_log_lines.append(f"iter {iter_idx:03d} | undo")
                 print(f"↩️ Undo applied. Snapshot: {out_dir}")
@@ -2429,7 +2982,7 @@ def _run_user_refinement_loop(
                 if not pending_commands:
                     print("⚠️ No staged commands to apply.")
                     continue
-                preview_tracks, preview_params, _ = _replay_pending_commands(
+                preview_tracks, preview_params, _, preview_pristine = _replay_pending_commands(
                     tracks,
                     params,
                     pending_commands,
@@ -2439,10 +2992,15 @@ def _run_user_refinement_loop(
                     bicycle_cfg,
                     frame_mapping=frame_mapping,
                     refit_bicycle=allow_refit_bicycle,
+                    pristine=pristine,
                 )
-                history.append((copy.deepcopy(tracks), copy.deepcopy(params)))
+                history.append(
+                    (copy.deepcopy(tracks), copy.deepcopy(params), copy.deepcopy(pristine))
+                )
                 tracks = preview_tracks
                 params = preview_params
+                if preview_pristine is not None:
+                    pristine = preview_pristine
                 commands.extend(pending_commands)
                 applied_batch = list(pending_commands)
                 applied_batch_sizes.append(len(applied_batch))
@@ -2460,6 +3018,8 @@ def _run_user_refinement_loop(
                     project_cfg=project_cfg,
                     bicycle_params=params,
                     bicycle_alpha=bike_alpha,
+                    debug_variants=debug_variants,
+                    bake_source=bake_source,
                 )
                 command_log_lines.append(
                     f"iter {iter_idx:03d} | apply | " + " ; ".join(applied_batch)
@@ -2472,7 +3032,9 @@ def _run_user_refinement_loop(
                     "Unknown command. Use Filter/Fuse/Extend/Extend_stopped/Remove/apply/undo/done."
                 )
 
-            preview_tracks, preview_params, _ = _replay_pending_commands(
+            # Stage a lightweight structural preview only; the (expensive)
+            # bicycle re-fit is deferred to the 'apply' command.
+            preview_tracks, preview_params, _, preview_pristine = _replay_pending_commands(
                 tracks,
                 params,
                 pending_commands,
@@ -2480,8 +3042,9 @@ def _run_user_refinement_loop(
                 vel_window,
                 frame_keys,
                 bicycle_cfg,
-                refit_bicycle=allow_refit_bicycle,
+                refit_bicycle=False,
                 frame_mapping=frame_mapping,
+                pristine=pristine,
             )
             stage_msg = _apply_user_command(
                 preview_tracks,
@@ -2492,8 +3055,9 @@ def _run_user_refinement_loop(
                 frame_keys,
                 preview_params,
                 bicycle_cfg,
-                refit_bicycle=allow_refit_bicycle,
+                refit_bicycle=False,
                 frame_mapping=frame_mapping,
+                pristine=preview_pristine,
             )
             pending_commands.append(raw)
             print(stage_msg)
@@ -2668,9 +3232,41 @@ def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") 
         min_rel_displacement=float(cfg.get("min_rel_displacement", 0.0)),
     )
 
+    # Resume shortcut. The bicycle fit is by far the most expensive stage, and a
+    # post-fit snapshot already contains its result (fitted boxes) plus the
+    # params that produced them. So when such a snapshot exists and resuming is
+    # on, skip BOTH the pre-fit interactive loop and the fit itself, and go
+    # straight to the post-fit loop, which resumes from that snapshot.
+    #
+    # Requires usable params in the snapshot: without them the resumed tracks
+    # would have no model, ``fit_ids`` would be empty, and the legacy
+    # fill/smooth path below would re-smooth the very tracks being resumed. In
+    # that case fall through and re-run the fit instead.
+    user_cfg = cfg.get("user_refinement", {}) or {}
+    user_enabled = bool(user_cfg.get("enabled", False)) and bool(output_dir)
+    post_enabled = user_enabled and bool(user_cfg.get("post_bicycle_fit", False))
+    resume_params: dict = {}
+    resume_post = False
+    if post_enabled and bool(user_cfg.get("resume_from_latest", True)):
+        post_dir_probe = os.path.join(output_dir, "user_refinement_post_bicycle")
+        snap_idx, snap_dir = _latest_user_snapshot(post_dir_probe)
+        if snap_idx is not None:
+            resume_params = _snapshot_bicycle_params(snap_dir, output_dir)
+            if resume_params:
+                resume_post = True
+                print(
+                    f"⏩ Resuming from post-fit snapshot {snap_idx:03d} "
+                    f"({len(resume_params)} fitted tracks); skipping the bicycle fit."
+                )
+            else:
+                print(
+                    f"⚠️ Post-fit snapshot {snap_idx:03d} has no bicycle params; "
+                    "re-running the fit."
+                )
+
     # Optional interactive user edits before bicycle fitting to remove outliers.
     refined_kept = kept
-    if bool(cfg.get("user_refinement", {}).get("enabled", False)) and output_dir:
+    if not resume_post and user_enabled:
         cameras = list(cfg.get("project", {}).get("cameras", []) or [])
         bicycle_cfg_user = cfg.get("bicycle_fit", {}) or {}
         user_refinement_dir = os.path.join(output_dir, "user_refinement")
@@ -2697,7 +3293,25 @@ def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") 
     bicycle_enabled = bool(bicycle_cfg.get("enabled", False))
     bicycle_report: dict = {}
     fit_ids: set[int] = set()
-    if bicycle_enabled:
+    # Always defined, so the post-fit loop below can be reached even when the fit
+    # is disabled or skipped.
+    params: dict = {}
+    if resume_post:
+        # The snapshot's boxes are already fitted and its params are the model
+        # that produced them, so ``fit_ids`` comes from the params rather than
+        # from a fresh selection — that is what keeps the legacy fill/smooth path
+        # off these tracks.
+        params = resume_params
+        fit_ids = {int(tid) for tid in params}
+        bicycle_report = {
+            "tracks_fitted": len(params),
+            "frames_filled": 0,
+            "tracks": {},
+            "params": params,
+            "rejected_ids": [],
+            "resumed_from_post_snapshot": True,
+        }
+    elif bicycle_enabled:
         fit_ids = set(select_bicycle_track_ids(kept, bicycle_cfg))
         fit_kept = {tid: kept[tid] for tid in fit_ids}
         _, bicycle_report = apply_bicycle_fit(fit_kept, frame_keys, bicycle_cfg)
@@ -2709,7 +3323,7 @@ def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") 
 
     # Optional interactive user edits after bicycle fitting to refine kinematic results.
     refined_kept = kept
-    if bool(cfg.get("user_refinement", {}).get("enabled", False)) and bool(cfg.get("user_refinement", {}).get("post_bicycle_fit", False)) and output_dir:
+    if post_enabled:
         cameras = list(cfg.get("project", {}).get("cameras", []) or [])
         bicycle_cfg_user = cfg.get("bicycle_fit", {}) or {}
         user_refinement_post_dir = os.path.join(output_dir, "user_refinement_post_bicycle")
@@ -2724,6 +3338,7 @@ def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") 
             bicycle_params=params,
             bicycle_cfg=bicycle_cfg_user,
             allow_refit_bicycle=True,
+            refine_output_dir=output_dir,
         )
         refined_kept = build_tracks(refined_kept_results)
         kept = refined_kept
@@ -2731,8 +3346,9 @@ def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") 
         # The post-fit interactive loop may re-fit / drop / add per-track models;
         # its returned params are the authoritative final set that main() persists
         # to the refine-root bicycle_params.json sidecar.
-        if bicycle_enabled:
+        if bicycle_enabled or resume_post:
             bicycle_report["params"] = final_params
+            bicycle_report["tracks_fitted"] = len(final_params)
 
     # Legacy heuristic path, applied only to tracks NOT handled by the fit.
     legacy_kept = {tid: t for tid, t in kept.items() if tid not in fit_ids}
@@ -2893,9 +3509,46 @@ def main(cfg: DictConfig) -> None:
     # symlink the refine-root projection to that latest iteration instead of
     # re-rendering every frame. Otherwise render fresh (user_refinement disabled,
     # or height-plane-fit reprojected the poses).
-    root_projected = os.path.join(output_dir, "projected")
+    bike_cfg = cfg.refine_task.get("bicycle_fit", {}) or {}
+    root_bake_source = str(bike_cfg.get("bake_source", "rollout")).strip().lower()
+
+    # Root promotion: when the interactive loop wrote the two bake variants, the
+    # refine-root files become a verbatim copy of the ``bake_source``-selected
+    # one. That makes the root exactly the variant that was compared — a single
+    # producer, so the root and the variant dirs cannot drift apart. Skipped when
+    # a height-plane fit ran afterwards (it moved the poses, leaving the variant
+    # snapshots stale) or when no variants were written (user_refinement or
+    # debug_bake_variants off); the root is then produced directly, below.
     latest_dir = report.get("user_refinement_latest_dir")
-    latest_projected = os.path.join(latest_dir, "projected") if latest_dir else ""
+    promote_dir = ""
+    if latest_dir and not height_fit_report:
+        candidate = os.path.join(latest_dir, root_bake_source)
+        if all(
+            os.path.exists(os.path.join(candidate, name))
+            for name in (
+                "track_3d_refined_colmap.json",
+                "bicycle_params.json",
+                "projected",
+            )
+        ):
+            promote_dir = candidate
+    report["bake_source"] = root_bake_source
+    report["root_promoted_from"] = promote_dir
+    if promote_dir:
+        print(
+            f"⬆️ Promoting '{root_bake_source}' bake variant to refine root: "
+            f"{os.path.relpath(promote_dir, start=output_dir)}"
+        )
+    else:
+        print(f"🧊 Refine root written directly (bake_source={root_bake_source})")
+
+    root_projected = os.path.join(output_dir, "projected")
+    # Prefer the promoted variant's projection so the root render matches the
+    # root boxes; otherwise fall back to the iteration's own projection.
+    proj_source_dir = promote_dir or (latest_dir or "")
+    latest_projected = (
+        os.path.join(proj_source_dir, "projected") if proj_source_dir else ""
+    )
     if latest_projected and os.path.isdir(latest_projected) and not height_fit_report:
         if os.path.islink(root_projected) or os.path.isfile(root_projected):
             os.unlink(root_projected)
@@ -2903,7 +3556,7 @@ def main(cfg: DictConfig) -> None:
             shutil.rmtree(root_projected)
         rel_target = os.path.relpath(latest_projected, start=output_dir)
         os.symlink(rel_target, root_projected, target_is_directory=True)
-        it_proj_report = os.path.join(latest_dir, "project_report.json")
+        it_proj_report = os.path.join(proj_source_dir, "project_report.json")
         if os.path.isfile(it_proj_report):
             with open(it_proj_report, encoding="utf-8") as f:
                 report["projection"] = json.load(f)
@@ -2920,11 +3573,16 @@ def main(cfg: DictConfig) -> None:
         )
         report["projection"] = proj_report
 
-    out = dict(data)
-    out["results"] = refined_results
     out_json = os.path.join(output_dir, "track_3d_refined_colmap.json")
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(out, f)
+    if promote_dir:
+        shutil.copyfile(
+            os.path.join(promote_dir, "track_3d_refined_colmap.json"), out_json
+        )
+    else:
+        out = dict(data)
+        out["results"] = refined_results
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(out, f)
 
     # Persist the fitted bicycle-model parameters to a sidecar so the simulator
     # can extrapolate trajectories on demand. Kept separate from the refined-box
@@ -2934,17 +3592,26 @@ def main(cfg: DictConfig) -> None:
     # edits / re-fits made during the interactive loop.
     n_bike = report.get("bicycle_fit", {}).get("tracks_fitted", 0)
     bike_params = report.get("bicycle_fit", {}).get("params", {}) or {}
-    if bike_params:
+    root_sidecar = os.path.join(output_dir, "bicycle_params.json")
+    if promote_dir:
+        # Promoted: take the variant's own sidecar verbatim, so the root pair
+        # (boxes + params) is exactly the pair that was rendered and compared.
+        shutil.copyfile(os.path.join(promote_dir, "bicycle_params.json"), root_sidecar)
+    elif bike_params:
+        # The sidecar always carries BOTH representations per track: the controls
+        # (state0/accel/steer, which the rollout is integrated from) and the
+        # fitted per-frame ``states_traj`` (the direct X,Z estimate). Which one
+        # the boxes in track_3d_refined_colmap.json were actually baked from is
+        # recorded in ``bake_source`` — and that field, NOT the mere presence of
+        # ``states_traj``, is what downstream must use to pick a trajectory, or
+        # the simulator would contradict the boxes 4DGS trained on.
         sidecar = {
             "frame_keys": frame_keys,
-            "wheelbase_alpha": float(
-                (cfg.refine_task.get("bicycle_fit", {}) or {}).get("wheelbase_alpha", 0.6)
-            ),
+            "bake_source": root_bake_source,
+            "wheelbase_alpha": float(bike_cfg.get("wheelbase_alpha", 0.6)),
             "tracks": bike_params,
         }
-        with open(
-            os.path.join(output_dir, "bicycle_params.json"), "w", encoding="utf-8"
-        ) as f:
+        with open(root_sidecar, "w", encoding="utf-8") as f:
             json.dump(sidecar, f)
 
     with open(os.path.join(output_dir, "refine_report.json"), "w", encoding="utf-8") as f:
