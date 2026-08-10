@@ -27,10 +27,11 @@ import numpy as np
 
 try:  # scipy is available in env_cc3dt (the refinement env).
     from scipy.optimize import least_squares
-    from scipy.sparse import lil_matrix
+    from scipy.sparse import coo_matrix, lil_matrix
 except Exception as exc:  # pragma: no cover - surfaced only if env is wrong
     least_squares = None
     lil_matrix = None
+    coo_matrix = None
     _SCIPY_IMPORT_ERROR = exc
 else:
     _SCIPY_IMPORT_ERROR = None
@@ -40,6 +41,8 @@ from src.tracking.bicycle_kinematics import (
     STATE_THETA,
     STATE_V,
     rollout,
+    rollout_segments,
+    rollout_sensitivity,
     slip_angle,
     wrap_angle,
 )
@@ -89,6 +92,13 @@ class BicycleFitConfig:
     # return the raw multiple-shooting states.
     polish_single_shooting: bool = True
     polish_max_nfev: int = 400
+    # Use the analytic Jacobian (exact derivatives of the same Euler step the
+    # residual integrates) instead of scipy's finite differences. The FD path
+    # costs one extra residual evaluation per Jacobian column group on every
+    # solver iteration; the analytic one costs roughly a single evaluation and
+    # is more accurate. Set False to fall back to finite differences (useful
+    # for A/B-ing fit quality).
+    analytic_jacobian: bool = True
 
 
 @dataclass
@@ -241,20 +251,7 @@ def _rollout_all_segments(
         defects: ``(n_interior_nodes, 4)`` mismatch between a segment's rolled
             end state and the next node's state.
     """
-    n_nodes = len(node_frames)
-    T = node_frames[-1] + 1
-    frame_states = np.empty((T, STATE_DIM), dtype=np.float64)
-    defects = np.empty((n_nodes - 1, STATE_DIM), dtype=np.float64)
-
-    for i in range(n_nodes - 1):
-        s, e = int(node_frames[i]), int(node_frames[i + 1])
-        seg = rollout(nodes[i], accel[s:e], steer[s:e], dt, wheelbase, lr_ratio)
-        # Interior frames [s, e) come from this segment; the boundary frame e is
-        # owned by the next node (written below / at loop end).
-        frame_states[s:e] = seg[:-1]
-        defects[i] = seg[-1] - nodes[i + 1]
-    frame_states[node_frames] = nodes  # node frames use their own state
-    return frame_states, defects
+    return rollout_segments(nodes, accel, steer, node_frames, dt, wheelbase, lr_ratio)
 
 
 def _make_residual_fn(
@@ -324,6 +321,141 @@ def _make_residual_fn(
         )
 
     return residuals, measurement_residuals, unpack
+
+
+def _make_jac_fn(
+    obs_frames: np.ndarray,
+    n_steps: int,
+    node_frames: np.ndarray,
+    dt: float,
+    wheelbase: float,
+    cfg: BicycleFitConfig,
+    yaw_w: np.ndarray,
+):
+    """Analytic Jacobian of the multiple-shooting residual vector.
+
+    Replaces the finite-difference Jacobian, which costs one extra residual
+    evaluation per Jacobian *column group* (tens of them) on every solver
+    iteration. Derivatives come from :func:`rollout_sensitivity`, the exact
+    derivative of the same Euler step the residual integrates, so the two cannot
+    drift apart.
+
+    Row layout matches ``residuals``: position (2 per obs, interleaved x/z), yaw
+    (1 per obs), defects (4 per interior node), then the control-smoothness and
+    magnitude priors. Columns are ``[nodes..., (accel, steer) * n_steps]``.
+
+    Within one segment every frame shares the same column set — the owning node
+    plus that segment's controls — because the sensitivity of a frame to controls
+    that come *after* it is structurally zero. Those zeros are stored explicitly,
+    which keeps the assembly rectangular and fully vectorized at a modest cost in
+    stored entries.
+    """
+    n_nodes = len(node_frames)
+    n_state = n_nodes * STATE_DIM
+    n_params = n_state + n_steps * 2
+    n_obs = len(obs_frames)
+    yaw_base = 2 * n_obs
+    defect_base = 3 * n_obs
+    smooth_base = defect_base + STATE_DIM * (n_nodes - 1)
+    n_res = smooth_base + 2 * (n_steps - 1) + 2 * n_steps
+
+    last_node_frame = int(node_frames[-1])
+    # Map each observation to its owning segment; the final node frame is owned
+    # by no segment (its state IS the last node), so it is flagged with -1.
+    seg_of_obs = np.empty(n_obs, dtype=np.int64)
+    for n, f in enumerate(obs_frames):
+        f = int(f)
+        if f == last_node_frame:
+            seg_of_obs[n] = -1
+        else:
+            seg_of_obs[n] = max(0, int(np.searchsorted(node_frames, f, side="right")) - 1)
+
+    # Constant blocks: control smoothness and magnitude priors.
+    c_rows, c_cols, c_data = [], [], []
+
+    def _accel_col(k):
+        return n_state + 2 * k
+
+    def _steer_col(k):
+        return n_state + 2 * k + 1
+
+    ks = np.arange(n_steps - 1)
+    for base, col_fn, lam in (
+        (smooth_base, _accel_col, cfg.lambda_accel),
+        (smooth_base + (n_steps - 1), _steer_col, cfg.lambda_steer),
+    ):
+        c_rows.append(base + ks); c_cols.append(col_fn(ks)); c_data.append(np.full(n_steps - 1, -lam))
+        c_rows.append(base + ks); c_cols.append(col_fn(ks + 1)); c_data.append(np.full(n_steps - 1, lam))
+    ka = np.arange(n_steps)
+    mag_base = smooth_base + 2 * (n_steps - 1)
+    for base, col_fn, lam in (
+        (mag_base, _accel_col, cfg.lambda_accel_mag),
+        (mag_base + n_steps, _steer_col, cfg.lambda_steer_mag),
+    ):
+        c_rows.append(base + ka); c_cols.append(col_fn(ka)); c_data.append(np.full(n_steps, lam))
+    const_rows = np.concatenate(c_rows); const_cols = np.concatenate(c_cols)
+    const_data = np.concatenate(c_data)
+
+    def jac(p: np.ndarray, w_pos: np.ndarray, w_yaw: np.ndarray):
+        nodes = p[:n_state].reshape(n_nodes, STATE_DIM)
+        ctrl = p[n_state:].reshape(n_steps, 2)
+        accel, steer = ctrl[:, 0], ctrl[:, 1]
+        sq_pos = np.sqrt(w_pos)
+        sq_yaw = np.sqrt(w_yaw) * yaw_w
+
+        rows, cols, data = [const_rows], [const_cols], [const_data]
+
+        for i in range(n_nodes - 1):
+            s, e = int(node_frames[i]), int(node_frames[i + 1])
+            L = e - s
+            sens = rollout_sensitivity(
+                nodes[i], accel[s:e], steer[s:e], dt, wheelbase, cfg.lr_ratio
+            )  # (L+1, 4, 4+2L)
+            seg_cols = np.concatenate([
+                np.arange(STATE_DIM * i, STATE_DIM * i + STATE_DIM),
+                n_state + 2 * s + np.arange(2 * L),
+            ])
+
+            sel = np.flatnonzero(seg_of_obs == i)
+            if sel.size:
+                m = obs_frames[sel] - s                       # local frame index
+                blk = sens[m]                                  # (M, 4, 4+2L)
+                px = blk[:, 0, :] * (sq_pos[sel] / cfg.pos_scale)[:, None]
+                pz = blk[:, 1, :] * (sq_pos[sel] / cfg.pos_scale)[:, None]
+                py = blk[:, 2, :] * (sq_yaw[sel] / cfg.yaw_scale)[:, None]
+                cc = np.broadcast_to(seg_cols, (sel.size, seg_cols.size))
+                for r_off, vals in ((0, px), (1, pz), (None, py)):
+                    r = (yaw_base + sel) if r_off is None else (2 * sel + r_off)
+                    rows.append(np.repeat(r, seg_cols.size))
+                    cols.append(cc.ravel())
+                    data.append(vals.ravel())
+
+            # Defect: rolled end state minus the next node.
+            d_rows = defect_base + STATE_DIM * i + np.arange(STATE_DIM)
+            end = sens[L] * cfg.defect_weight                  # (4, 4+2L)
+            rows.append(np.repeat(d_rows, seg_cols.size))
+            cols.append(np.broadcast_to(seg_cols, (STATE_DIM, seg_cols.size)).ravel())
+            data.append(end.ravel())
+            nxt = np.arange(STATE_DIM * (i + 1), STATE_DIM * (i + 1) + STATE_DIM)
+            rows.append(d_rows); cols.append(nxt)
+            data.append(np.full(STATE_DIM, -cfg.defect_weight))
+
+        # Observations landing on the final node frame read that node directly.
+        sel = np.flatnonzero(seg_of_obs == -1)
+        if sel.size:
+            base_col = STATE_DIM * (n_nodes - 1)
+            for n in sel:
+                w_p = sq_pos[n] / cfg.pos_scale
+                rows.append(np.array([2 * n, 2 * n + 1, yaw_base + n]))
+                cols.append(np.array([base_col, base_col + 1, base_col + STATE_THETA]))
+                data.append(np.array([w_p, w_p, sq_yaw[n] / cfg.yaw_scale]))
+
+        return coo_matrix(
+            (np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
+            shape=(n_res, n_params),
+        ).tocsr()
+
+    return jac
 
 
 def _build_jac_sparsity(
@@ -475,6 +607,79 @@ def _make_ss_residual_fn(
     return residuals, measurement_residuals, unpack
 
 
+def _make_ss_jac_fn(
+    obs_frames: np.ndarray,
+    n_steps: int,
+    dt: float,
+    wheelbase: float,
+    cfg: BicycleFitConfig,
+    yaw_w: np.ndarray,
+):
+    """Analytic Jacobian of the single-shooting polish residual.
+
+    Simpler than the multiple-shooting case: the whole span is one rollout, so
+    :func:`rollout_sensitivity` returns derivatives whose column layout already
+    matches the parameter vector ``[state0, (accel, steer) * n_steps]``.
+    """
+    n_obs = len(obs_frames)
+    n_params = STATE_DIM + 2 * n_steps
+    yaw_base = 2 * n_obs
+    smooth_base = 3 * n_obs
+    n_res = smooth_base + 2 * (n_steps - 1) + 2 * n_steps
+
+    def _accel_col(k):
+        return STATE_DIM + 2 * k
+
+    def _steer_col(k):
+        return STATE_DIM + 2 * k + 1
+
+    c_rows, c_cols, c_data = [], [], []
+    ks = np.arange(n_steps - 1)
+    for base, col_fn, lam in (
+        (smooth_base, _accel_col, cfg.lambda_accel),
+        (smooth_base + (n_steps - 1), _steer_col, cfg.lambda_steer),
+    ):
+        c_rows.append(base + ks); c_cols.append(col_fn(ks)); c_data.append(np.full(n_steps - 1, -lam))
+        c_rows.append(base + ks); c_cols.append(col_fn(ks + 1)); c_data.append(np.full(n_steps - 1, lam))
+    ka = np.arange(n_steps)
+    mag_base = smooth_base + 2 * (n_steps - 1)
+    for base, col_fn, lam in (
+        (mag_base, _accel_col, cfg.lambda_accel_mag),
+        (mag_base + n_steps, _steer_col, cfg.lambda_steer_mag),
+    ):
+        c_rows.append(base + ka); c_cols.append(col_fn(ka)); c_data.append(np.full(n_steps, lam))
+    const_rows = np.concatenate(c_rows); const_cols = np.concatenate(c_cols)
+    const_data = np.concatenate(c_data)
+    all_cols = np.arange(n_params)
+
+    def jac(p: np.ndarray, w_pos: np.ndarray, w_yaw: np.ndarray):
+        state0 = p[:STATE_DIM]
+        ctrl = p[STATE_DIM:].reshape(n_steps, 2)
+        sens = rollout_sensitivity(
+            state0, ctrl[:, 0], ctrl[:, 1], dt, wheelbase, cfg.lr_ratio
+        )  # (T, 4, n_params)
+        blk = sens[obs_frames]
+        sq_pos = (np.sqrt(w_pos) / cfg.pos_scale)[:, None]
+        sq_yaw = (np.sqrt(w_yaw) * yaw_w / cfg.yaw_scale)[:, None]
+
+        cc = np.broadcast_to(all_cols, (n_obs, n_params)).ravel()
+        rows = [const_rows]; cols = [const_cols]; data = [const_data]
+        n = np.arange(n_obs)
+        for r, vals in (
+            (2 * n, blk[:, 0, :] * sq_pos),
+            (2 * n + 1, blk[:, 1, :] * sq_pos),
+            (yaw_base + n, blk[:, 2, :] * sq_yaw),
+        ):
+            rows.append(np.repeat(r, n_params)); cols.append(cc); data.append(vals.ravel())
+
+        return coo_matrix(
+            (np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
+            shape=(n_res, n_params),
+        ).tocsr()
+
+    return jac
+
+
 def _build_ss_jac_sparsity(obs_frames: np.ndarray, n_steps: int):
     """Boolean Jacobian sparsity for the single-shooting residual vector.
 
@@ -572,7 +777,10 @@ def _single_shooting_polish(
     residuals, measurement_residuals, unpack = _make_ss_residual_fn(
         frames, positions, yaws, n_steps, dt, wheelbase, cfg, yaw_w
     )
-    jac_sparsity = _build_ss_jac_sparsity(frames, n_steps)
+    if cfg.analytic_jacobian:
+        jac_kwargs = {"jac": _make_ss_jac_fn(frames, n_steps, dt, wheelbase, cfg, yaw_w)}
+    else:
+        jac_kwargs = {"jac_sparsity": _build_ss_jac_sparsity(frames, n_steps)}
     lb, ub = _param_bounds(STATE_DIM, n_steps, cfg)
 
     n_obs = int(len(frames))
@@ -593,10 +801,10 @@ def _single_shooting_polish(
                 args=(w_pos, w_yaw),
                 method="trf",
                 loss="linear",
-                jac_sparsity=jac_sparsity,
                 tr_solver="lsmr",
                 bounds=(lb, ub),
                 max_nfev=cfg.polish_max_nfev,
+                **jac_kwargs,
             )
         except Exception:  # pragma: no cover - solver robustness
             break
@@ -680,7 +888,13 @@ def fit_track(
     residuals, measurement_residuals, unpack = _make_residual_fn(
         frames, positions, yaws, n_steps, node_frames, dt, wheelbase, cfg, yaw_weights
     )
-    jac_sparsity = _build_jac_sparsity(frames, n_steps, node_frames)
+    if cfg.analytic_jacobian:
+        jac_fn = _make_jac_fn(
+            frames, n_steps, node_frames, dt, wheelbase, cfg, yaw_weights
+        )
+        jac_kwargs = {"jac": jac_fn}
+    else:
+        jac_kwargs = {"jac_sparsity": _build_jac_sparsity(frames, n_steps, node_frames)}
     lb, ub = _param_bounds(len(node_frames) * STATE_DIM, n_steps, cfg)
     p0 = np.clip(p0, lb, ub)
 
@@ -699,10 +913,10 @@ def fit_track(
                 args=(w_pos, w_yaw),
                 method="trf",
                 loss="linear",
-                jac_sparsity=jac_sparsity,
                 tr_solver="lsmr",
                 bounds=(lb, ub),
                 max_nfev=cfg.solver_max_nfev,
+                **jac_kwargs,
             )
         except Exception as exc:  # pragma: no cover - solver robustness
             message = f"least_squares failed: {exc}"

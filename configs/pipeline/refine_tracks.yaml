@@ -190,6 +190,12 @@ bicycle_fit:
   # (states hugs the detections; rollout is smooth / simulator-reproducible).
   polish_single_shooting: false
   polish_max_nfev: 400
+  # Analytic Jacobian instead of scipy's finite differences. The FD path spends
+  # one extra residual evaluation per Jacobian column group on EVERY solver
+  # iteration (tens of them); the analytic one costs about a single evaluation
+  # and is more accurate, so the fit is much faster at equal iteration count.
+  # Set false to fall back to finite differences for an A/B on fit quality.
+  analytic_jacobian: true
   # Debug: in each user_refinement_post_bicycle/NNN/, also write NNN/rollout/ and
   # NNN/states/ (tracks JSON + projected bboxes) to compare both representations
   # visually. Adds 2 extra projection renders per iteration.

@@ -1178,6 +1178,9 @@ def _bicycle_fit_config(cfg: dict) -> BicycleFitConfig:
             cfg.get("polish_single_shooting", defaults.polish_single_shooting)
         ),
         polish_max_nfev=int(cfg.get("polish_max_nfev", defaults.polish_max_nfev)),
+        analytic_jacobian=bool(
+            cfg.get("analytic_jacobian", defaults.analytic_jacobian)
+        ),
     )
 
 
