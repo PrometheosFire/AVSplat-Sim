@@ -99,6 +99,34 @@ class BicycleFitConfig:
     # is more accurate. Set False to fall back to finite differences (useful
     # for A/B-ing fit quality).
     analytic_jacobian: bool = True
+    # --- Start-heading prior ---------------------------------------------- #
+    # Position data alone cannot pin the heading at the START of a track. The
+    # model is invariant under (theta -> theta+pi, v -> -v) whenever the slip
+    # angle is zero (straight-line motion), and at low speed the motion tangent
+    # is pure noise; the first frame has no preceding motion at all. So with the
+    # yaw measurement globally down-weighted (a large ``yaw_scale``) the solver
+    # is free to start a track facing anywhere, which surfaces as a trajectory
+    # driven in reverse or a spinning first few seconds.
+    #
+    # These anchor ONLY the leading observations to the measured box yaw, and
+    # leave the rest of the track position-driven so curve quality is unaffected.
+    start_yaw_frames: int = 5  # leading observations to anchor (0 disables)
+    start_yaw_scale: float = 0.15  # residual normalizer (rad) for those frames
+    start_yaw_ref_obs: int = 15  # observations spanned by the travel reference
+    start_yaw_min_travel: float = 1.0  # min net travel (m) for a usable reference
+    start_yaw_max_dev_deg: float = 45.0  # skip prior if measured yaw disagrees more
+    # --- Reverse penalty ------------------------------------------------- #
+    # One-sided penalty on negative speed, applied to every frame of the span.
+    # The model is exactly invariant under (theta -> theta+pi, v -> -v) for
+    # straight-line motion, so "driving backwards while facing backwards" is a
+    # mirror solution the solver can slide into at no cost; to then stay on the
+    # observed path it swings the heading around, which is the visible spinning.
+    # Vehicles in these scenes never reverse, so the branch is pure degeneracy.
+    # Speed is a STATE, not a parameter (only shooting nodes are parameters), so
+    # this cannot be a box bound -- hence a residual. It is a true hinge: for
+    # v >= 0 both the residual and its derivative are exactly zero, so positive
+    # or zero speeds are completely unaffected. 0 disables.
+    lambda_reverse: float = 10.0
 
 
 @dataclass
@@ -153,6 +181,133 @@ def _cauchy_weight(r: np.ndarray, c: float) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 # Initialization
 # --------------------------------------------------------------------------- #
+def _start_yaw_setup(
+    positions: np.ndarray, yaws: np.ndarray, cfg: BicycleFitConfig
+) -> tuple[np.ndarray, np.ndarray]:
+    """De-flipped measured yaw plus the per-observation weight of the start prior.
+
+    The measured box yaw carries a 180-degree front/back ambiguity, so it is
+    first de-flipped against the direction the object actually travels over its
+    leading ``start_yaw_ref_obs`` observations. The de-flip is applied to the
+    WHOLE track, not just the anchored frames, because it also decides which
+    basin :func:`_initial_track_states` starts the optimizer in.
+
+    The prior is then applied only where that reference can be trusted: the
+    object must travel at least ``start_yaw_min_travel`` metres, and its
+    de-flipped yaw must agree with the travel direction to within
+    ``start_yaw_max_dev_deg``. Near-stationary objects have no well-defined
+    heading and boxes whose yaw disagrees wildly are simply wrong — anchoring to
+    either would drag a good fit off course, so those tracks stay entirely
+    position-driven, exactly as before.
+
+    Returns ``(yaws, yaw_weight)``. The weight multiplies the yaw residual, which
+    is divided by the global ``yaw_scale``; a value of ``yaw_scale /
+    start_yaw_scale`` therefore reproduces a per-frame scale of
+    ``start_yaw_scale`` on the anchored frames while leaving the rest at 1.
+
+    Two details matter and both were learned the hard way. The front/back flips
+    occur PER FRAME, not per track, so each anchored sample is de-flipped
+    individually — a single whole-track flip merely swaps which frames are wrong.
+    And the consensus heading is a circular median taken about the travel
+    reference, never ``np.unwrap`` + median: on a flip-contaminated window
+    ``np.unwrap`` lifts the outliers into a different branch and the median then
+    follows the artefact rather than the majority.
+    """
+    n = int(yaws.size)
+    weight = np.ones(n)
+    if cfg.start_yaw_frames <= 0 or n < 3:
+        return yaws, weight
+
+    k = min(int(cfg.start_yaw_ref_obs), n - 1)
+    d = positions[k] - positions[0]
+    if float(np.hypot(d[0], d[1])) < cfg.start_yaw_min_travel:
+        return yaws, weight  # no usable travel reference (near-stationary)
+    ref = float(np.arctan2(d[1], d[0]))
+
+    lead = min(int(cfg.start_yaw_frames), n)
+    # Signed offset of each leading sample from the travel direction, with the
+    # 180-degree ambiguity resolved per sample: a box reported facing backwards
+    # is the same physical heading as one facing forwards.
+    delta = wrap_angle(yaws[:lead] - ref)
+    delta = np.where(np.abs(delta) > (np.pi / 2.0), wrap_angle(delta + np.pi), delta)
+
+    # Reject the whole prior when the de-flipped consensus still disagrees with
+    # the direction of travel: the box yaw is then simply wrong (or the object
+    # has no defined heading), and anchoring to it would drag a good fit away.
+    max_dev = np.radians(float(cfg.start_yaw_max_dev_deg))
+    if abs(float(np.median(delta))) > max_dev:
+        return yaws, weight
+
+    yaws = yaws.copy()
+    yaws[:lead] = ref + delta
+    # Anchor only the individual samples that survive the same test, so one bad
+    # box inside the window cannot fight the others.
+    ok = np.abs(delta) <= max_dev
+    scale = max(float(cfg.start_yaw_scale), 1e-6)
+    weight[:lead] = np.where(ok, float(cfg.yaw_scale) / scale, 1.0)
+    return yaws, weight
+
+
+def _rolling_median(x: np.ndarray, window: int) -> np.ndarray:
+    """Centred rolling median with edge padding (odd window, no-op if too small)."""
+    n = int(x.size)
+    if n == 0 or window <= 2:
+        return x
+    w = min(int(window), n if n % 2 else n - 1)
+    if w < 3:
+        return x
+    if w % 2 == 0:
+        w -= 1
+    pad = np.pad(x, w // 2, mode="edge")
+    return np.median(np.lib.stride_tricks.sliding_window_view(pad, w), axis=-1)
+
+
+def _resolve_yaw_flips(
+    positions: np.ndarray, yaws: np.ndarray, min_move: float = 0.15
+) -> np.ndarray:
+    """Remove the per-frame 180-degree front/back ambiguity from measured yaw.
+
+    Detector boxes routinely report a vehicle facing backwards; the flips land on
+    individual frames, so a series can alternate between ``y`` and ``y + pi``.
+    Feeding that straight to ``np.unwrap`` is destructive: each flip is absorbed
+    as a real rotation and the "unwrapped" heading ramps away without bound —
+    measured at up to 2.7 full turns over a single track — which then
+    initializes the solver with a vehicle that spins.
+
+    Resolution is by TEMPORAL CONTINUITY: each sample is chosen to be the
+    representative nearest the previously resolved heading, since a vehicle
+    cannot reverse its facing between consecutive frames while genuine turning
+    stays gradual. The local direction of travel is deliberately *not* used as
+    the per-frame reference — on the tracks this exists to fix, the positions are
+    noisy enough that the local tangent flips by 180 degrees itself, so it merely
+    substitutes one flipping signal for another. It is used only to seed the
+    first sample, from the net displacement over the track (which averages that
+    noise away), so the resolved series is anchored to forward motion. A
+    genuinely reversing vehicle is therefore resolved to face its travel
+    direction.
+    """
+    n = int(yaws.size)
+    if n == 0:
+        return yaws
+
+    # Seed from net displacement: robust to the per-frame position noise that
+    # makes the instantaneous tangent unusable.
+    net = positions[-1] - positions[0]
+    if float(np.hypot(net[0], net[1])) >= min_move:
+        prev = float(np.arctan2(net[1], net[0]))
+    else:
+        prev = float(yaws[0])
+
+    out = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        y = float(yaws[i])
+        if abs(float(wrap_angle(y - prev))) > (np.pi / 2.0):
+            y = float(wrap_angle(y + np.pi))
+        out[i] = y
+        prev = y
+    return out
+
+
 def _initial_track_states(
     frames: np.ndarray,
     positions: np.ndarray,
@@ -162,9 +317,10 @@ def _initial_track_states(
 ) -> np.ndarray:
     """Dense per-frame state initialization from sparse observations.
 
-    Interpolates observed positions across the full span, estimates speed and
-    heading from finite differences, and prefers the measured yaw where motion
-    is too small to trust the tangent.
+    The solve is non-convex, so this starting point decides which basin the
+    optimizer lands in; both the speed and the heading are therefore estimated
+    robustly rather than by raw differencing, which single bad detections and
+    box-yaw flips would otherwise corrupt.
     """
     T = n_steps + 1
     span = np.arange(T)
@@ -173,21 +329,25 @@ def _initial_track_states(
     px = np.interp(span, frames, positions[:, 0])
     pz = np.interp(span, frames, positions[:, 1])
 
-    # Speed from position finite differences (central where possible).
-    dx = np.gradient(px)
-    dz = np.gradient(pz)
-    step_dist = np.hypot(dx, dz)
-    v = step_dist / max(dt, 1e-6)
+    # Speed between consecutive OBSERVATIONS (dividing by the real frame gap so
+    # interpolated frames do not dilute it), median-filtered so a single
+    # teleported box cannot set the initial speed several times too high, which
+    # otherwise forces a non-physical braking profile the solver must undo.
+    if frames.size >= 2:
+        seg = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+        gaps = np.maximum(np.diff(frames).astype(np.float64), 1.0)
+        v_obs = seg / (gaps * max(dt, 1e-6))
+        v_obs = np.concatenate([v_obs[:1], v_obs])  # align to observation count
+        v = np.interp(span, frames, _rolling_median(v_obs, 5))
+    else:
+        v = np.zeros(T)
 
-    # Heading: unwrap measured yaw and interpolate; fall back to tangent when the
-    # object is clearly moving.
-    yaw_unwrapped = np.unwrap(yaws) if yaws.size else np.zeros_like(frames, dtype=float)
-    th = np.interp(span, frames, yaw_unwrapped) if yaws.size else np.zeros(T)
-    tangent = np.arctan2(dz, dx)
-    moving = step_dist > (0.2 * max(dt, 1e-6))
-    # Align tangent to the current heading branch before blending.
-    tangent = th + wrap_angle(tangent - th)
-    th = np.where(moving, tangent, th)
+    # Heading: de-flip the measured yaw before unwrapping (see
+    # :func:`_resolve_yaw_flips`), then interpolate across the span.
+    if yaws.size:
+        th = np.interp(span, frames, np.unwrap(_resolve_yaw_flips(positions, yaws)))
+    else:
+        th = np.zeros(T)
 
     states = np.empty((T, STATE_DIM), dtype=np.float64)
     states[:, 0] = px
@@ -203,8 +363,16 @@ def _initial_controls(
     wheelbase: float,
     lr_ratio: float,
     max_steer: float,
+    accel_min: float = -np.inf,
+    accel_max: float = np.inf,
 ) -> np.ndarray:
-    """Seed controls ``[a, delta]`` from the initialized state sequence."""
+    """Seed controls ``[a, delta]`` from the initialized state sequence.
+
+    Both controls are clipped to the solver's box bounds here rather than being
+    clipped later alongside the states: an initial guess whose controls sit far
+    outside the feasible box does not reproduce its own initial states, so the
+    solver would start from an internally inconsistent point.
+    """
     n_steps = states.shape[0] - 1
     v = states[:, STATE_V]
     th = states[:, STATE_THETA]
@@ -218,6 +386,7 @@ def _initial_controls(
     beta = np.arcsin(sin_beta)
     steer = np.arctan(np.tan(beta) / max(lr_ratio, 1e-6))
     steer = np.clip(steer, -max_steer, max_steer)
+    accel = np.clip(accel, accel_min, accel_max)
 
     return np.stack([accel, steer], axis=1)  # (n_steps, 2)
 
@@ -308,6 +477,10 @@ def _make_residual_fn(
         mag_accel = cfg.lambda_accel_mag * accel
         mag_steer = cfg.lambda_steer_mag * steer
 
+        # Reverse penalty over every frame (gaps included: the speed can dip
+        # negative between observations just as easily).
+        rev = cfg.lambda_reverse * np.minimum(frame_states[:, STATE_V], 0.0)
+
         return np.concatenate(
             [
                 pos_res.ravel(),
@@ -317,6 +490,7 @@ def _make_residual_fn(
                 d_steer,
                 mag_accel,
                 mag_steer,
+                rev,
             ]
         )
 
@@ -357,7 +531,8 @@ def _make_jac_fn(
     yaw_base = 2 * n_obs
     defect_base = 3 * n_obs
     smooth_base = defect_base + STATE_DIM * (n_nodes - 1)
-    n_res = smooth_base + 2 * (n_steps - 1) + 2 * n_steps
+    rev_base = smooth_base + 2 * (n_steps - 1) + 2 * n_steps
+    n_res = rev_base + (n_steps + 1)
 
     last_node_frame = int(node_frames[-1])
     # Map each observation to its owning segment; the final node frame is owned
@@ -403,6 +578,17 @@ def _make_jac_fn(
         sq_pos = np.sqrt(w_pos)
         sq_yaw = np.sqrt(w_yaw) * yaw_w
 
+        # Frames where the reverse penalty is active. ``min(v, 0)`` has zero
+        # derivative for v >= 0, so those rows are structurally empty -- the
+        # hinge costs nothing where the speed is already non-negative.
+        if cfg.lambda_reverse > 0.0:
+            frame_states, _ = _rollout_all_segments(
+                nodes, accel, steer, node_frames, dt, wheelbase, cfg.lr_ratio
+            )
+            rev_active = frame_states[:, STATE_V] < 0.0
+        else:
+            rev_active = np.zeros(n_steps + 1, dtype=bool)
+
         rows, cols, data = [const_rows], [const_cols], [const_data]
 
         for i in range(n_nodes - 1):
@@ -430,6 +616,18 @@ def _make_jac_fn(
                     cols.append(cc.ravel())
                     data.append(vals.ravel())
 
+            # Reverse-penalty rows for every frame this segment owns, [s, e).
+            # Local index 0 is the node frame itself, whose sensitivity is the
+            # identity block, so node frames are handled by the same expression.
+            loc = np.arange(L)
+            act = rev_active[s + loc]
+            if act.any():
+                sl = loc[act]
+                blk = sens[sl][:, STATE_V, :] * cfg.lambda_reverse
+                rows.append(np.repeat(rev_base + s + sl, seg_cols.size))
+                cols.append(np.broadcast_to(seg_cols, (sl.size, seg_cols.size)).ravel())
+                data.append(blk.ravel())
+
             # Defect: rolled end state minus the next node.
             d_rows = defect_base + STATE_DIM * i + np.arange(STATE_DIM)
             end = sens[L] * cfg.defect_weight                  # (4, 4+2L)
@@ -439,6 +637,13 @@ def _make_jac_fn(
             nxt = np.arange(STATE_DIM * (i + 1), STATE_DIM * (i + 1) + STATE_DIM)
             rows.append(d_rows); cols.append(nxt)
             data.append(np.full(STATE_DIM, -cfg.defect_weight))
+
+        # The final node frame is owned by no segment: its state IS the last
+        # node, so the reverse row is a single unit entry on that node's v column.
+        if rev_active[n_steps]:
+            rows.append(np.array([rev_base + n_steps]))
+            cols.append(np.array([STATE_DIM * (n_nodes - 1) + STATE_V]))
+            data.append(np.array([cfg.lambda_reverse]))
 
         # Observations landing on the final node frame read that node directly.
         sel = np.flatnonzero(seg_of_obs == -1)
@@ -484,6 +689,7 @@ def _build_jac_sparsity(
         + (n_steps - 1)  # d_steer
         + n_steps  # accel magnitude
         + n_steps  # steer magnitude
+        + (n_steps + 1)  # reverse penalty (one row per frame)
     )
     S = lil_matrix((n_res, n_params), dtype=bool)
 
@@ -599,9 +805,10 @@ def _make_ss_residual_fn(
         d_steer = cfg.lambda_steer * np.diff(steer)
         mag_accel = cfg.lambda_accel_mag * accel
         mag_steer = cfg.lambda_steer_mag * steer
+        rev = cfg.lambda_reverse * np.minimum(states[:, STATE_V], 0.0)
 
         return np.concatenate(
-            [pos_res.ravel(), yaw_res, d_accel, d_steer, mag_accel, mag_steer]
+            [pos_res.ravel(), yaw_res, d_accel, d_steer, mag_accel, mag_steer, rev]
         )
 
     return residuals, measurement_residuals, unpack
@@ -625,7 +832,8 @@ def _make_ss_jac_fn(
     n_params = STATE_DIM + 2 * n_steps
     yaw_base = 2 * n_obs
     smooth_base = 3 * n_obs
-    n_res = smooth_base + 2 * (n_steps - 1) + 2 * n_steps
+    rev_base = smooth_base + 2 * (n_steps - 1) + 2 * n_steps
+    n_res = rev_base + (n_steps + 1)
 
     def _accel_col(k):
         return STATE_DIM + 2 * k
@@ -672,6 +880,15 @@ def _make_ss_jac_fn(
         ):
             rows.append(np.repeat(r, n_params)); cols.append(cc); data.append(vals.ravel())
 
+        # Reverse penalty: only frames whose speed is negative contribute.
+        if cfg.lambda_reverse > 0.0:
+            states = rollout(state0, ctrl[:, 0], ctrl[:, 1], dt, wheelbase, cfg.lr_ratio)
+            act = np.flatnonzero(states[:, STATE_V] < 0.0)
+            if act.size:
+                rows.append(np.repeat(rev_base + act, n_params))
+                cols.append(np.broadcast_to(all_cols, (act.size, n_params)).ravel())
+                data.append((sens[act][:, STATE_V, :] * cfg.lambda_reverse).ravel())
+
         return coo_matrix(
             (np.concatenate(data), (np.concatenate(rows), np.concatenate(cols))),
             shape=(n_res, n_params),
@@ -698,6 +915,7 @@ def _build_ss_jac_sparsity(obs_frames: np.ndarray, n_steps: int):
         + (n_steps - 1)  # d_steer
         + n_steps  # accel magnitude
         + n_steps  # steer magnitude
+        + (n_steps + 1)  # reverse penalty (one row per frame)
     )
     S = lil_matrix((n_res, n_params), dtype=bool)
 
@@ -733,6 +951,16 @@ def _build_ss_jac_sparsity(obs_frames: np.ndarray, n_steps: int):
     base += n_steps
     for k in range(n_steps):
         S[base + k, steer_col(k)] = True
+
+    # Reverse penalty: frame f's speed depends on state0 and controls 0..f-1,
+    # the same lower-triangular structure as its predicted state.
+    base += n_steps
+    for f in range(n_steps + 1):
+        for c in range(STATE_DIM):
+            S[base + f, c] = True
+        for k in range(f):
+            S[base + f, accel_col(k)] = True
+            S[base + f, steer_col(k)] = True
 
     return S.tocsr()
 
@@ -862,6 +1090,13 @@ def fit_track(
     else:
         yaw_weights = np.asarray(yaw_weights, dtype=np.float64).reshape(-1)
 
+    # Start-heading prior: de-flip the measured yaw and up-weight the leading
+    # observations, so the otherwise unobservable initial heading (and with it
+    # the sign of the speed) is pinned by the one measurement that carries it.
+    # Applied BEFORE the initialization, which reads the same yaw array.
+    yaws, start_w = _start_yaw_setup(positions, yaws, cfg)
+    yaw_weights = yaw_weights * start_w
+
     init_states = _initial_track_states(frames, positions, yaws, n_steps, dt)
 
     # Degenerate spans: nothing to optimize, return the initialization.
@@ -881,7 +1116,8 @@ def fit_track(
 
     node_frames = _segment_boundaries(n_steps, cfg.segment_len)
     init_ctrl = _initial_controls(
-        init_states, dt, wheelbase, cfg.lr_ratio, cfg.max_steer
+        init_states, dt, wheelbase, cfg.lr_ratio, cfg.max_steer,
+        cfg.accel_min, cfg.accel_max,
     )
     p0 = np.concatenate([init_states[node_frames].ravel(), init_ctrl.ravel()])
 

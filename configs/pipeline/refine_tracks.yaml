@@ -140,7 +140,7 @@ pose_smooth_rotation_min_speed: 0.05
 # JSON, projection and bicycle_params.json are written to the <refine_dir> root,
 # which is what all downstream stages (4DGS training, simulator) read.
 user_refinement:
-  enabled: true
+  enabled: false
   default_extend: 5
   extend_velocity_window: 3
   post_bicycle_fit: true
@@ -221,7 +221,7 @@ bicycle_fit:
   # Multiple-shooting segment length (frames).
   #   ^ fewer/longer segments -> better bake continuity but stiffer & less stable on curves
   #   v more/shorter segments -> more stable solve but more segment seams (bake drift; polish mitigates)
-  segment_len: 25
+  segment_len: 51
   # Position residual normalizer (m); only the pos_scale : yaw_scale ratio matters.
   #   ^ trusts position LESS (looser/smoother, drifts off points) | v trusts position MORE (hugs obs, keeps noise)
   pos_scale: 0.5
@@ -231,6 +231,45 @@ bicycle_fit:
   # Position robust (Huber) transition, in normalized residual units.
   #   ^ tolerates position outliers (they pull the fit more) | v rejects them sooner (more robust, may drop good pts)
   huber_delta: 1.345
+  # One-sided penalty on NEGATIVE fitted speed, applied to every frame.
+  # The model is exactly invariant under (theta -> theta+pi, v -> -v) for
+  # straight-line motion, so "facing backwards while driving backwards" traces
+  # the same path at no cost; the fit can slide into it and then has to swing the
+  # heading around to stay on the observed path, which is the visible spinning.
+  # Vehicles in these scenes never reverse, so that branch is pure degeneracy.
+  # It is a true hinge: for v >= 0 the residual AND its derivative are exactly
+  # zero, so positive or near-zero speeds are untouched (a genuine stop is free).
+  # Measured on scene_099: reversing tracks reach -1.1 .. -2.9 m/s while
+  # non-reversing ones bottom out at +0.4 m/s, so there is clear separation.
+  #   ^ forces v >= 0 harder | v allows more reverse | 0 disables
+  lambda_reverse: 10.0
+  # --- Start-heading prior ---
+  # Position data alone cannot pin the heading at the START of a track: the
+  # model is invariant under (theta -> theta+pi, v -> -v) for straight-line
+  # motion, and at low speed the motion tangent is noise. With yaw_scale large
+  # (yaw effectively ignored) the solver is free to start a track facing
+  # anywhere -> trajectories driven in reverse, or spinning for the first
+  # seconds while the fit recovers the position. These anchor ONLY the leading
+  # observations to the measured box yaw; the rest of the track stays
+  # position-driven, so curve quality is unaffected.
+  #   ^ start_yaw_frames: more frames anchored (too many re-introduces noisy yaw)
+  #   v 0 disables the prior entirely
+  start_yaw_frames: 5
+  # Residual normalizer (rad) applied to the anchored frames only.
+  #   ^ trusts the measured start yaw LESS | v trusts it MORE (floor ~0.05)
+  start_yaw_scale: 0.15
+  # Observations spanned when deriving the direction-of-travel reference used to
+  # resolve the 180-degree front/back ambiguity of the measured box yaw.
+  start_yaw_ref_obs: 15
+  # Minimum net travel (m) over that span for the reference to be usable. Below
+  # it the object is effectively stationary and has no defined heading, so the
+  # prior is skipped.
+  start_yaw_min_travel: 1.0
+  # Skip the prior when the de-flipped measured yaw disagrees with the travel
+  # direction by more than this - the box yaw is then simply wrong, and
+  # anchoring to it would drag an otherwise good fit off course.
+  #   ^ anchors more tracks (incl. dubious ones) | v only anchors confident ones
+  start_yaw_max_dev_deg: 45.0
   # Heading robust (Cauchy) transition, normalized units (heavier tails than Huber).
   #   ^ tolerates yaw outliers | v rejects yaw outliers sooner
   cauchy_c: 2.3849

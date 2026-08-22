@@ -67,7 +67,19 @@ dynamic_rigid_classes: null
 dynamic_min_track_score: 0.0
 # Initial Gaussians sampled inside each instance box.
 rigid_init_points_per_instance: 5000
-# Per-frame pose learning rates.
+# Percentage to widen each instance box FOOTPRINT by before training. Gaussians
+# are only seeded inside the box (and are not clipped to it afterwards), so a
+# box that hugs the body leaves mirrors, overhang and silhouette edges with
+# nothing to start from. Only the ground-plane extents grow; HEIGHT is left
+# alone so boxes do not sink into the road or reach above the roof. 0 disables.
+rigid_bbox_expand_pct: 10.0
+# Optimize the per-frame rigid poses during training. The poses sit in the
+# render path, so when true the photometric loss moves every box independently
+# with no kinematic constraint (rigid_smooth_w is 0). On scene_099 that drifted
+# boxes ~0.30 m from the refined fit and made trajectories ~9x rougher, which
+# smears the dynamic objects. False = trust the Step 1.5 bicycle-model fit.
+rigid_pose_optimize: false
+# Per-frame pose learning rates. Ignored unless rigid_pose_optimize is true.
 rigid_pose_trans_lr: 0.0005
 rigid_pose_quats_lr: 0.00001
 # Final pose LRs for linear decay over training (OmniRe schedule).
@@ -147,6 +159,6 @@ bicycle_wheelbase_alpha: 0.60
 
 
 strategy:
-  cap_max: 2000000        # Default cap
+  cap_max: 1500000        # Default cap
   min_opacity: 0.005        # Default pruning opacity
 

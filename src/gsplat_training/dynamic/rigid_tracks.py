@@ -308,6 +308,7 @@ def load_rigid_tracks(
     frame_timestamps_us: Sequence[int],
     rigid_classes: Optional[Sequence[str]] = None,
     min_score: float = 0.0,
+    bbox_expand_pct: float = 0.0,
 ) -> RigidTracks:
     """Load refined tracks and convert to per-instance rigid poses.
 
@@ -320,6 +321,9 @@ def load_rigid_tracks(
             ordering by rank.
         rigid_classes: Class names to keep. Defaults to the vehicle group.
         min_score: Drop boxes with ``tracking_score`` below this threshold.
+        bbox_expand_pct: Percentage to widen each instance's box FOOTPRINT by.
+            Only the ground-plane extents grow; height is untouched. See the
+            note where it is applied.
 
     Returns:
         A populated :class:`RigidTracks`.
@@ -385,6 +389,19 @@ def load_rigid_tracks(
     sizes = np.stack(
         [np.median(np.stack(id_to_sizes[tid], axis=0), axis=0) for tid in instance_ids]
     )
+    # Widen the footprint before scaling to training units. The tracker's boxes
+    # hug the vehicle body, so mirrors, overhang and the silhouette edges start
+    # with no Gaussians at all -- instances are seeded uniformly INSIDE the box
+    # (``RigidNodes._init_gaussians``) and are not clipped to it afterwards, so
+    # anything outside has to be grown from nothing by densification.
+    #
+    # Only the ground-plane extents are scaled: after the ``[[1, 0, 2]]`` reorder
+    # above, the axes are [length (local x), width (local y), height (local z)],
+    # so index 2 is deliberately left alone -- growing it would push the box into
+    # the road surface below and empty space above the roof, seeding Gaussians
+    # onto background rather than the vehicle.
+    if bbox_expand_pct:
+        sizes[:, :2] *= 1.0 + float(bbox_expand_pct) / 100.0
     sizes = (sizes * transform.scale).astype(np.float32)
 
     # Allocate per-frame pose arrays.

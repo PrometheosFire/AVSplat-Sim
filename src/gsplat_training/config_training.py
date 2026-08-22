@@ -207,7 +207,25 @@ class Config:
     dynamic_min_track_score: float = 0.0
     # Initial number of Gaussians sampled inside each instance box.
     rigid_init_points_per_instance: int = 5000
+    # Percentage to widen each instance's bounding box FOOTPRINT by before
+    # training. The tracker's boxes hug the vehicle body, leaving mirrors,
+    # overhang and the silhouette edges with no Gaussians initialised there --
+    # and since Gaussians are only seeded inside the box (they are not clipped
+    # afterwards), densification has to grow outward from nothing to cover them.
+    # Only the ground-plane extents (local x = length, y = width) are scaled;
+    # HEIGHT (local z) is left untouched so boxes do not sink into the road or
+    # reach above the roof. 0 disables.
+    rigid_bbox_expand_pct: float = 10.0
+    # Optimize the per-frame rigid poses during training. The poses are part of
+    # the render path (``get_world_gaussians`` builds ``means_world`` from them),
+    # so when enabled the photometric loss moves every box independently, with no
+    # kinematic constraint unless ``rigid_smooth_w`` > 0. Measured on scene_099
+    # that cost ~0.30 m median drift from the Step 1.5 fitted trajectory and made
+    # it ~9x rougher frame-to-frame, smearing the dynamic objects. Default False:
+    # the refinement's bicycle-model fit is treated as the trajectory of record.
+    rigid_pose_optimize: bool = False
     # Per-frame pose learning rates (translation moves faster than rotation).
+    # Ignored unless ``rigid_pose_optimize`` is True.
     rigid_pose_trans_lr: float = 5e-4
     rigid_pose_quats_lr: float = 1e-5
     # Final pose learning rates for linear LR decay (OmniRe schedule).

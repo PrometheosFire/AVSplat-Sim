@@ -568,6 +568,7 @@ class Runner:
             self.parser.frame_timestamps_us,
             rigid_classes=cfg.dynamic_rigid_classes,
             min_score=cfg.dynamic_min_track_score,
+            bbox_expand_pct=cfg.rigid_bbox_expand_pct,
         )
         self.rigid_nodes = RigidNodes(
             self.rigid_tracks,
@@ -587,11 +588,18 @@ class Runner:
             shN_lr=cfg.shN_lr,
             pose_trans_lr=cfg.rigid_pose_trans_lr,
             pose_quats_lr=cfg.rigid_pose_quats_lr,
+            optimize_poses=cfg.rigid_pose_optimize,
         )
         self.rigid_gauss_optimizers = {k: all_optimizers[k] for k in RIGID_GAUSS_KEYS}
+        # Absent entirely when poses are frozen, so every consumer below iterates
+        # an empty dict rather than needing its own guard.
         self.rigid_pose_optimizers = {
             k: all_optimizers[k] for k in ("pose_trans", "pose_quats")
+            if k in all_optimizers
         }
+        if not cfg.rigid_pose_optimize:
+            print("🔒 Rigid per-frame poses FROZEN at the refined trajectory "
+                  "(rigid_pose_optimize=false); photometric loss cannot move them.")
 
         # Optional kinematic smoothers.
         self.unicycle_optimizers: Dict[str, torch.optim.Optimizer] = {}
@@ -1038,12 +1046,14 @@ class Runner:
                     shN_lr=cfg.shN_lr,
                     pose_trans_lr=cfg.rigid_pose_trans_lr,
                     pose_quats_lr=cfg.rigid_pose_quats_lr,
+                    optimize_poses=cfg.rigid_pose_optimize,
                 )
                 self.rigid_gauss_optimizers = {
                     k: all_optimizers[k] for k in RIGID_GAUSS_KEYS
                 }
                 self.rigid_pose_optimizers = {
                     k: all_optimizers[k] for k in ("pose_trans", "pose_quats")
+                    if k in all_optimizers
                 }
             if "optimizers" in ckpt:
                 for name, optimizer in self.optimizers.items():

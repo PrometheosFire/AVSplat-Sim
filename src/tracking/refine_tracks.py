@@ -1181,6 +1181,16 @@ def _bicycle_fit_config(cfg: dict) -> BicycleFitConfig:
         analytic_jacobian=bool(
             cfg.get("analytic_jacobian", defaults.analytic_jacobian)
         ),
+        start_yaw_frames=int(cfg.get("start_yaw_frames", defaults.start_yaw_frames)),
+        start_yaw_scale=float(cfg.get("start_yaw_scale", defaults.start_yaw_scale)),
+        start_yaw_ref_obs=int(cfg.get("start_yaw_ref_obs", defaults.start_yaw_ref_obs)),
+        start_yaw_min_travel=float(
+            cfg.get("start_yaw_min_travel", defaults.start_yaw_min_travel)
+        ),
+        start_yaw_max_dev_deg=float(
+            cfg.get("start_yaw_max_dev_deg", defaults.start_yaw_max_dev_deg)
+        ),
+        lambda_reverse=float(cfg.get("lambda_reverse", defaults.lambda_reverse)),
     )
 
 
@@ -2327,14 +2337,32 @@ def _refit_track_bicycle(
     else:
         # Fit a private copy of the observations so apply_bicycle_fit's in-place
         # bake does not touch the pre-fit snapshot, then transfer the fitted
-        # poses onto the live track. Only frames the live track still has are
-        # written; the fit's own gap-filling cannot resurrect removed frames.
+        # poses onto the live track.
         fit_track_boxes = copy.deepcopy(obs)
         _, rep = apply_bicycle_fit({tid: fit_track_boxes}, frame_keys, bicycle_cfg)
-        for f, fitted in fit_track_boxes.items():
+        # Snapshot the surviving frames before inserting any bridged box, so the
+        # "nearest" lookup below always copies metadata from a real box.
+        live_frames = sorted(track)
+        n_keys = len(frame_keys)
+        for f, fitted in sorted(fit_track_boxes.items()):
             if f in track:
                 track[f]["translation"] = list(fitted["translation"])
                 track[f]["rotation"] = list(fitted["rotation"])
+                continue
+            # An interior frame the user removed. It is gone as an OBSERVATION
+            # (absent from ``obs``, so the fit never sees it) but the fitted span
+            # still crosses it, so the model bridges the hole rather than letting
+            # the object blink out mid-trajectory. Frames removed at the ends lie
+            # outside the span — the fit runs first-survivor to last-survivor —
+            # so they are never resurrected here.
+            nearest = min(live_frames, key=lambda o: abs(o - f))
+            box = copy.deepcopy(track[nearest])
+            box["interpolated"] = True
+            if 0 <= f < n_keys and "sample_token" in box:
+                box["sample_token"] = frame_keys[f]
+            box["translation"] = list(fitted["translation"])
+            box["rotation"] = list(fitted["rotation"])
+            track[f] = box
     entry = rep.get("params", {}).get(str(tid))
     if entry is not None:
         bicycle_params[str(tid)] = entry
@@ -2690,8 +2718,15 @@ def _apply_user_command(
                 "(track became empty and was deleted)."
             )
 
-        # Re-fit the surviving frames so the model reflects the removal (the goal
-        # of remove is to drop bad detections). Deferred to 'apply' like fuse.
+        # Re-fit the surviving frames so the model reflects the removal — the
+        # whole point of remove is to drop bad detections and let the trajectory
+        # be recomputed without them. This matters just as much for frames taken
+        # off the START or END as for interior ones: the fit anchors on the span
+        # endpoints, so a dropped first/last box re-anchors ``state0`` and
+        # changes the entire trajectory, not merely its edge. Interior removals
+        # are bridged by the model in ``_refit_track_bicycle`` (the frames stay
+        # dropped as observations, but the baked path still crosses them), so
+        # there is no hole to enforce here. Deferred to 'apply' like fuse.
         refit_note = ""
         if bike_enabled and str(tid) in bicycle_params:
             if _should_bike_fit(tracks[tid], bicycle_cfg):
@@ -2700,29 +2735,7 @@ def _apply_user_command(
                         tid, tracks[tid], frame_keys, bicycle_cfg,
                         bicycle_params, pristine,
                     )
-                    # Guard against re-fit regenerating interior holes: keep
-                    # explicit user removals authoritative.
-                    reintroduced = 0
-                    for frame_idx in frame_indices_to_remove:
-                        if frame_idx in tracks[tid]:
-                            del tracks[tid][frame_idx]
-                            reintroduced += 1
-                    if not tracks[tid]:
-                        del tracks[tid]
-                        bicycle_params.pop(str(tid), None)
-                        return (
-                            f"✂️ Staged remove for {cls}_{tid} frames {user_start}-{user_end}; removed {removed} frames "
-                            "(re-fit regenerated removed frames; removals enforced and track became empty)."
-                        )
-                    if reintroduced > 0:
-                        # Model controls now disagree with explicit holes.
-                        bicycle_params.pop(str(tid), None)
-                        refit_note = (
-                            f" (re-fit regenerated {reintroduced} removed frames; "
-                            "removals enforced, bicycle params dropped)"
-                        )
-                    else:
-                        refit_note = " (re-fit bicycle model; state0 refreshed)"
+                    refit_note = " (re-fit bicycle model on the remaining observations)"
                 else:
                     refit_note = " (bicycle re-fit on apply)"
             else:

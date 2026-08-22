@@ -591,8 +591,19 @@ class RigidNodes(nn.Module):
         shN_lr: float = 2.5e-3 / 20,
         pose_trans_lr: float = 5e-4,
         pose_quats_lr: float = 1e-5,
+        optimize_poses: bool = True,
     ) -> Dict[str, torch.optim.Optimizer]:
-        """Create per-parameter Adam optimizers (lrs scaled by sqrt(batch_size))."""
+        """Create per-parameter Adam optimizers (lrs scaled by sqrt(batch_size)).
+
+        With ``optimize_poses=False`` the per-frame poses get no optimizer and
+        their ``requires_grad`` is cleared, so the boxes stay exactly where the
+        Step 1.5 refinement put them. This matters because the poses sit in the
+        render path (``get_world_gaussians`` composes ``means_world`` from them),
+        so the photometric loss otherwise reaches them every step with no
+        kinematic constraint -- measured on scene_099 as ~0.30 m median drift
+        from the fitted trajectory and ~9x its frame-to-frame roughness, which
+        smears the very objects the refinement was making consistent.
+        """
         bs = batch_size
         specs = {
             "means": (self.gauss["means"], means_lr),
@@ -601,9 +612,14 @@ class RigidNodes(nn.Module):
             "opacities": (self.gauss["opacities"], opacities_lr),
             "sh0": (self.gauss["sh0"], sh0_lr),
             "shN": (self.gauss["shN"], shN_lr),
-            "pose_trans": (self.poses["trans"], pose_trans_lr),
-            "pose_quats": (self.poses["quats"], pose_quats_lr),
         }
+        if optimize_poses:
+            specs["pose_trans"] = (self.poses["trans"], pose_trans_lr)
+            specs["pose_quats"] = (self.poses["quats"], pose_quats_lr)
+        else:
+            # No optimizer AND no gradient: frozen poses cost nothing to keep.
+            self.poses["trans"].requires_grad_(False)
+            self.poses["quats"].requires_grad_(False)
         optimizers = {
             name: torch.optim.Adam(
                 [{"params": param, "lr": lr * np.sqrt(bs), "name": name}],
