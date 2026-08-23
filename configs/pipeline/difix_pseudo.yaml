@@ -1,0 +1,37 @@
+# configs/pipeline/difix_pseudo.yaml
+#
+# One round of the pseudo-view loop: clean a subset of the shifted renders with
+# reference-conditioned Difix and emit the manifest the trainer consumes.
+# Driven by scripts/run_difix_loop.py, which overrides the paths and the
+# per-round stride/phase.
+
+# Where the renders came from (<round>/render/<mode>), and the real-frame bank
+# exported by src/gsplat_training/export_real_frames.py.
+render_dir: null
+real_bank_dir: null
+output_dir: null
+
+# Which frames to clean. Round r uses phase (r * 2), so successive rounds cover
+# different timesteps: stride 6 with phases 0/2/4 gives {0,6,12,...},
+# {2,8,14,...}, {4,10,16,...}. Validation frames are always excluded.
+frame_stride: 6
+frame_phase: 0
+
+# Recorded in the manifest for provenance.
+round: 0
+
+# Empty = every camera present in the render dir.
+cameras: []
+
+# The zero shift is difixed and measured as a CONTROL (real ground truth exists
+# there) but never enters the manifest. Its name is set by render_standalone's
+# _shift_name for an all-zero shift.
+control_shift_name: "original"
+
+# Diffusion settings. The model itself comes from cfg.diffusion; the loop passes
+# model@diffusion=difix_ref so that ref_image conditioning is active.
+prompt: "remove degradation"
+timestep: 199
+
+# Re-clean frames whose output already exists (false = resume an interrupted run).
+force: false

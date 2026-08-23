@@ -3,7 +3,7 @@
 # Render trajectory path: "interp", "ellipse", "spiral", or "raw" (use captured poses as-is)
 render_traj_path: "raw"
 # Downsample factor for the dataset
-data_factor: 1
+data_factor: 2
 
 # Port for the viewer server
 port: 8080

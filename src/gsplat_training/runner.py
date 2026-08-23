@@ -17,6 +17,7 @@
 import json
 import math
 import os
+import random
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -329,6 +330,58 @@ class Runner:
                 f"When using multiple cameras ({self.parser.num_cameras} found), batch_size must be 1, "
                 f"but got batch_size={cfg.batch_size}."
             )
+
+        # --- Difix pseudo-views (static-only lateral-parallax augmentation) ---
+        self.pseudo_parser = None
+        self.pseudoset = None
+        if cfg.pseudo_manifests:
+            # Every one of these indexes a per-image table sized len(trainset)
+            # by the SPLIT-LOCAL image_id. Pseudo-views own no row there and
+            # emit image_id=0, so enabling any of them would have them quietly
+            # write into real frame 0's embedding instead of failing.
+            conflicting = [
+                name
+                for name, active in (
+                    ("app_opt", cfg.app_opt),
+                    ("pose_opt", cfg.pose_opt),
+                    ("pose_noise", cfg.pose_noise > 0.0),
+                    ("post_processing", cfg.post_processing is not None),
+                )
+                if active
+            ]
+            if conflicting:
+                raise ValueError(
+                    f"pseudo_manifests is incompatible with {', '.join(conflicting)}: "
+                    "each indexes a per-image embedding table sized len(trainset) "
+                    "using the split-local image_id, which pseudo-views do not own."
+                )
+            if cfg.enable_dynamic:
+                raise ValueError(
+                    "pseudo_manifests is static-only (v1); set enable_dynamic=false."
+                )
+            if cfg.batch_size != 1:
+                raise ValueError(
+                    "pseudo_manifests requires batch_size=1 (rasterize_splats "
+                    f"calls camera_idcs.item()), got batch_size={cfg.batch_size}."
+                )
+            if world_size > 1:
+                raise ValueError(
+                    "pseudo_manifests requires a single process: the pseudo "
+                    "loader has no DistributedSampler."
+                )
+
+            from datasets.pseudo import PseudoViewDataset, PseudoViewParser
+
+            # Passing the trainer's camera order and intrinsics is what enables
+            # the stale-manifest checks (wrong camera_idx -> wrong distortion,
+            # wrong K -> wrong focal length). Built here rather than in train()
+            # so a bad bank fails at startup, not 1000 steps in.
+            self.pseudo_parser = PseudoViewParser(
+                list(cfg.pseudo_manifests),
+                expected_camera_ids=list(self.parser.camera_ids),
+                expected_Ks=self.parser.Ks_dict,
+            )
+            self.pseudoset = PseudoViewDataset(self.pseudo_parser, split="train")
         if cfg.post_processing == "ppisp" and cfg.batch_size != 1:
             raise ValueError(
                 f"PPISP post-processing requires batch_size=1, got batch_size={cfg.batch_size}"
@@ -1083,7 +1136,29 @@ class Runner:
             pin_memory=True,
             #prefetch_factor=2,           # Refetch factor for preloading data. Can maybe increase if data loading is bottleneck
         )
-        trainloader_iter = iter(trainloader) 
+        trainloader_iter = iter(trainloader)
+
+        # Pseudo-views are a SECOND, independent stream: its own shuffle and its
+        # own epoch cycle, sampled per step with fixed probability. Keeping it
+        # out of the real pool is what stops the mixing ratio from drifting as
+        # the bank accumulates across rounds.
+        pseudoloader = None
+        pseudoloader_iter = None
+        if self.pseudoset is not None:
+            pseudoloader = torch.utils.data.DataLoader(
+                self.pseudoset,
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                num_workers=2,
+                persistent_workers=True,
+                pin_memory=True,
+            )
+            pseudoloader_iter = iter(pseudoloader)
+            print(
+                f"[Pseudo] {len(self.pseudoset)} views, sampled "
+                f"{cfg.pseudo_sample_prob:.0%} of steps, loss x{cfg.pseudo_lambda} "
+                f"(real x{cfg.real_loss_scale})"
+            )
 
         # Training loop.
         global_tic = time.time()
@@ -1109,12 +1184,25 @@ class Runner:
             ):
                 self.freeze_gaussians()
             
-            # One frame per data dict (for batch_size = 1)
-            try:
-                data = next(trainloader_iter) # Fetch next batch of training data. 
-            except StopIteration:             # If the iterator is exhausted, it raises StopIteration, which we catch to reset the iterator for the next epoch.
-                trainloader_iter = iter(trainloader)
-                data = next(trainloader_iter)
+            # One frame per data dict (for batch_size = 1). Draw from the pseudo
+            # bank with fixed probability, otherwise from the real frames; each
+            # stream advances (and reshuffles) only on the steps it is chosen.
+            is_pseudo = (
+                pseudoloader_iter is not None
+                and random.random() < cfg.pseudo_sample_prob
+            )
+            if is_pseudo:
+                try:
+                    data = next(pseudoloader_iter)
+                except StopIteration:
+                    pseudoloader_iter = iter(pseudoloader)
+                    data = next(pseudoloader_iter)
+            else:
+                try:
+                    data = next(trainloader_iter) # Fetch next batch of training data.
+                except StopIteration:             # If the iterator is exhausted, it raises StopIteration, which we catch to reset the iterator for the next epoch.
+                    trainloader_iter = iter(trainloader)
+                    data = next(trainloader_iter)
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
@@ -1255,6 +1343,17 @@ class Runner:
                     cfg, rigid_frame_idx, step
                 )
 
+            # Per-stream loss scaling, placed exactly where the Difix3D+
+            # reference puts it (simple_trainer_difix3d.py:708-712): AFTER the
+            # regularizers, which means opacity_reg/scale_reg are scaled too.
+            # real_loss_scale compensates real frames for the step budget lost
+            # to the pseudo stream, so pseudo supervision adds rather than
+            # displaces. Inactive (both branches skipped) with no pseudo bank.
+            if pseudoloader_iter is not None:
+                loss = loss * (
+                    cfg.pseudo_lambda if is_pseudo else cfg.real_loss_scale
+                )
+
             loss.backward()
 
             # Accumulate the rigid densification signal (3D positional gradient)
@@ -1286,6 +1385,12 @@ class Runner:
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                if pseudoloader_iter is not None:
+                    # Split the curve by stream: the two are scaled differently,
+                    # so a single series would just look bimodal.
+                    tag = "pseudo" if is_pseudo else "real"
+                    self.writer.add_scalar(f"train/loss_{tag}", loss.item(), step)
+                    self.writer.add_scalar(f"train/l1loss_{tag}", l1loss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
                 # Log unicycle loss components separately for tuning.
@@ -1516,14 +1621,20 @@ class Runner:
             # Run post-backward steps after backward and optimizer
             # Densification strategy!
             if isinstance(self.cfg.strategy, DefaultStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    packed=cfg.packed,
-                )
+                # DefaultStrategy grows/prunes from the accumulated 2D gradient,
+                # so pseudo steps steer densification directly; pseudo_densify
+                # exists to ablate that. MCMC below is deliberately NOT gated:
+                # it ignores `info` and is driven by the step counter, so
+                # skipping calls would desync its noise/refine schedule.
+                if cfg.pseudo_densify or not is_pseudo:
+                    self.cfg.strategy.step_post_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                        packed=cfg.packed,
+                    )
             elif isinstance(self.cfg.strategy, MCMCStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,

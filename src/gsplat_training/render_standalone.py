@@ -724,10 +724,23 @@ class StandaloneRenderer:
 
         Returns:
             List of saved frame paths
+
+        Side effects:
+            Always writes the poses it was handed to
+            ``<output_dir>/poses/<shift>/<cam>/camtoworlds.npy``. Downstream
+            consumers need the ACTUAL shifted poses; re-deriving the shift from
+            the unshifted camera metadata risks disagreeing with what was
+            rendered (e.g. via ``world_to_normalized_scale``).
         """
         safe_cam_name = str(camera.camera_id).replace("/", "_")
         frames_dir = os.path.join(output_dir, "frames", shift_name, safe_cam_name)
         os.makedirs(frames_dir, exist_ok=True)
+
+        # Sibling of frames/, so globs like apply_diffusion.py's `frames/**/*.png`
+        # are unaffected.
+        poses_dir = os.path.join(output_dir, "poses", shift_name, safe_cam_name)
+        os.makedirs(poses_dir, exist_ok=True)
+        np.save(os.path.join(poses_dir, "camtoworlds.npy"), np.asarray(camtoworlds))
 
         num_rigid_frames = (
             int(self.rigid_state["poses.trans"].shape[0])

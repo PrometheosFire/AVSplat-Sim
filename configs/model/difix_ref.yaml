@@ -1,0 +1,22 @@
+# Reference-conditioned Difix3D+, used by the pseudo-view loop.
+# The non-ref variant in difix3d+.yaml is left untouched for the legacy
+# static pipeline (scripts/run_pipeline.py step 5).
+_target_: src.model_wrappers.diffusion.difix_wrapper.DifixWrapper
+
+name: "difix_ref"
+model_id: "nvidia/difix_ref"
+
+# The default noise level (199 is recommended for Difix3D+)
+default_timestep: 199
+
+# Maximum resolution the model/GPU can handle. Frames larger than this are
+# downscaled to fit; smaller frames are kept as-is (no upscaling).
+# Dimensions are snapped to the nearest multiple of 8 (VAE requirement).
+max_width: 1280
+max_height: 720
+
+# Condition on the real frame at the same camera + timestep.
+use_ref: true
+
+# MUST stay false while use_ref is true. See the comment in difix_wrapper.py.
+enable_vae_slicing: false

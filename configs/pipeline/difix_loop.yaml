@@ -1,0 +1,52 @@
+# configs/pipeline/difix_loop.yaml
+#
+# The iterative Difix pseudo-view loop (scripts/run_difix_loop.py).
+#
+# Round r trains a FRESH model on the real frames plus every manifest produced
+# by rounds 0..r-1, then renders the next shift level, cleans a slice of it with
+# reference-conditioned Difix, and emits manifest r. With a schedule of length R
+# there are R+1 rounds; the last one trains only.
+#
+#   round 0: train(real)            -> render {0,-1}       phase 0 -> manifest 0
+#   round 1: train(real + m0)       -> render {0,-1,-2}    phase 2 -> manifest 1
+#   round 2: train(real + m0,m1)    -> render {0,-1,-2,-3} phase 4 -> manifest 2
+#   round 3: train(real + m0,m1,m2) -> FINAL
+
+# --- Shift curriculum -------------------------------------------------------
+# Explicit schedule wins. One entry per round, each a list of [x_m, y_m, z_m]
+# triplets in the style of configs/rendering/render.yaml. The zero shift is
+# added automatically as the control and never becomes training data.
+#   shift_schedule:
+#     - [[-1, 0, 0]]
+#     - [[-1, 0, 0], [-2, 0, 0]]
+#     - [[-1, 0, 0], [-2, 0, 0], [-3, 0, 0]]
+# Leave null to generate that ramp from step_shift toward target_shift.
+shift_schedule: null
+target_shift: [-3, 0, 0]
+step_shift: [-1, 0, 0]
+
+# --- Per-round training -----------------------------------------------------
+# null -> gaussian_splatting.max_steps for every round. Otherwise one entry per
+# round, e.g. [7000, 7000, 7000, 30000] to keep the intermediate models cheap
+# (they exist only to render the next pseudo-GT) and spend the budget on the
+# final one. eval/save/ply steps are re-derived from this automatically.
+max_steps_per_round: null
+
+# --- Frame selection --------------------------------------------------------
+# Difix every Nth frame, rotating the starting offset per round so successive
+# rounds cover different timesteps: stride 6 with phases 0/2/4 gives
+# {0,6,12,...}, {2,8,14,...}, {4,10,16,...}. Validation frames are excluded.
+frame_stride: 6
+frame_phase_per_round: null   # null -> round * 2
+
+# --- Scope ------------------------------------------------------------------
+# Empty = every camera in the ncore dataset. A single camera is much cheaper for
+# a first end-to-end validation run, at the cost of a weaker pseudo-GT bank.
+cameras: []
+
+# Downscale factor for training and the real-frame bank. Both must agree, which
+# they do because the loop passes one gaussian_splatting config to each.
+data_factor: 2
+
+# Re-run rounds even when their .success markers exist.
+force: false

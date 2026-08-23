@@ -192,6 +192,30 @@ class Config:
     with_eval3d: bool = True
 
     # ----------------------------------------------------------------- #
+    # Difix pseudo-views (static-only lateral-parallax augmentation)     #
+    # ----------------------------------------------------------------- #
+    # Round manifests produced by the pseudo-view loop. Empty disables the
+    # whole path, leaving training byte-for-byte as before. Listing several
+    # accumulates them into one bank (round r is handed rounds 1..r).
+    pseudo_manifests: List[str] = field(default_factory=list)
+    # Fraction of steps drawn from the pseudo bank instead of the real frames.
+    # Fixed on purpose: pseudo-views live in a SEPARATE dataset, so the mixing
+    # ratio stays put as the bank grows across rounds rather than drifting
+    # upward with its size.
+    pseudo_sample_prob: float = 0.3
+    # Per-step loss multipliers, matching the Difix3D+ reference
+    # (examples/gsplat/simple_trainer_difix3d.py:585 and :708-712). Effective
+    # weight is real 0.7*1.5 = 1.05 vs pseudo 0.3*0.3 = 0.09, i.e. ~11.7:1.
+    # real_loss_scale compensates for real frames losing 30% of the step budget,
+    # so pseudo supervision is additive rather than displacing.
+    pseudo_lambda: float = 0.3
+    real_loss_scale: float = 1.5
+    # Let pseudo steps drive densification. Ablation knob only: it gates the
+    # DefaultStrategy hooks, and is a NO-OP under strategy_type="mcmc" whose
+    # step_post_backward ignores `info` and is driven by the step counter.
+    pseudo_densify: bool = True
+
+    # ----------------------------------------------------------------- #
     # Dynamic rigid objects (vehicles) — 4D extension                    #
     # ----------------------------------------------------------------- #
     # Master switch. When False, training is background-only (unchanged).
