@@ -1,13 +1,39 @@
 import os
+import time
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from gsplat.distributed import cli
 
 # Import your existing classes from wherever you saved them
-from src.gsplat_training.config_training import Config 
+from src.gsplat_training.config_training import Config
 from src.gsplat_training.runner import main as runner_main
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+
+
+def _fmt_hms(seconds):
+    """Format a duration as HH:MM:SS. Hours accumulate past 24 rather than wrap."""
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _stamp_success(path, message, elapsed, breakdown=None):
+    """Write a .success marker carrying its runtime and optional sub-block times.
+
+    Nothing in the pipeline reads these files -- only their existence is checked
+    -- so the extra lines are free to grow.
+    """
+    lines = [message, f"duration: {_fmt_hms(elapsed)}"]
+    if breakdown:
+        width = max(len(label) for label, _ in breakdown)
+        for label, value in breakdown:
+            shown = value if isinstance(value, str) else _fmt_hms(value)
+            lines.append(f"  {label:<{width}}  {shown}")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="config")
 def main(cfg: DictConfig):
@@ -45,12 +71,20 @@ def main(cfg: DictConfig):
     # 5. Launch the distributed training exactly like the original tyro script did
     #    This passes control over to gsplat's multi-GPU wrapper, which will 
     #    ultimately call `runner_main(local_rank, world_rank, world_size, cfg_obj)`
+    # Timed from here rather than the top of main(): everything above is config
+    # marshalling and takes microseconds, so the total is the training itself.
+    # No finer split is available without instrumenting runner.py.
+    t_start = time.perf_counter()
     cli(runner_main, cfg_obj, verbose=True)
-    
+
     standalone_success_path = os.path.join(cfg_obj.result_dir, ".success")
-    with open(standalone_success_path, "w") as f:
-        f.write("GSplat training completed successfully.")
-        
+    _stamp_success(
+        standalone_success_path,
+        f"GSplat training completed successfully ({cfg_obj.max_steps} steps).",
+        time.perf_counter() - t_start,
+    )
+
+
     print(f"✅ Standalone success marker written to {standalone_success_path}")
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ import csv
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -45,6 +46,30 @@ MANIFEST_SCHEMA_VERSION = 1
 
 # |difix - render| above this (0-255) counts a pixel as changed.
 CHANGED_THRESHOLD = 2.0
+
+
+def _fmt_hms(seconds: float) -> str:
+    """Format a duration as HH:MM:SS. Hours accumulate past 24 rather than wrap."""
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _stamp_success(path: str, message: str, elapsed: float, breakdown=None) -> None:
+    """Write a .success marker carrying its runtime and optional sub-block times.
+
+    Nothing in the pipeline reads these files -- only their existence is checked
+    -- so the extra lines are free to grow.
+    """
+    lines = [message, f"duration: {_fmt_hms(elapsed)}"]
+    if breakdown:
+        width = max(len(label) for label, _ in breakdown)
+        for label, value in breakdown:
+            shown = value if isinstance(value, str) else _fmt_hms(value)
+            lines.append(f"  {label:<{width}}  {shown}")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def load_real_index(real_bank_dir: str) -> Dict[str, Any]:
@@ -94,16 +119,54 @@ def select_frames(
     ]
 
 
-def discover_shifts(render_dir: str) -> List[str]:
+def discover_shifts(
+    render_dir: str, requested_m: Optional[List[List[float]]] = None
+) -> List[str]:
+    """Shift directories to clean, optionally filtered to a requested subset.
+
+    The loop renders every shift level each round so successive rounds can be
+    compared on the same trajectories, but cleans only the levels scheduled for
+    that round. ``requested_m`` is that subset, in metres; matching goes through
+    :func:`parse_shift_metres` so the caller never has to reproduce
+    ``render_standalone._shift_name``.
+
+    Args:
+        render_dir: A render mode directory, e.g. ``<round>/render/full``.
+        requested_m: ``[x, y, z]`` triplets to keep. ``None`` or empty keeps all.
+
+    Returns:
+        Shift directory names, sorted.
+
+    Raises:
+        FileNotFoundError: If ``render_dir`` holds no ``frames/``.
+        ValueError: If a requested shift was never rendered.
+    """
     frames_root = os.path.join(render_dir, "frames")
     if not os.path.isdir(frames_root):
         raise FileNotFoundError(
             f"{frames_root} not found. Point render_dir at a render mode "
             "directory, e.g. <round>/render/full"
         )
-    return sorted(
+    available = sorted(
         d for d in os.listdir(frames_root) if os.path.isdir(os.path.join(frames_root, d))
     )
+    if not requested_m:
+        return available
+
+    def matches(name: str, wanted: List[float]) -> bool:
+        parsed = parse_shift_metres(name)
+        return parsed is not None and all(
+            abs(a - b) < 1e-6 for a, b in zip(parsed, wanted)
+        )
+
+    selected = [n for n in available if any(matches(n, w) for w in requested_m)]
+    unmatched = [w for w in requested_m if not any(matches(n, w) for n in available)]
+    if unmatched:
+        raise ValueError(
+            f"shifts {unmatched} were requested but not rendered under "
+            f"{frames_root} (available: {available})"
+        )
+    return selected
 
 
 def build_jobs(
@@ -404,10 +467,14 @@ def main(cfg: DictConfig) -> None:
         print(f"Pseudo-view round already complete at {output_dir}")
         return
 
+    t_start = time.perf_counter()
+    phases: List[Tuple[str, float]] = []
+
     os.makedirs(output_dir, exist_ok=True)
     real_index = load_real_index(real_bank_dir)
 
-    shifts = discover_shifts(render_dir)
+    requested_m = [[float(v) for v in s] for s in (task.shifts_m or [])]
+    shifts = discover_shifts(render_dir, requested_m)
     cameras = list(task.cameras) or sorted(real_index["cameras"])
     missing = [c for c in cameras if c not in real_index["cameras"]]
     if missing:
@@ -442,22 +509,40 @@ def main(cfg: DictConfig) -> None:
         f"{len(jobs) - n_control} pseudo)"
     )
 
+    t_phase = time.perf_counter()
     wrapper = instantiate(cfg.diffusion)
     if not getattr(wrapper, "use_ref", False):
         print(
             "WARNING: the diffusion model is not reference-conditioned. Pass "
             "model@diffusion=difix_ref so the real frame guides the cleaning."
         )
-    wrapper.process_pairs(
-        jobs,
-        prompt=task.prompt,
-        timestep=int(task.timestep),
-        skip_existing=not task.force,
-    )
+    phases.append(("model load", time.perf_counter() - t_phase))
 
+    # One process_pairs call per shift so each level is timed on its own. Free:
+    # build_jobs already emits shift-major order, so the work and its order are
+    # unchanged, and the pipeline is built in DifixWrapper.__init__ rather than
+    # per call, so the model is loaded exactly once either way.
+    for shift_name in shifts:
+        shift_jobs = [j for j, m in zip(jobs, meta) if m["shift_name"] == shift_name]
+        if not shift_jobs:
+            continue
+        t_phase = time.perf_counter()
+        wrapper.process_pairs(
+            shift_jobs,
+            prompt=task.prompt,
+            timestep=int(task.timestep),
+            skip_existing=not task.force,
+        )
+        elapsed = time.perf_counter() - t_phase
+        phases.append((f"difix {shift_name} ({len(shift_jobs)} frames)", elapsed))
+        print(f"  {shift_name}: {len(shift_jobs)} frames in {_fmt_hms(elapsed)}")
+
+    t_phase = time.perf_counter()
     rows = compute_stats(meta, task.control_shift_name)
     write_stats(rows, output_dir)
+    phases.append(("stats", time.perf_counter() - t_phase))
 
+    t_phase = time.perf_counter()
     manifest = build_manifest(
         meta=meta,
         render_dir=render_dir,
@@ -471,9 +556,14 @@ def main(cfg: DictConfig) -> None:
     with open(manifest_path, "w") as fp:
         json.dump(manifest, fp, indent=2)
     print(f"\nManifest: {len(manifest['entries'])} pseudo-views -> {manifest_path}")
+    phases.append(("manifest", time.perf_counter() - t_phase))
 
-    with open(success_marker, "w") as fp:
-        fp.write("Difix pseudo-view round completed successfully.\n")
+    _stamp_success(
+        success_marker,
+        "Difix pseudo-view round completed successfully.",
+        time.perf_counter() - t_start,
+        phases,
+    )
 
 
 if __name__ == "__main__":

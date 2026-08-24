@@ -23,6 +23,13 @@ round: 0
 # Empty = every camera present in the render dir.
 cameras: []
 
+# Which shift levels to clean, as [x_m, y_m, z_m] triplets. Empty = every shift
+# found under render_dir/frames. The loop renders ALL levels every round so
+# successive rounds can be compared on identical trajectories, but cleans only
+# the levels scheduled for that round -- this is what selects them. Matching is
+# by value, so callers never reproduce render_standalone's shift naming.
+shifts_m: []
+
 # The zero shift is difixed and measured as a CONTROL (real ground truth exists
 # there) but never enters the manifest. Its name is set by render_standalone's
 # _shift_name for an all-zero shift.

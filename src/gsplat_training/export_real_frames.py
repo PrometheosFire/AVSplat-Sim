@@ -36,8 +36,9 @@ Run standalone::
 
 import json
 import os
+import time
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import cv2
 import hydra
@@ -48,6 +49,30 @@ from config_training import Config
 from datasets.ncore import NCoreParser
 
 SCHEMA_VERSION = 1
+
+
+def _fmt_hms(seconds: float) -> str:
+    """Format a duration as HH:MM:SS. Hours accumulate past 24 rather than wrap."""
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _stamp_success(path: str, message: str, elapsed: float, breakdown=None) -> None:
+    """Write a .success marker carrying its runtime and optional sub-block times.
+
+    Nothing in the pipeline reads these files -- only their existence is checked
+    -- so the extra lines are free to grow.
+    """
+    lines = [message, f"duration: {_fmt_hms(elapsed)}"]
+    if breakdown:
+        width = max(len(label) for label, _ in breakdown)
+        for label, value in breakdown:
+            shown = value if isinstance(value, str) else _fmt_hms(value)
+            lines.append(f"  {label:<{width}}  {shown}")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def load_gsplat_config(cfg: DictConfig) -> Config:
@@ -91,7 +116,9 @@ def build_parser(gs_cfg: Config) -> NCoreParser:
     )
 
 
-def export_frames(parser: NCoreParser, out_dir: str) -> Dict[str, Any]:
+def export_frames(
+    parser: NCoreParser, out_dir: str
+) -> Tuple[Dict[str, Any], List[Tuple[str, float]]]:
     """Write every frame in the parser to ``out_dir`` and return the index.
 
     Walks the flat (camera-major) frame list once, keeping a per-camera counter
@@ -101,9 +128,12 @@ def export_frames(parser: NCoreParser, out_dir: str) -> Dict[str, Any]:
     tensor before normalisation.
 
     Returns:
-        The ``index.json`` payload: per camera, its ``camera_index``, size,
-        intrinsics and a list of ``{frame_idx, global_index, timestamp_us,
-        is_val, image}`` records.
+        ``(index, per_camera_seconds)``. ``index`` is the ``index.json`` payload:
+        per camera, its ``camera_index``, size, intrinsics and a list of
+        ``{frame_idx, global_index, timestamp_us, is_val, image}`` records.
+        ``per_camera_seconds`` is the decode+write time attributed to each
+        camera, accumulated per frame so it stays correct whatever order the
+        flat frame list happens to be in.
     """
     sequence_loader = parser._open_sequence_loader(parser.sequence_meta_file_path)
     sensors = {cid: sequence_loader.get_camera_sensor(cid) for cid in parser.camera_ids}
@@ -121,7 +151,9 @@ def export_frames(parser: NCoreParser, out_dir: str) -> Dict[str, Any]:
         }
 
     local_counter: Dict[str, int] = defaultdict(int)
+    per_camera_seconds: Dict[str, float] = defaultdict(float)
     for global_index in range(len(parser.frame_list)):
+        t_frame = time.perf_counter()
         camera_id, sensor_frame_idx = parser.frame_list[global_index]
         local_idx = local_counter[camera_id]
         local_counter[camera_id] += 1
@@ -146,13 +178,16 @@ def export_frames(parser: NCoreParser, out_dir: str) -> Dict[str, Any]:
                 "image": rel_path,
             }
         )
+        per_camera_seconds[camera_id] += time.perf_counter() - t_frame
 
-    return {
+    index = {
         "schema_version": SCHEMA_VERSION,
         "test_every": int(parser.test_every),
         "num_frames": int(len(parser.frame_list)),
         "cameras": cameras,
     }
+    per_camera = [(cid, per_camera_seconds[cid]) for cid in parser.camera_ids]
+    return index, per_camera
 
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="config")
@@ -163,8 +198,10 @@ def main(cfg: DictConfig) -> None:
         print(f"Real-frame bank already exported at {out_dir}")
         return
 
+    t_start = time.perf_counter()
     parser = build_parser(load_gsplat_config(cfg))
-    index = export_frames(parser, out_dir)
+    t_parser = time.perf_counter() - t_start
+    index, per_camera = export_frames(parser, out_dir)
 
     with open(os.path.join(out_dir, "index.json"), "w") as fp:
         json.dump(index, fp, indent=2)
@@ -178,8 +215,12 @@ def main(cfg: DictConfig) -> None:
         f"({n_val} marked is_val and excluded from pseudo-view generation)"
     )
 
-    with open(success_marker, "w") as fp:
-        fp.write("Real frame export completed successfully.\n")
+    _stamp_success(
+        success_marker,
+        "Real frame export completed successfully.",
+        time.perf_counter() - t_start,
+        [("parser build", t_parser), *per_camera],
+    )
 
 
 if __name__ == "__main__":

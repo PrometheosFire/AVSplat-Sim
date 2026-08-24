@@ -1,4 +1,5 @@
 import os
+import time
 import cv2
 import numpy as np
 import scipy.ndimage as ndimage
@@ -6,6 +7,31 @@ import hydra
 from hydra.utils import to_absolute_path
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
+
+
+def _fmt_hms(seconds):
+    """Format a duration as HH:MM:SS. Hours accumulate past 24 rather than wrap."""
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _stamp_success(path, message, elapsed, breakdown=None):
+    """Write a .success marker carrying its runtime and optional sub-block times.
+
+    Nothing in the pipeline reads these files -- only their existence is checked
+    -- so the extra lines are free to grow.
+    """
+    lines = [message, f"duration: {_fmt_hms(elapsed)}"]
+    if breakdown:
+        width = max(len(label) for label, _ in breakdown)
+        for label, value in breakdown:
+            shown = value if isinstance(value, str) else _fmt_hms(value)
+            lines.append(f"  {label:<{width}}  {shown}")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
 
 @hydra.main(version_base=None, config_path="../../configs", config_name="config")
 def main(cfg: DictConfig):
@@ -24,6 +50,9 @@ def main(cfg: DictConfig):
     
     dilation_pct = cfg.mask_processing.dilation_percentage
 
+    t_start = time.perf_counter()
+    per_camera = []
+
     for camera_name in cfg.dataset.cameras:
         sam_camera_dir = os.path.join(sam_masks_base_dir, camera_name)
         ego_camera_dir = os.path.join(ego_masks_base_dir, camera_name)
@@ -35,11 +64,13 @@ def main(cfg: DictConfig):
         # Idempotent Checkpoint
         if os.path.exists(camera_success_marker):
             print(f"⏭️ Skipping {camera_name}: .success marker found. Already fused!")
+            per_camera.append((camera_name, "cached"))
             continue
 
         print(f"\n--- Fusing and Dilating Camera: {camera_name} ---")
-        
+
         try:
+            t_cam = time.perf_counter()
             # Grab all SAM mask filenames
             valid_exts = ('.png', '.jpg', '.jpeg')
             sam_files = sorted([f for f in os.listdir(sam_camera_dir) if f.lower().endswith(valid_exts)])
@@ -100,9 +131,17 @@ def main(cfg: DictConfig):
                 cv2.imwrite(save_path, final_saved_mask)
                 
             # Write the granular success marker for this specific camera
-            with open(camera_success_marker, "w") as f:
-                f.write(f"Fused and dilated with {n_dilation} iterations ({dilation_pct}% of width)")
-            print(f"✅ Fused & Dilated {len(sam_files)} frames for {camera_name}")
+            cam_elapsed = time.perf_counter() - t_cam
+            per_camera.append((camera_name, cam_elapsed))
+            _stamp_success(
+                camera_success_marker,
+                f"Fused and dilated with {n_dilation} iterations ({dilation_pct}% of width)",
+                cam_elapsed,
+            )
+            print(
+                f"✅ Fused & Dilated {len(sam_files)} frames for {camera_name} "
+                f"in {_fmt_hms(cam_elapsed)}"
+            )
 
         except Exception as e:
             print(f"\n❌ ERROR processing {camera_name}: {e}")
@@ -110,8 +149,12 @@ def main(cfg: DictConfig):
             exit(1)
             
     master_success_marker = os.path.join(output_base_dir, ".success")
-    with open(master_success_marker, "w") as f:
-        f.write("All cameras fused and dilated successfully.")
+    _stamp_success(
+        master_success_marker,
+        "All cameras fused and dilated successfully.",
+        time.perf_counter() - t_start,
+        per_camera,
+    )
 
     print(f"\n🎉 Mask Fusion Complete! All data ready for 3D Splatting.")
 

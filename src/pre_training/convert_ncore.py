@@ -2,12 +2,38 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import hydra
 import numpy as np
 import pycolmap
 from hydra.core.hydra_config import HydraConfig
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
+
+
+def _fmt_hms(seconds):
+    """Format a duration as HH:MM:SS. Hours accumulate past 24 rather than wrap."""
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _stamp_success(path, message, elapsed, breakdown=None):
+    """Write a .success marker carrying its runtime and optional sub-block times.
+
+    Nothing in the pipeline reads these files -- only their existence is checked
+    -- so the extra lines are free to grow.
+    """
+    lines = [message, f"duration: {_fmt_hms(elapsed)}"]
+    if breakdown:
+        width = max(len(label) for label, _ in breakdown)
+        for label, value in breakdown:
+            shown = value if isinstance(value, str) else _fmt_hms(value)
+            lines.append(f"  {label:<{width}}  {shown}")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
 
 def create_symlink(src: str, dst: str):
     """Creates a symlink securely. Removes existing link if necessary."""
@@ -33,7 +59,11 @@ def main(cfg: DictConfig):
     os.makedirs(final_output_dir, exist_ok=True)
 
     print(f"\n--- 🏗️ Building Virtual Symlink Farm ---")
-    
+
+    t_start = time.perf_counter()
+    t_phase = t_start
+    phases = []
+
     create_symlink(os.path.join(dataset_base, "images"), os.path.join(staging_dir, "images"))
     if input_masks_dir:
         create_symlink(input_masks_dir, os.path.join(staging_dir, "masks"))
@@ -55,6 +85,8 @@ def main(cfg: DictConfig):
         raise FileNotFoundError(f"Could not find valid COLMAP data in {dataset_base}")
 
     print("✅ Symlink farm built.")
+    phases.append(("symlink farm", time.perf_counter() - t_phase))
+    t_phase = time.perf_counter()
 
     # 3. Execute the External ncore Converter
     print(f"\n--- 🚀 Running ncore Converter ---")
@@ -85,6 +117,9 @@ def main(cfg: DictConfig):
             # Delete the now-empty 'staging_symlinks' folder
             os.rmdir(generated_nested_dir)
         
+        phases.append(("ncore converter", time.perf_counter() - t_phase))
+        t_phase = time.perf_counter()
+
         # ==========================================
         # 📷 Extract, Map, and Sort Camera IDs
         # ==========================================
@@ -139,6 +174,9 @@ def main(cfg: DictConfig):
         OmegaConf.save({"ncore_camera_ids": sorted_camera_names}, cam_list_path)
         
         print(f"\n✅ Saved {len(sorted_camera_names)} cameras in optimal order: {sorted_camera_names}")
+
+        phases.append(("camera ids", time.perf_counter() - t_phase))
+        t_phase = time.perf_counter()
 
         # ==========================================
         # 🎯 Extract Point Visibility for Depth Loss
@@ -202,10 +240,16 @@ def main(cfg: DictConfig):
         print(f"🎉 Conversion Worker Finished! Final ncore dataset ready at:\n{final_output_dir}")
         
         
+        phases.append(("point visibility", time.perf_counter() - t_phase))
+
         # Note: No .success marker written here anymore! The drone just finishes its job.
         master_ncore_success = os.path.join(workspace_dir, ".success")
-        with open(master_ncore_success, "w") as f:
-                f.write("Dataset successfully converted to ncore format.")
+        _stamp_success(
+            master_ncore_success,
+            "Dataset successfully converted to ncore format.",
+            time.perf_counter() - t_start,
+            phases,
+        )
 
         print(f"\n🎉 Conversion Worker Finished! Final ncore dataset ready at:\n{final_output_dir}")
         
