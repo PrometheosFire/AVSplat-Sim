@@ -102,7 +102,7 @@ fill_gaps: true
 # held). Covers objects still visible in the fisheye view but no longer detected
 # by the narrower-FOV tracker at frame edges / far range. 0 disables. Extended
 # boxes are marked "extrapolated": true.
-extend_frames: 5
+extend_frames: 0
 extend_velocity_window: 3
 
 # Pose smoothing: after gap-fill/extension, low-pass each track's per-frame
@@ -140,9 +140,9 @@ pose_smooth_rotation_min_speed: 0.05
 # JSON, projection and bicycle_params.json are written to the <refine_dir> root,
 # which is what all downstream stages (4DGS training, simulator) read.
 user_refinement:
-  enabled: false
-  default_extend: 5
-  extend_velocity_window: 3
+  enabled: true
+  default_extend: 0
+  extend_velocity_window: 5
   post_bicycle_fit: true
   # If true, when re-running with the SAME configs (same step-15 hash), the
   # interactive loop continues from the newest existing user_refinement snapshot
@@ -188,7 +188,7 @@ bicycle_fit:
   # against a pure single rollout so res.states == the baked rollout. TRUE makes
   # "states" and "rollout" identical; FALSE gives the genuinely different pair
   # (states hugs the detections; rollout is smooth / simulator-reproducible).
-  polish_single_shooting: false
+  polish_single_shooting: true
   polish_max_nfev: 400
   # Analytic Jacobian instead of scipy's finite differences. The FD path spends
   # one extra residual evaluation per Jacobian column group on EVERY solver

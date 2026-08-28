@@ -17,6 +17,12 @@ while PSNR punishes the resulting sub-pixel misalignment (measured: PSNR -1.92 d
 while LPIPS improved 47% on a visibly better image). Control frames are cleaned
 and measured but never enter the manifest.
 
+``pseudo_task.dynamic`` records whether the renders being cleaned contained
+rigid objects, and the trainer reads it back to decide whether to composite
+vehicles into a pseudo-view's render. It describes the IMAGES, not the intent of
+whatever trains on them -- the dynamic loop's ``final_round`` mode deliberately
+feeds a bank of static rounds to a dynamic final round.
+
 Run standalone::
 
     PYTHONPATH=. envs/envs/env_gsplat/bin/python \\
@@ -42,7 +48,9 @@ import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 
-MANIFEST_SCHEMA_VERSION = 1
+# 2 added the top-level "dynamic" flag. datasets/pseudo.py still reads version 1
+# (treating it as static), so banks written before this stay usable.
+MANIFEST_SCHEMA_VERSION = 2
 
 # |difix - render| above this (0-255) counts a pixel as changed.
 CHANGED_THRESHOLD = 2.0
@@ -361,12 +369,21 @@ def build_manifest(
     phase: int,
     stride: int,
     test_every: Optional[int],
+    dynamic: bool,
 ) -> Dict[str, Any]:
     """Assemble the trainer-facing manifest, excluding control views.
 
     Poses come from the ``camtoworlds.npy`` the renderer saved next to the
     frames, so the manifest records the poses that were ACTUALLY rendered rather
     than re-deriving the shift and risking disagreement.
+
+    ``dynamic`` records whether those renders contained rigid objects. It is a
+    top-level field because one round cleans one render tree, which is uniformly
+    dynamic or not; the trainer's per-view granularity comes from concatenating
+    several rounds' manifests, not from variation inside one. It must describe
+    the IMAGES -- a manifest that claims the wrong thing makes the trainer
+    either paint vehicles into the background or try to erase them, both
+    silently.
     """
     pose_cache: Dict[Tuple[str, str], np.ndarray] = {}
     entries: List[Dict[str, Any]] = []
@@ -412,6 +429,7 @@ def build_manifest(
         "phase": phase,
         "frame_stride": stride,
         "test_every": test_every,
+        "dynamic": bool(dynamic),
         "render_dir": os.path.abspath(render_dir),
         "entries": entries,
     }
@@ -485,7 +503,8 @@ def main(cfg: DictConfig) -> None:
 
     print(
         f"Round {task.round}: shifts={shifts} cameras={cameras} "
-        f"stride={task.frame_stride} phase={task.frame_phase}"
+        f"stride={task.frame_stride} phase={task.frame_phase} "
+        f"dynamic={bool(task.dynamic)}"
     )
 
     jobs, meta = build_jobs(
@@ -551,6 +570,7 @@ def main(cfg: DictConfig) -> None:
         phase=int(task.frame_phase),
         stride=int(task.frame_stride),
         test_every=real_index.get("test_every"),
+        dynamic=bool(task.dynamic),
     )
     manifest_path = os.path.join(output_dir, "manifest.json")
     with open(manifest_path, "w") as fp:

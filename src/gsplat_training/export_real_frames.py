@@ -180,10 +180,26 @@ def export_frames(
         )
         per_camera_seconds[camera_id] += time.perf_counter() - t_frame
 
+    # Whether every camera has the same frame count and they share one timestamp
+    # set. This is the precondition for compositing dynamic objects into a
+    # rendered trajectory: the RENDERER has no timestamps at all -- it walks
+    # frames positionally and places vehicles with "frame i -> rigid i"
+    # (render_standalone.render_trajectory) -- while the TRAINER resolves them
+    # from a timestamp via RigidTracks.frame_index_from_timestamp. Those two
+    # agree exactly when the flat frame list divides evenly by camera.
+    #
+    # Measured on both a 200-frame scene (1000 = 5x200) and a 201-frame one
+    # (1005 = 5x201): zero mismatches. A ragged scene -- one camera short a
+    # frame -- would silently place that camera's vehicles one rigid frame off,
+    # so the dynamic loop refuses to start when this is false. The static
+    # pipeline ignores the field.
+    n_unique_ts = len(set(int(t) for t in parser.frame_timestamps_us))
     index = {
         "schema_version": SCHEMA_VERSION,
         "test_every": int(parser.test_every),
         "num_frames": int(len(parser.frame_list)),
+        "num_unique_timestamps": n_unique_ts,
+        "frames_balanced": len(parser.frame_list) == len(parser.camera_ids) * n_unique_ts,
         "cameras": cameras,
     }
     per_camera = [(cid, per_camera_seconds[cid]) for cid in parser.camera_ids]
@@ -214,6 +230,15 @@ def main(cfg: DictConfig) -> None:
         f"{len(index['cameras'])} cameras to {out_dir} "
         f"({n_val} marked is_val and excluded from pseudo-view generation)"
     )
+    if not index["frames_balanced"]:
+        print(
+            f"WARNING: frames are NOT balanced across cameras "
+            f"({index['num_frames']} frames, {len(index['cameras'])} cameras, "
+            f"{index['num_unique_timestamps']} unique timestamps). Static "
+            f"training is unaffected, but the dynamic pseudo-view loop will "
+            f"refuse this scene: the renderer places vehicles positionally and "
+            f"would disagree with the trainer's timestamp lookup."
+        )
 
     _stamp_success(
         success_marker,

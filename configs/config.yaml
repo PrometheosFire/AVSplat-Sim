@@ -11,6 +11,7 @@ defaults:
   - pipeline@diff_task: apply_diffusion   # Loads pipeline/apply_diffusion.yaml into cfg.diff_task
   - pipeline@pseudo_task: difix_pseudo    # Loads pipeline/difix_pseudo.yaml into cfg.pseudo_task
   - pipeline@loop_task: difix_loop        # Loads pipeline/difix_loop.yaml into cfg.loop_task
+  - pipeline@loop4d_task: difix_4dgs      # Loads pipeline/difix_4dgs.yaml into cfg.loop4d_task
   - pipeline@track_task: run_tracking     # Loads pipeline/run_tracking.yaml into cfg.track_task
   - pipeline@refine_task: refine_tracks   # Loads pipeline/refine_tracks.yaml into cfg.refine_task
 
@@ -31,4 +32,4 @@ hydra:
 mask_processing:
   use_ego_masks: true
   dilate_ego: false
-  dilation_percentage: 0.15
+  dilation_percentage: 0.25

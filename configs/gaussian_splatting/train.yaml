@@ -159,6 +159,6 @@ bicycle_wheelbase_alpha: 0.60
 
 
 strategy:
-  cap_max: 1500000        # Default cap
+  cap_max: 2000000        # Default cap
   min_opacity: 0.005        # Default pruning opacity
 

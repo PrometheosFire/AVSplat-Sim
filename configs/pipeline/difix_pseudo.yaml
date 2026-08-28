@@ -20,6 +20,21 @@ frame_phase: 0
 # Recorded in the manifest for provenance.
 round: 0
 
+# Did the renders being cleaned contain dynamic rigid objects (vehicles)?
+#
+# Recorded in the manifest, and it is the trainer's ONLY signal for whether to
+# composite rigid nodes into a pseudo-view's render: PseudoViewDataset emits
+# timestamp_us for dynamic entries, which is what makes
+# Runner._resolve_rigid_frame_idx return a frame instead of None.
+#
+# This describes WHAT THE RENDERS CONTAINED, not what the next round intends to
+# train. The two diverge on purpose in the dynamic loop's final_round mode,
+# where a bank of static rounds feeds a dynamic final round -- those images have
+# no vehicles, so the loss must not add any.
+#
+# Set by scripts/run_difix_4dgs.py. The static loop leaves it false.
+dynamic: false
+
 # Empty = every camera present in the render dir.
 cameras: []
 

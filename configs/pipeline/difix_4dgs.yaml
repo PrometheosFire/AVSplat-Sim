@@ -1,0 +1,77 @@
+# configs/pipeline/difix_4dgs.yaml
+#
+# The Difix pseudo-view loop WITH dynamic rigid objects
+# (scripts/run_difix_4dgs.py).
+#
+# Same curriculum as difix_loop.yaml -- train, render laterally shifted
+# trajectories, clean them with reference-conditioned Difix, retrain from
+# scratch with the cleaned frames added -- but the scene also carries tracked
+# vehicles as rigid Gaussian nodes.
+#
+# Everything this pipeline touches lives under
+#   results/extended_4dgs/${dataset.name}/${dataset.scene}/
+# and nothing is read from results/4dgs/ or results/<dataset>/<scene>/. Tracking
+# and refinement re-run the first time a scene goes through here; that is the
+# deliberate price of having one place to look.
+
+# --- Which rounds model vehicles ------------------------------------------
+# all_rounds
+#   Vehicles are modelled from round 0, so the renders contain them, so the
+#   pseudo-views contain them, so pseudo-GT supervises the rigid nodes too.
+#   The open question this mode answers: do diffused pseudo-views help dynamic
+#   objects, or does Difix mangle vehicles at shifted viewpoints?
+#
+#     round 0: train(real, DYN)         -> render DYN -> difix -> m0 (dynamic)
+#     round 1: train(real+m0, DYN)      -> render DYN -> difix -> m1
+#     round N: train(real+m0..., DYN)   -> render DYN    FINAL
+#
+# final_round
+#   Background-only rounds build a well-constrained static scene from
+#   pseudo-views, then ONE dynamic round fits vehicles on top of it. The static
+#   rounds train against SAM-masked images so no vehicle bakes into the
+#   background as a ghost; the final round switches to ego-masked images so the
+#   rigid nodes have vehicle pixels to learn from.
+#
+#     round 0: train(real, STATIC, masked)    -> render -> difix -> m0 (static)
+#     round 1: train(real+m0, STATIC, masked) -> render -> difix -> m1
+#     round N: train(real+m0..., DYN, ego)    -> render DYN    FINAL
+#
+#   Its pseudo-views contain no vehicles, and the manifest says so, so the
+#   trainer renders them background-only while the real frames alone supervise
+#   the rigid nodes. That is handled automatically -- see
+#   configs/pipeline/difix_pseudo.yaml's `dynamic` flag.
+#
+# Only final_round needs the SAM mask steps. all_rounds skips them entirely.
+dynamic_mode: all_rounds
+
+# --- Shift curriculum -------------------------------------------------------
+# Identical semantics to difix_loop.yaml. An explicit schedule wins; one entry
+# per round, each a list of [x_m, y_m, z_m] triplets. A bilateral curriculum is
+# written out explicitly, e.g.
+#   shift_schedule:
+#     - [[-1, 0, 0], [1, 0, 0]]
+#     - [[-2, 0, 0], [2, 0, 0]]
+#     - [[-3, 0, 0], [3, 0, 0]]
+shift_schedule: null
+target_shift: [-3, 0, 0]
+step_shift: [-1, 0, 0]
+
+# cumulative  -> round r cleans EVERY level up to r+1 with the freshest model.
+# incremental -> round r cleans only the newest level, reusing the bank.
+# Ignored when shift_schedule is given explicitly.
+schedule_mode: cumulative
+
+# --- Per-round training -----------------------------------------------------
+# null -> gaussian_splatting.max_steps every round. Otherwise one entry per
+# round, e.g. [7000, 7000, 7000, 30000]. eval/save/ply steps are re-derived
+# automatically -- which also matters here because the CHECKPOINT written at
+# save_steps is what dynamic rendering loads (rigid nodes are not in the PLY).
+max_steps_per_round: null
+
+# --- Frame selection --------------------------------------------------------
+frame_stride: 6
+frame_phase_per_round: null   # null -> round * 2
+
+# --- Scope ------------------------------------------------------------------
+cameras: []
+data_factor: 2

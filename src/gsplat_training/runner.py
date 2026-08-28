@@ -53,7 +53,7 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization, RasterizeMode
-from gsplat.cuda._wrapper import CameraModel
+from gsplat.cuda._wrapper import CameraModel, spherical_harmonics
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
@@ -331,34 +331,40 @@ class Runner:
                 f"but got batch_size={cfg.batch_size}."
             )
 
-        # --- Difix pseudo-views (static-only lateral-parallax augmentation) ---
+        # --- Difix pseudo-views (lateral-parallax augmentation) ---
         self.pseudo_parser = None
         self.pseudoset = None
         if cfg.pseudo_manifests:
-            # Every one of these indexes a per-image table sized len(trainset)
-            # by the SPLIT-LOCAL image_id. Pseudo-views own no row there and
-            # emit image_id=0, so enabling any of them would have them quietly
-            # write into real frame 0's embedding instead of failing.
+            # Pose-space per-image parameters stay incompatible, for a reason
+            # that survives image_id inheritance: a pseudo-view's pose is BAKED
+            # at render time from the previous round's camera_paths. If poses are
+            # also being optimised, round r's correction is already inside the
+            # pose the manifest carries, and round r+1 would apply its own delta
+            # on top -- a correction compounding across rounds with no fixed
+            # point. Colour-space modules (app_opt, bilateral grid, PPISP) have
+            # no such feedback: they never alter the geometry that gets rendered
+            # into the next round's pseudo-views.
             conflicting = [
                 name
                 for name, active in (
-                    ("app_opt", cfg.app_opt),
                     ("pose_opt", cfg.pose_opt),
                     ("pose_noise", cfg.pose_noise > 0.0),
-                    ("post_processing", cfg.post_processing is not None),
                 )
                 if active
             ]
             if conflicting:
                 raise ValueError(
                     f"pseudo_manifests is incompatible with {', '.join(conflicting)}: "
-                    "each indexes a per-image embedding table sized len(trainset) "
-                    "using the split-local image_id, which pseudo-views do not own."
+                    "a pseudo-view's pose is baked from the previous round's "
+                    "camera_paths, so a learned pose delta would compound across "
+                    "rounds. app_opt and post_processing ARE supported -- they "
+                    "index the source frame's row via inherited image_id."
                 )
-            if cfg.enable_dynamic:
-                raise ValueError(
-                    "pseudo_manifests is static-only (v1); set enable_dynamic=false."
-                )
+            # enable_dynamic is deliberately NOT in that list. Rigid nodes are
+            # indexed by capture timestamp, not by image_id, so a pseudo-view
+            # carrying the real frame's timestamp resolves to the correct rigid
+            # pose with no per-image table involved. The coherence check that
+            # dynamic DOES need is below, once the bank has been parsed.
             if cfg.batch_size != 1:
                 raise ValueError(
                     "pseudo_manifests requires batch_size=1 (rasterize_splats "
@@ -380,8 +386,42 @@ class Runner:
                 list(cfg.pseudo_manifests),
                 expected_camera_ids=list(self.parser.camera_ids),
                 expected_Ks=self.parser.Ks_dict,
+                # Lets each pseudo-view inherit the per-image row of the real
+                # frame it was rendered from, so appearance embeddings and the
+                # bilateral grid work alongside a bank. Also re-checks val
+                # exclusion from the other direction: a held-out frame is simply
+                # absent from this array and raises.
+                train_indices=self.trainset.indices,
             )
             self.pseudoset = PseudoViewDataset(self.pseudo_parser, split="train")
+
+            # A bank cleaned from renders that CONTAINED vehicles, trained
+            # without rigid nodes to render them, is the one combination that
+            # corrupts silently: the photometric loss has no vehicle geometry to
+            # explain those pixels with, so it drives the BACKGROUND Gaussians
+            # to paint them in permanently -- and the result looks plausible.
+            # Fail at startup instead.
+            if self.pseudo_parser.has_dynamic and not cfg.enable_dynamic:
+                raise ValueError(
+                    "pseudo_manifests contains views cleaned from DYNAMIC "
+                    "renders, but enable_dynamic=false. Those images have "
+                    "vehicles this model has no rigid nodes to render, so the "
+                    "background would learn to paint them in. Either set "
+                    "enable_dynamic=true (with dynamic_tracks_json and "
+                    "dynamic_scene_root), or use a bank built from static "
+                    f"renders. Manifests: {list(cfg.pseudo_manifests)}"
+                )
+            # The inverse is legitimate and is how the dynamic loop's
+            # final_round mode works: a bank of background-only rounds training
+            # a round that also fits vehicles. Those pseudo-views omit
+            # timestamp_us, so rigid nodes stay out of THEIR renders while the
+            # real frames still supervise them.
+            if cfg.enable_dynamic and not self.pseudo_parser.has_dynamic:
+                print(
+                    "[Pseudo] Static bank + enable_dynamic=true: pseudo steps "
+                    "render background only; rigid objects are supervised by "
+                    "the real frames alone."
+                )
         if cfg.post_processing == "ppisp" and cfg.batch_size != 1:
             raise ValueError(
                 f"PPISP post-processing requires batch_size=1, got batch_size={cfg.batch_size}"
@@ -797,17 +837,26 @@ class Runner:
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
+        # Held in a local because the rigid branch below must evaluate its own SH
+        # at the SAME degree. Training ramps this (min(step // sh_degree_interval,
+        # sh_degree)), so reading cfg.sh_degree there instead would use full-degree
+        # SH for vehicles while the background is still on a lower band.
+        sh_degree_used = kwargs.pop("sh_degree", self.cfg.sh_degree)
         if self.cfg.app_opt:
             colors = self.app_module(
                 features=self.splats["features"],
                 embed_ids=image_ids,
                 dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
-                sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
+                sh_degree=sh_degree_used,
             )
             colors = colors + self.splats["colors"]
             colors = torch.sigmoid(colors)
         else:
             colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+            # Put it back: without app_opt the rasterizer does the SH evaluation
+            # itself and needs the degree in kwargs. Only the app_opt path hands
+            # it precomputed RGB.
+            kwargs["sh_degree"] = sh_degree_used
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
@@ -850,20 +899,50 @@ class Runner:
         n_background = means.shape[0]
         n_rigid = 0
         rigid_nodes = getattr(self, "rigid_nodes", None)
+
+        def _append_colors(base, extra_sh, extra_means):
+            """Concatenate extra Gaussians' colours onto the background's.
+
+            The two colour paths have different shapes and semantics, so the
+            append differs:
+
+            * no app_opt -- ``base`` is ``[N, K, 3]`` SH and the rasterizer
+              evaluates it, so SH coefficients concatenate directly on the
+              Gaussian axis (dim 0).
+            * app_opt -- ``base`` is ``[C, N, 3]`` PRECOMPUTED RGB (sh_degree was
+              removed from kwargs), so the extras must be evaluated to RGB here
+              and appended on dim 1. Reproduces gsplat's own convention exactly
+              (``gsplat.rendering.rasterization``): evaluate SH, then
+              ``clamp_min(rgb + 0.5, 0)``. ``dirs`` uses the same unnormalised
+              ``means - camera_center`` form the background path above uses; the
+              kernel normalises internally.
+            """
+            if not self.cfg.app_opt:
+                return torch.cat([base, extra_sh], dim=0)
+            dirs = extra_means[None, :, :] - camtoworlds[:, None, :3, 3]  # [C, P, 3]
+            # spherical_harmonics wants coeffs batched to match dirs: [C, P, K, 3].
+            # C is 1 here (batch_size=1), so unsqueeze alone is exact and free; the
+            # expand+contiguous path only materialises for a real multi-camera batch.
+            coeffs = extra_sh.unsqueeze(0)
+            if dirs.shape[0] != 1:
+                coeffs = coeffs.expand(dirs.shape[0], -1, -1, -1).contiguous()
+            rgb = torch.clamp_min(
+                spherical_harmonics(sh_degree_used, dirs, coeffs) + 0.5, 0.0
+            )
+            return torch.cat([base, rgb], dim=1)
+
         if rigid_nodes is not None and rigid_frame_idx is not None:
-            if self.cfg.app_opt:
-                raise NotImplementedError(
-                    "Dynamic rigid nodes are incompatible with app_opt: backgrounds "
-                    "use precomputed per-camera RGB while rigid nodes use SH "
-                    "coefficients, which cannot share one rasterization call."
-                )
+            # Rigid nodes keep their own view-dependent SH rather than going
+            # through the appearance module: the per-image latent models the
+            # CAPTURE's exposure/white balance, which the background already
+            # absorbs, and applying it again per vehicle would double-count it.
             rigid = rigid_nodes.get_world_gaussians(int(rigid_frame_idx))
             if rigid is not None:
+                colors = _append_colors(colors, rigid["colors"], rigid["means"])
                 means = torch.cat([means, rigid["means"]], dim=0)
                 quats = torch.cat([quats, rigid["quats"]], dim=0)
                 scales = torch.cat([scales, rigid["scales"]], dim=0)
                 opacities = torch.cat([opacities, rigid["opacities"]], dim=0)
-                colors = torch.cat([colors, rigid["colors"]], dim=0)
                 n_rigid = rigid["means"].shape[0]
 
         # --- Debug overlay: draw per-instance 3D boxes as semi-transparent
@@ -872,11 +951,11 @@ class Runner:
         if draw_boxes and rigid_nodes is not None and rigid_frame_idx is not None:
             boxes = rigid_nodes.get_box_edge_gaussians(int(rigid_frame_idx))
             if boxes is not None:
+                colors = _append_colors(colors, boxes["colors"], boxes["means"])
                 means = torch.cat([means, boxes["means"]], dim=0)
                 quats = torch.cat([quats, boxes["quats"]], dim=0)
                 scales = torch.cat([scales, boxes["scales"]], dim=0)
                 opacities = torch.cat([opacities, boxes["opacities"]], dim=0)
-                colors = torch.cat([colors, boxes["colors"]], dim=0)
 
         render_colors, render_alphas, info = rasterization(
             means=means,
