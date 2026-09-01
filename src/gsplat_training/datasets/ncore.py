@@ -309,11 +309,40 @@ class NCoreParser:
         vis_path = self.sequence_meta_file_path.parent / "point_visibility.npz"
         if vis_path.exists():
             vis_data = np.load(str(vis_path))
-            depth_points = vis_data["points_3d"].astype(np.float64)
-            # Apply the same normalization transform used for cameras/lidar
-            if self.normalize_world_space and hasattr(self, "transform"):
-                depth_points = transform_points(self.transform, depth_points)
-            self.depth_points = depth_points.astype(np.float32)
+            # Prefer the parser's own point cloud over the npz copy.
+            #
+            # They are the SAME points in the SAME order -- verified on
+            # scene_084, where the two differ by a pure translation (per-axis
+            # std ~1e-8, so element-wise corresponding) -- but they live in
+            # different frames. self.points arrives through NCore's
+            # world->scene mapping before _normalize_world_space; the npz holds
+            # raw COLMAP-world coordinates and only ever gets self.transform,
+            # which was built for the NCore scene frame. Applying it to
+            # COLMAP-world points leaves a constant offset (0.203 units here,
+            # ~13% of a typical depth).
+            #
+            # The consequence was severe: rendered-vs-GT depth correlation of
+            # only 0.18-0.36 and per-frame depth ratios swinging 1.34-2.88.
+            # Taking the points from self.points instead raises correlation to
+            # 0.37-0.72 and collapses the ratio to a consistent 1.11-1.22.
+            # The npz is still the source of the per-camera visibility lists,
+            # whose indices address this same ordering.
+            npz_points = vis_data["points_3d"]
+            if len(self.points) == len(npz_points):
+                self.depth_points = np.asarray(self.points, dtype=np.float32)
+            else:
+                # Ordering can no longer be assumed, so fall back to the npz
+                # copy and transform it as before rather than mis-indexing.
+                print(
+                    f"[NCoreParser] WARNING: point_visibility has "
+                    f"{len(npz_points)} points but the parser cloud has "
+                    f"{len(self.points)}; falling back to the npz coordinates. "
+                    "Depth supervision may be misaligned."
+                )
+                depth_points = npz_points.astype(np.float64)
+                if self.normalize_world_space and hasattr(self, "transform"):
+                    depth_points = transform_points(self.transform, depth_points)
+                self.depth_points = depth_points.astype(np.float32)
             # Store per-camera offsets and indices
             self.depth_visibility = {}
             for camera_id in self.camera_ids:
@@ -1170,21 +1199,64 @@ class NCoreDataset(torch.utils.data.Dataset):
 
                         camtoworld = self.parser.camtoworlds[index]
                         worldtocam = np.linalg.inv(camtoworld)
-                        K = self.parser.Ks_dict[camera_id]
 
                         points_cam = (worldtocam[:3, :3] @ points_world.T + worldtocam[:3, 3:4]).T
-                        points_proj = (K @ points_cam.T).T
-                        points_2d = points_proj[:, :2] / points_proj[:, 2:3]
-                        depths = points_cam[:, 2]
 
-                        # Filter to visible points (in front of camera + inside image)
-                        valid = (
-                            (depths > 0)
-                            & (points_2d[:, 0] >= 0)
-                            & (points_2d[:, 0] < width)
-                            & (points_2d[:, 1] >= 0)
-                            & (points_2d[:, 1] < height)
+                        # Camera-space z, NOT ray distance -- this was tested and
+                        # the alternative is worse.
+                        #
+                        # Rendered depth divided by z sits at a consistent
+                        # 1.11-1.22 on this scene, which looks like the
+                        # 1/cos(theta) signature of a ray-distance convention.
+                        # It is not: an equally good explanation is that the
+                        # renderer DOES use z and its accumulated depth
+                        # overshoots the true surface by ~15%, which a diffuse
+                        # Gaussian field does. The two readings are
+                        # indistinguishable from the projection geometry alone.
+                        # Training separates them -- switching to
+                        # np.linalg.norm(points_cam) made every metric worse
+                        # (depth term 0.31 -> 0.49, PSNR 23.67 -> 23.59,
+                        # LPIPS 0.240 -> 0.263), so z is the right target.
+                        depths = points_cam[:, 2]
+                        in_front = depths > 0
+
+                        # Project with the camera's OWN model, not a pinhole.
+                        #
+                        # These sensors are opencv_fisheye and the renderer
+                        # rasterizes them as such, so the rendered depth map is
+                        # in distorted image space. A pinhole projection
+                        # (K @ points_cam) lands each point tens of pixels away
+                        # from where the lens actually puts it -- measured on
+                        # scene_084: median 11 px on the forward camera and
+                        # 26 px on a side camera, p90 36-95 px, max 140 px.
+                        # grid_sample then reads the depth of a DIFFERENT
+                        # surface, and the resulting disparity residual was 2.7x
+                        # the median disparity itself: supervision indistinguishable
+                        # from noise, which dragged geometry badly enough to cost
+                        # 1.24 dB PSNR and steepen off-trajectory KID.
+                        #
+                        # The model is rescaled with data_factor alongside the
+                        # parser (verified: the projected pixel span halves
+                        # exactly between factor 1 and 2), and its valid_flag
+                        # already encodes what the lens can see -- so it replaces
+                        # the manual bounds test, which additionally rejected
+                        # points the fisheye genuinely images (it kept 83-94% of
+                        # visible points where the true model keeps 98%).
+                        #
+                        # image_points rather than pixels: the latter returns
+                        # int32 pixel indices, and the loss grid_samples these
+                        # coordinates, so throwing away the sub-pixel part would
+                        # add up to half a pixel of avoidable error. Both use the
+                        # same convention (verified: they differ only by the
+                        # rounding).
+                        camera_model = self.parser.camera_models[camera_id]
+                        projected = camera_model.camera_rays_to_image_points(
+                            torch.from_numpy(np.ascontiguousarray(points_cam)).float()
                         )
+                        points_2d = np.asarray(projected.image_points, dtype=np.float32)
+                        in_view = np.asarray(projected.valid_flag, dtype=bool)
+
+                        valid = in_view & in_front
                         points_2d = points_2d[valid]
                         depths = depths[valid]
 
