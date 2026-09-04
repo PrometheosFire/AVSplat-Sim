@@ -22,6 +22,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 GSPLAT_TRAINING_DIR = REPO_ROOT / "src" / "gsplat_training"
 if str(GSPLAT_TRAINING_DIR) not in sys.path:
     sys.path.insert(0, str(GSPLAT_TRAINING_DIR))
+# Rigid extrapolation reaches back out to ``src.tracking.bicycle_kinematics``
+# (via dynamic.rigid_tracks.bicycle_pose_at_frame), which resolves only with the
+# repo root importable. Running as a script puts scripts/ on sys.path, not the
+# root, so without this any frame past the baked span raises ModuleNotFoundError.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from render_standalone import (  # noqa: E402
     StandaloneRenderer,
@@ -29,7 +35,72 @@ from render_standalone import (  # noqa: E402
     load_rigid_state_from_checkpoint,
     load_splats_from_checkpoint,
     load_splats_from_ply,
+    rigid_poses_at_frame,
+    rigid_world_gaussians_from_pose,
 )
+from run_discovery import (  # noqa: E402
+    RunNotFoundError,
+    find_latest_checkpoint,
+    load_class_names,
+    load_instance_ids,
+    resolve_run,
+)
+from trajectory.scenario import (  # noqa: E402
+    SinusoidSpec,
+    apply_ego_scenario,
+    apply_rigid_scenario,
+    step_length,
+)
+from dynamic.asset_library import (  # noqa: E402
+    build_rigid_bank,
+    list_assets,
+    load_asset,
+)
+
+MODES = ("replay", "sinusoid", "user")
+
+
+@dataclass
+class TargetScenario:
+    """Trajectory edits applied to one target (the ego, or one rigid instance)."""
+
+    shift_m: list = None  # [x, y, z] metres; project convention, see scenario.py
+    sinusoid: SinusoidSpec = None
+    asset: str = None  # 3DRealCar model driving this instance's track (objects only)
+
+    def __post_init__(self):
+        if self.shift_m is None:
+            self.shift_m = [0.0, 0.0, 0.0]
+        if self.sinusoid is None:
+            self.sinusoid = SinusoidSpec()
+
+    @property
+    def shifted(self) -> bool:
+        return any(abs(float(v)) > 1e-9 for v in self.shift_m)
+
+    def sin_active(self, force_on: bool = False) -> bool:
+        """Weave is on when configured enabled, or when a mode forces it on."""
+        return (force_on or self.sinusoid.enabled) and self.sinusoid.usable
+
+    def active(self, force_sin: bool = False) -> bool:
+        return self.shifted or self.sin_active(force_sin)
+
+    @classmethod
+    def from_cfg(cls, node) -> "TargetScenario":
+        if node is None:
+            return cls()
+        try:
+            shift = node.get("shift_m", None)
+            sin_node = node.get("sinusoid", None)
+            asset = node.get("asset", None)
+        except AttributeError:
+            return cls()
+        shift = [0.0, 0.0, 0.0] if shift is None else [float(v) for v in shift]
+        return cls(
+            shift_m=shift,
+            sinusoid=SinusoidSpec.from_cfg(sin_node),
+            asset=str(asset) if asset else None,
+        )
 
 
 @dataclass
@@ -45,30 +116,27 @@ def generate_config_hash(config_subset: dict) -> str:
     return hashlib.md5(config_str.encode("utf-8")).hexdigest()[:8]
 
 
-def _find_latest_checkpoint(ckpt_dir: str) -> str:
-    if not os.path.isdir(ckpt_dir):
-        return ""
+def _resolve_cached_inputs(cfg: DictConfig) -> tuple[str, str] | None:
+    """Resolve simulator inputs from the same cache hashes used by the orchestrator.
 
-    def step_of(fname: str) -> int:
-        try:
-            return int(fname.split("_")[1])
-        except (IndexError, ValueError):
-            return -1
-
-    ckpts = sorted([f for f in os.listdir(ckpt_dir) if f.endswith(".pt")], key=step_of)
-    return os.path.join(ckpt_dir, ckpts[-1]) if ckpts else ""
-
-
-def _resolve_cached_inputs(cfg: DictConfig) -> tuple[str, str]:
-    """Resolve simulator inputs from the same cache hashes used by the orchestrator."""
+    This is the exact-hash path: it reproduces the v2 (``results/4dgs``) naming
+    recipe so that "run this specific configuration" stays reproducible. Returns
+    ``None`` when the hashed directories do not exist, letting the caller fall
+    back to :func:`run_discovery.resolve_run`.
+    """
     dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
     tracker_cfg = OmegaConf.to_container(cfg.tracker, resolve=True)
     track_task_cfg = OmegaConf.to_container(cfg.track_task, resolve=True)
     refine_task_cfg = OmegaConf.to_container(cfg.refine_task, resolve=True)
     gsplat_cfg = OmegaConf.to_container(cfg.gaussian_splatting, resolve=True)
 
+    # The hash recipe below is v2's. Honouring the configured root means a v2
+    # lookup still works when the root is switched back to results/4dgs; under
+    # results/extended_4dgs it simply misses (v3 hashes different inputs), and
+    # the caller falls through to the newest-run search.
+    results_root = str(cfg.get("simulator", {}).get("results_root", "results/4dgs"))
     base_results_dir = os.path.abspath(
-        f"results/4dgs/{dataset_cfg['name']}/{dataset_cfg['scene']}"
+        os.path.join(results_root, dataset_cfg["name"], dataset_cfg["scene"])
     )
 
     ego_masks_dir = os.path.abspath(os.path.join(dataset_cfg["base_dir"], "masks"))
@@ -109,12 +177,13 @@ def _resolve_cached_inputs(cfg: DictConfig) -> tuple[str, str]:
     )
     training_dir = os.path.join(base_results_dir, f"20_gsplat_dynamic_{step20_hash}")
     camera_paths_dir = os.path.join(training_dir, "camera_paths")
-    checkpoint_path = _find_latest_checkpoint(os.path.join(training_dir, "ckpts"))
+    checkpoint_path = find_latest_checkpoint(os.path.join(training_dir, "ckpts"))
 
     if not os.path.isdir(camera_paths_dir) or not checkpoint_path:
-        print("could not find configuration")
-        raise SystemExit(1)
+        print(f"[sim] exact-hash 20_gsplat_dynamic_{step20_hash}: MISS")
+        return None
 
+    print(f"[sim] exact-hash 20_gsplat_dynamic_{step20_hash}: HIT")
     return camera_paths_dir, checkpoint_path
 
 
@@ -158,8 +227,8 @@ class SimulatorRuntime:
         self.advance_rigid_in_replay = bool(sim_cfg.get("advance_rigid_in_replay", True))
 
         self.mode = str(sim_cfg.get("mode", "replay"))
-        if self.mode not in ("replay", "user"):
-            raise ValueError("simulator.mode must be 'replay' or 'user'.")
+        if self.mode not in MODES:
+            raise ValueError(f"simulator.mode must be one of {MODES}.")
 
         self.rigid_paused = bool(sim_cfg.get("rigid_paused", False))
 
@@ -174,15 +243,18 @@ class SimulatorRuntime:
 
         camera_paths_dir = render_cfg.get("camera_paths_dir")
         checkpoint_path = render_cfg.get("checkpoint_path")
+        self.run_paths = None
         if not camera_paths_dir or not checkpoint_path:
-            auto_camera_paths_dir, auto_checkpoint_path = _resolve_cached_inputs(cfg)
+            auto_camera_paths_dir, auto_checkpoint_path = self._auto_resolve(cfg)
             camera_paths_dir = camera_paths_dir or auto_camera_paths_dir
             checkpoint_path = checkpoint_path or auto_checkpoint_path
 
         self.cameras = load_all_cameras(str(camera_paths_dir))
         if not self.cameras:
-            print("could not find configuration")
-            raise SystemExit(1)
+            raise SystemExit(
+                f"[sim] no camera_data.json under {camera_paths_dir} -- this run "
+                f"has no camera metadata to render from."
+            )
 
         selected_camera_id = str(sim_cfg.get("start_camera_id", ""))
         if selected_camera_id:
@@ -215,8 +287,10 @@ class SimulatorRuntime:
                 str(checkpoint_path), device=device
             )
         else:
-            print("could not find configuration")
-            raise SystemExit(1)
+            raise SystemExit(
+                f"[sim] no model to load: rendering.ply_path={ply_path!r} and "
+                f"checkpoint {checkpoint_path!r} are both missing."
+            )
 
         render_dynamic = bool(render_cfg.get("render_dynamic", True))
         self.rigid_state = None
@@ -265,6 +339,8 @@ class SimulatorRuntime:
             device=device,
         )
 
+        self._setup_scenarios(sim_cfg, checkpoint_path)
+
         self.base_pose = self.camera.camtoworlds[self.ego_frame_idx].copy()
         self.bicycle = BicycleState()
 
@@ -285,24 +361,551 @@ class SimulatorRuntime:
 
         self.server = viser.ViserServer(port=self.server_port, verbose=False)
         self.server.gui.set_panel_label("AVSplat Simulator")
-
-        self.server.gui.add_markdown(
-            """
-### Keyboard (terminal)
-- `w/s`: accelerate / brake
-- `a/d`: steer left / right
-- `m`: toggle mode (`replay` <-> `user`)
-- `p`: toggle rigid timeline pause
-- `r`: reset ego pose
-- `t`: reset rigid timestep
-- `g`: reset both
-- `q`: quit
-"""
-        )
-        self.status_handle = self.server.gui.add_markdown("Waiting for first frame...")
+        self._build_gui()
         # Display renders as full-viewport background so the image fills the 3D canvas.
         init_img = np.zeros((self.camera.height, self.camera.width, 3), dtype=np.uint8)
         self.server.scene.set_background_image(init_img)
+
+    # ------------------------------------------------------------------
+    # GUI
+    # ------------------------------------------------------------------
+    def _build_gui(self) -> None:
+        """Live scenario controls, mirroring the config blocks.
+
+        Handler threading: viser callbacks run off the render thread. Scalar
+        edits (shifts, sinusoid params, mode) are plain attribute writes and are
+        safe. An asset swap is NOT -- it reallocates the whole rigid bank, which
+        the render thread reads -- so those only set ``_pending_bank_rebuild``
+        and the render loop performs the rebuild between frames.
+        """
+        gui = self.server.gui
+        self._pending_bank_rebuild = False
+        self._gui_syncing = False  # re-entrancy guard for programmatic .value sets
+
+        with gui.add_folder("Playback"):
+            self.g_mode = gui.add_dropdown("mode", MODES, initial_value=self.mode)
+            self.g_paused = gui.add_checkbox("rigid paused", self.rigid_paused)
+            b_ego = gui.add_button("reset ego")
+            b_rigid = gui.add_button("reset rigid")
+            b_all = gui.add_button("reset all")
+
+        @self.g_mode.on_update
+        def _(_) -> None:
+            if not self._gui_syncing:
+                self.mode = str(self.g_mode.value)
+
+        @self.g_paused.on_update
+        def _(_) -> None:
+            if not self._gui_syncing:
+                self.rigid_paused = bool(self.g_paused.value)
+
+        b_ego.on_click(lambda _: self._reset_ego())
+        b_rigid.on_click(lambda _: self._reset_rigid())
+
+        @b_all.on_click
+        def _(_) -> None:
+            self._reset_ego()
+            self._reset_rigid()
+
+        with gui.add_folder("Ego"):
+            self.g_ego = self._scenario_controls(gui, self.ego_scn, lambda: self.ego_scn)
+
+        # --- Objects -------------------------------------------------------
+        if not self.rigid_state is None and self.num_rigid_frames > 0:
+            num_inst = int(self.rigid_state["instances_size"].shape[0])
+            labels = [self._label_for_column(c) for c in range(num_inst)]
+            self._gui_labels = labels
+            with gui.add_folder("Objects"):
+                self.g_target = gui.add_dropdown(
+                    "target", labels, initial_value=labels[0]
+                )
+                self.g_asset = gui.add_dropdown(
+                    "asset", ["(none)"] + self.asset_names, initial_value="(none)"
+                )
+                self.g_obj = self._scenario_controls(
+                    gui, self._selected_scn(), lambda: self._selected_scn(create=True)
+                )
+                b_reset = gui.add_button("reset this object")
+
+            @self.g_target.on_update
+            def _(_) -> None:
+                self._sync_object_controls()
+
+            @self.g_asset.on_update
+            def _(_) -> None:
+                if self._gui_syncing:
+                    return
+                name = str(self.g_asset.value)
+                scn = self._selected_scn(create=True)
+                new = None if name == "(none)" else name
+                if (scn.asset or None) != new:
+                    scn.asset = new
+                    # Deferred: rebuilding here would race the render thread.
+                    self._pending_bank_rebuild = True
+
+            @b_reset.on_click
+            def _(_) -> None:
+                col = self._selected_col()
+                self.obj_scn[col] = TargetScenario()
+                self._pending_bank_rebuild = True
+                self._sync_object_controls()
+
+            self._sync_object_controls()
+
+        gui.add_markdown(
+            """
+### Keyboard (terminal)
+- `w/s`: accelerate / brake &nbsp;&nbsp; `a/d`: steer left / right
+- `m`: cycle mode &nbsp;&nbsp; `p`: rigid pause
+- `r`: reset ego &nbsp;&nbsp; `t`: reset rigid &nbsp;&nbsp; `g`: reset both
+- `q`: quit
+
+Shifts are metres: **x** lateral (+right), **y** vertical (+down),
+**z** longitudinal (+forward).
+"""
+        )
+        self.status_handle = gui.add_markdown("Waiting for first frame...")
+
+    def _scenario_controls(self, gui, scn: "TargetScenario", getter):
+        """Shift + sinusoid widgets bound to whatever ``getter()`` returns.
+
+        ``getter`` is indirect so the Objects panel can retarget the same widgets
+        at a different instance column without rebuilding them -- a checkpoint
+        can carry 60 instances, and a folder each would be unusable.
+        """
+        h = {}
+        h["shift"] = gui.add_vector3(
+            "shift (m)", tuple(float(v) for v in scn.shift_m), step=0.1
+        )
+        h["enabled"] = gui.add_checkbox("weave", scn.sinusoid.enabled)
+        h["amp"] = gui.add_slider(
+            "amplitude (m)", 0.0, 6.0, 0.1, float(scn.sinusoid.amplitude_m)
+        )
+        h["period"] = gui.add_slider(
+            "period (frames)", 4.0, 200.0, 1.0, float(scn.sinusoid.period_frames)
+        )
+        h["phase"] = gui.add_slider(
+            "phase (deg)", 0.0, 360.0, 5.0, float(scn.sinusoid.phase_deg)
+        )
+        h["yaw"] = gui.add_checkbox("follow yaw", scn.sinusoid.follow_yaw)
+
+        def apply(_=None) -> None:
+            if self._gui_syncing:
+                return
+            s = getter()
+            s.shift_m = [float(v) for v in h["shift"].value]
+            s.sinusoid.enabled = bool(h["enabled"].value)
+            s.sinusoid.amplitude_m = float(h["amp"].value)
+            s.sinusoid.period_frames = float(h["period"].value)
+            s.sinusoid.phase_deg = float(h["phase"].value)
+            s.sinusoid.follow_yaw = bool(h["yaw"].value)
+
+        for handle in h.values():
+            handle.on_update(apply)
+        return h
+
+    def _selected_col(self) -> int:
+        try:
+            return self._gui_labels.index(str(self.g_target.value))
+        except (AttributeError, ValueError):
+            return 0
+
+    def _selected_scn(self, create: bool = False) -> "TargetScenario":
+        """Scenario for the selected column.
+
+        Reads must not create: merely *looking* at an object in the panel should
+        not add an entry to ``obj_scn``, or the dict fills with inert scenarios
+        and no longer answers "what has actually been configured?". Only an edit
+        passes ``create=True``.
+        """
+        col = self._selected_col()
+        if create:
+            return self.obj_scn.setdefault(col, TargetScenario())
+        return self.obj_scn.get(col) or TargetScenario()
+
+    def _sync_object_controls(self) -> None:
+        """Repopulate the object widgets from the currently selected column."""
+        scn = self._selected_scn()
+        self._gui_syncing = True
+        try:
+            self.g_asset.value = scn.asset or "(none)"
+            h = self.g_obj
+            h["shift"].value = tuple(float(v) for v in scn.shift_m)
+            h["enabled"].value = bool(scn.sinusoid.enabled)
+            h["amp"].value = float(scn.sinusoid.amplitude_m)
+            h["period"].value = float(scn.sinusoid.period_frames)
+            h["phase"].value = float(scn.sinusoid.phase_deg)
+            h["yaw"].value = bool(scn.sinusoid.follow_yaw)
+        finally:
+            self._gui_syncing = False
+
+    def _sync_playback_controls(self) -> None:
+        """Push keyboard-driven state back into the panel."""
+        if str(self.g_mode.value) == self.mode and bool(
+            self.g_paused.value
+        ) == self.rigid_paused:
+            return
+        self._gui_syncing = True
+        try:
+            self.g_mode.value = self.mode
+            self.g_paused.value = self.rigid_paused
+        finally:
+            self._gui_syncing = False
+
+    def _auto_resolve(self, cfg: DictConfig) -> tuple[str, str]:
+        """Locate the run to load: exact config hash first, newest run second.
+
+        The hash path keeps "run this specific configuration" reproducible. It
+        stops resolving as configs grow (and never matches the v3 layout at all),
+        so a miss falls back to the newest usable run *for the same
+        dataset/scene* -- announced loudly, because it is not what was asked for.
+        """
+        sim_cfg = cfg.get("simulator", {})
+        dataset_cfg = cfg.dataset
+        results_root = str(sim_cfg.get("results_root", "results/extended_4dgs"))
+        pin = sim_cfg.get("run_dir")
+
+        if not pin:
+            hashed = _resolve_cached_inputs(cfg)
+            if hashed is not None:
+                return hashed
+
+        if not pin and not bool(sim_cfg.get("allow_latest_fallback", True)):
+            raise SystemExit(
+                "[sim] exact-hash lookup missed and simulator.allow_latest_fallback "
+                "is false. Set it true, or pin simulator.run_dir=<train or loop dir>."
+            )
+
+        try:
+            run = resolve_run(
+                results_root,
+                str(dataset_cfg.name),
+                str(dataset_cfg.scene),
+                pin=str(pin) if pin else None,
+            )
+        except RunNotFoundError as exc:
+            raise SystemExit(f"[sim] {exc}") from exc
+
+        self.run_paths = run
+        root_abs = os.path.abspath(results_root)
+        if run.source == "pin":
+            print(f"[sim] using pinned run: {run.describe(root_abs)}")
+        else:
+            print(
+                f"[sim] WARNING: falling back to newest run under "
+                f"{os.path.join(results_root, str(dataset_cfg.name), str(dataset_cfg.scene))}\n"
+                f"[sim]   -> {run.describe(root_abs)}\n"
+                f"[sim]   this is NOT a config-hash match"
+            )
+        return run.camera_paths_dir, run.checkpoint_path
+
+    def _setup_scenarios(self, sim_cfg, checkpoint_path) -> None:
+        """Load ego/object scenarios and everything they need to be evaluated.
+
+        Object scenarios are keyed by ORIGINAL TRACK ID in the config, because
+        that is what is meaningful to a person reading a scene. Track IDs are not
+        stored in the checkpoint, so they are recovered from the training
+        ``cfg.yml`` (see ``run_discovery.load_instance_ids``). Different tracking
+        or refinement runs renumber tracks, so a config written for one run may
+        name IDs this one does not have: those entries are reported and skipped
+        rather than silently landing on the wrong vehicle.
+        """
+        # Metres -> normalized units. The camera metadata and the checkpoint's
+        # fitted bicycle transform carry the same value; either will do.
+        scale = self.camera.world_to_normalized_scale
+        if scale is None and self.rigid_state is not None:
+            extrap = self.rigid_state.get("bicycle")
+            if extrap is not None:
+                scale = float(extrap["transform_scale"])
+        if scale is None:
+            print(
+                "[sim] WARNING: no world_to_normalized_scale found -- shift and "
+                "amplitude values will be in raw scene units, not metres."
+            )
+            scale = 1.0
+        self.scale = float(scale)
+
+        assets_node = sim_cfg.get("assets", None) or {}
+
+        def _acfg(key, default):
+            try:
+                value = assets_node.get(key, default)
+            except AttributeError:
+                return default
+            return default if value is None else value
+
+        crop = assets_node.get("crop_to_box_margin", None) if assets_node else None
+        self.assets_cfg = {
+            "library_dir": str(_acfg("library_dir", "data/3DRealCar")),
+            "opacity_threshold": float(_acfg("opacity_threshold", 0.0)),
+            # None -> no box crop (the default). See asset_library.load_asset.
+            "crop_to_box_margin": None if crop is None else float(crop),
+            "max_points": int(_acfg("max_points", 750000)),
+            "dc_only": bool(_acfg("dc_only", True)),
+            "flip_forward": bool(_acfg("flip_forward", False)),
+        }
+        self.asset_names = [a.name for a in list_assets(self.assets_cfg["library_dir"])]
+        # Always a valid bank: identity until a substitution replaces something,
+        # so the early returns below still leave the untouched checkpoint path.
+        self.rigid_bank = self.rigid_state
+        # Set here rather than only in _build_gui, so the render loop can check it
+        # regardless of how the runtime was constructed.
+        self._pending_bank_rebuild = False
+
+        self.ego_scn = TargetScenario.from_cfg(sim_cfg.get("ego", None))
+
+        # Along-track distance per frame, for tangent yaw. Precomputed: tiny
+        # (T=200-ish) and it keeps the render loop free of trajectory scans.
+        ego_pos = self.camera.camtoworlds[:, :3, 3]
+        self.ego_step = np.array(
+            [step_length(ego_pos, f) for f in range(self.num_ego_frames)],
+            dtype=np.float32,
+        )
+
+        self.instance_ids = None
+        self.class_names = []
+        self.obj_scn: dict[int, TargetScenario] = {}
+        self.rigid_step = None
+        self.rigid_first_valid = None
+
+        num_inst = (
+            int(self.rigid_state["instances_size"].shape[0])
+            if self.rigid_state is not None
+            else 0
+        )
+        if num_inst == 0:
+            return
+
+        trans = self.rigid_state["poses.trans"].detach().cpu().numpy()  # (T, M, 3)
+        fv = self.rigid_state["instances_fv"].detach().cpu().numpy()  # (T, M)
+        self.rigid_step = np.stack(
+            [
+                [step_length(trans[:, m, :], f) for m in range(num_inst)]
+                for f in range(self.num_rigid_frames)
+            ]
+        ).astype(np.float32)
+        # First frame each instance is present. The weave is phase-anchored here
+        # so an object entering mid-sequence starts exactly on its real track
+        # instead of popping in already displaced sideways.
+        self.rigid_first_valid = np.array(
+            [
+                int(np.argmax(fv[:, m])) if bool(fv[:, m].any()) else 0
+                for m in range(num_inst)
+            ],
+            dtype=np.int64,
+        )
+
+        cfg_yml = self.run_paths.cfg_yml if self.run_paths is not None else None
+        if cfg_yml is None and checkpoint_path:
+            candidate = os.path.join(
+                os.path.dirname(os.path.dirname(str(checkpoint_path))), "cfg.yml"
+            )
+            cfg_yml = candidate if os.path.exists(candidate) else None
+        self.instance_ids = load_instance_ids(cfg_yml, num_inst)
+        if self.instance_ids:
+            self.class_names = load_class_names(cfg_yml, self.instance_ids)
+
+        objects_cfg = sim_cfg.get("objects", None)
+        if not objects_cfg:
+            return
+        if not self.instance_ids:
+            print(
+                f"[sim] WARNING: simulator.objects is configured but the track-ID "
+                f"mapping could not be recovered for this run; skipping all "
+                f"{len(objects_cfg)} object scenario(s)."
+            )
+            return
+
+        id_to_col = {tid: m for m, tid in enumerate(self.instance_ids)}
+        for key, node in objects_cfg.items():
+            try:
+                track_id = int(key)
+            except (TypeError, ValueError):
+                print(f"[sim] WARNING: object key {key!r} is not a track ID; skipped.")
+                continue
+            col = id_to_col.get(track_id)
+            if col is None:
+                print(
+                    f"[sim] WARNING: track ID {track_id} is not in this run "
+                    f"(available: {self.instance_ids}); scenario skipped."
+                )
+                continue
+            self.obj_scn[col] = TargetScenario.from_cfg(node)
+            print(f"[sim] object scenario: track {track_id} -> instance column {col}")
+
+        self._rebuild_bank()
+
+    def _rebuild_bank(self) -> None:
+        """Rebuild the rigid Gaussian bank from the current asset assignment.
+
+        Only called when the assignment changes -- never per frame. With no
+        substitutions the bank IS ``rigid_state``, so the untouched checkpoint
+        path stays exactly as it was.
+        """
+        # Drop the previous bank's device tensors before building the next one,
+        # so a swap does not hold two banks at once.
+        had_bank = self.rigid_bank is not None and self.rigid_bank is not self.rigid_state
+        self.rigid_bank = self.rigid_state
+        if self.rigid_state is None:
+            return
+
+        assets = {}
+        for col, scn in self.obj_scn.items():
+            if not scn.asset:
+                continue
+            try:
+                # Loads to host memory; build_rigid_bank moves it to the device.
+                # Caching on the GPU would pin every model auditioned in the
+                # picker for the life of the process.
+                asset = load_asset(
+                    self.assets_cfg["library_dir"],
+                    scn.asset,
+                    opacity_threshold=self.assets_cfg["opacity_threshold"],
+                    crop_margin=self.assets_cfg["crop_to_box_margin"],
+                    max_points=self.assets_cfg["max_points"],
+                    dc_only=self.assets_cfg["dc_only"],
+                )
+            except (FileNotFoundError, OSError, ValueError, IndexError) as exc:
+                print(f"[sim] WARNING: could not load asset {scn.asset!r}: {exc}")
+                scn.asset = None
+                continue
+            assets[col] = asset
+            box_h_m = float(self.rigid_state["instances_size"][col][2]) / self.scale
+            print(
+                f"[sim] substitute {self._label_for_column(col)} <- {asset.info} "
+                f"[{asset.num_points} gaussians, box height {box_h_m:.2f} m]"
+            )
+
+        if not assets:
+            # Back to the original vehicles. The old bank is already unreferenced;
+            # hand its blocks back so the drop shows up in nvidia-smi rather than
+            # sitting in the caching allocator.
+            if had_bank:
+                self._release_device_cache()
+            return
+        before = int(self.rigid_state["point_ids"].shape[0])
+        self.rigid_bank = build_rigid_bank(
+            self.rigid_state,
+            assets,
+            self.scale,
+            dc_only=self.assets_cfg["dc_only"],
+            flip_forward=self.assets_cfg["flip_forward"],
+        )
+        after = int(self.rigid_bank["point_ids"].shape[0])
+        if had_bank:
+            self._release_device_cache()
+        print(
+            f"[sim] rigid gaussians: {before} -> {after} ({after - before:+d})"
+            f"{self._vram_note()}"
+        )
+
+    @staticmethod
+    def _release_device_cache() -> None:
+        """Return freed blocks to the driver so VRAM changes are observable."""
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    @staticmethod
+    def _vram_note() -> str:
+        if not torch.cuda.is_available():
+            return ""
+        return f"  |  VRAM {torch.cuda.memory_allocated() / 2**20:.0f} MB"
+
+    def set_asset(self, col: int, name) -> None:
+        """Assign (or clear, with None) an asset for one instance column."""
+        scn = self.obj_scn.setdefault(col, TargetScenario())
+        if (scn.asset or None) == (name or None):
+            return
+        scn.asset = str(name) if name else None
+        self._rebuild_bank()
+
+    def _substitutions_active(self) -> bool:
+        return any(s.asset for s in self.obj_scn.values())
+
+    def _label_for_column(self, col: int) -> str:
+        """Human label for an instance column, e.g. 'id 53 (car)'."""
+        if not self.instance_ids or col >= len(self.instance_ids):
+            return f"col {col}"
+        cls = (
+            self.class_names[col]
+            if col < len(self.class_names) and self.class_names[col]
+            else ""
+        )
+        return f"id {self.instance_ids[col]}{f' ({cls})' if cls else ''}"
+
+    @property
+    def replay_like(self) -> bool:
+        """Modes where the baked ego trajectory drives the camera.
+
+        'sinusoid' is 'replay' with a lateral displacement layered on, so every
+        playback decision (advancing frames, honouring advance_rigid_in_replay,
+        applying ego scenarios) must treat the two together. Only 'user' hands
+        control to the bicycle model instead.
+        """
+        return self.mode in ("replay", "sinusoid")
+
+    @property
+    def ego_sinusoid_on(self) -> bool:
+        """Ego weave is on in 'sinusoid' mode, or whenever configured enabled."""
+        return self.ego_scn.sin_active(self.mode == "sinusoid")
+
+    def _ego_scenario_active(self) -> bool:
+        return self.replay_like and self.ego_scn.active(self.mode == "sinusoid")
+
+    def _rigid_scenarios_active(self) -> bool:
+        return any(s.active() for s in self.obj_scn.values())
+
+    def _scenario_rigid_gaussians(self):
+        """World-space rigid Gaussians with per-object scenarios applied.
+
+        Returns ``None`` when nothing needs perturbing, which lets the caller
+        fall back to the untouched checkpoint path.
+        """
+        if self.rigid_state is None:
+            return None
+        if not (self._rigid_scenarios_active() or self._substitutions_active()):
+            return None
+        bank = self.rigid_bank if self.rigid_bank is not None else self.rigid_state
+        poses = rigid_poses_at_frame(bank, int(self.rigid_frame_idx))
+        if poses is None:
+            return None
+
+        # rigid_poses_at_frame hands back the checkpoint tensors themselves for
+        # baked frames -- clone before touching them.
+        trans, quats, fv = poses[0].clone(), poses[1].clone(), poses[2]
+        baked = 0 <= self.rigid_frame_idx < self.num_rigid_frames
+
+        for col, scn in self.obj_scn.items():
+            if col >= trans.shape[0] or not bool(fv[col]):
+                continue
+            # Weave only where the object has a real trajectory to weave around:
+            # never on bicycle-extrapolated frames, and phase-anchored to the
+            # object's first valid frame.
+            use_sin = baked and scn.sinusoid.active
+            local_frame = (
+                float(self.rigid_frame_idx - int(self.rigid_first_valid[col]))
+                if use_sin
+                else 0.0
+            )
+            step = (
+                float(self.rigid_step[int(self.rigid_frame_idx), col])
+                if (use_sin and self.rigid_step is not None)
+                else 0.0
+            )
+            trans[col], quats[col] = apply_rigid_scenario(
+                trans[col],
+                quats[col],
+                local_frame,
+                self.scale,
+                shift_m=scn.shift_m,
+                sinusoid=scn.sinusoid if use_sin else None,
+                step_len=step,
+            )
+
+        return rigid_world_gaussians_from_pose(bank, trans, quats, fv)
 
     def _build_user_pose(self) -> np.ndarray:
         pose = self.base_pose.copy()
@@ -366,14 +969,18 @@ class SimulatorRuntime:
         self.bicycle.z_m += self.bicycle.speed_mps * np.cos(self.bicycle.yaw_rad) * self.dt
 
     def _advance_indices(self) -> None:
-        if self.mode == "replay":
+        # 'sinusoid' is a replay variant: the baked trajectory still drives the
+        # camera, it is just displaced. Testing for "replay" alone here pinned the
+        # ego at its start frame, which froze both the drive-through and the weave
+        # (whose phase is that very index).
+        if self.replay_like:
             if self.loop_trajectory:
                 self.ego_frame_idx = (self.ego_frame_idx + 1) % self.num_ego_frames
             else:
                 self.ego_frame_idx = min(self.ego_frame_idx + 1, self.num_ego_frames - 1)
 
         if self.num_rigid_frames > 0 and not self.rigid_paused:
-            if self.mode != "replay" or self.advance_rigid_in_replay:
+            if not self.replay_like or self.advance_rigid_in_replay:
                 self.rigid_frame_idx = (self.rigid_frame_idx + 1) % max(
                     self.rigid_loop_frames, 1
                 )
@@ -387,15 +994,26 @@ class SimulatorRuntime:
         self.rigid_frame_idx = 0
 
     def _current_pose(self) -> np.ndarray:
-        return (
-            self.camera.camtoworlds[self.ego_frame_idx]
-            if self.mode == "replay"
-            else self._build_user_pose()
+        if self.mode == "user":
+            return self._build_user_pose()
+
+        pose = self.camera.camtoworlds[self.ego_frame_idx]
+        if not self._ego_scenario_active():
+            return pose
+        return apply_ego_scenario(
+            pose,
+            float(self.ego_frame_idx),
+            self.scale,
+            shift_m=self.ego_scn.shift_m,
+            sinusoid=self.ego_scn.sinusoid if self.ego_sinusoid_on else None,
+            step_len=float(self.ego_step[self.ego_frame_idx]),
+            plane_normal=self.plane_normal,
         )
 
     def _render_frame(self) -> np.ndarray:
         rigid_idx = self.rigid_frame_idx if self.num_rigid_frames > 0 else None
         return self.renderer.render_frame(
+            rigid_gaussians=self._scenario_rigid_gaussians(),
             camtoworld=self._current_pose(),
             K=self.camera.K,
             width=self.camera.width,
@@ -409,6 +1027,36 @@ class SimulatorRuntime:
             rigid_frame_idx=rigid_idx,
         )
 
+    def _scenario_summary(self) -> str:
+        """Which scenarios are currently shaping the render."""
+        parts = []
+        if self._ego_scenario_active():
+            bits = []
+            if self.ego_scn.shifted:
+                bits.append("shift " + ",".join(f"{v:g}" for v in self.ego_scn.shift_m))
+            if self.ego_sinusoid_on:
+                s = self.ego_scn.sinusoid
+                bits.append(f"sin {s.amplitude_m:g}m/{s.period_frames:g}f")
+            parts.append("ego: " + " + ".join(bits))
+
+        baked = 0 <= self.rigid_frame_idx < self.num_rigid_frames
+        for col, scn in sorted(self.obj_scn.items()):
+            if not (scn.active() or scn.asset):
+                continue
+            bits = []
+            if scn.asset:
+                bits.append(f"asset {scn.asset}")
+            if scn.shifted:
+                bits.append("shift " + ",".join(f"{v:g}" for v in scn.shift_m))
+            if scn.sinusoid.active:
+                bits.append(
+                    f"sin {scn.sinusoid.amplitude_m:g}m/{scn.sinusoid.period_frames:g}f"
+                    + ("" if baked else " (held: extrapolated)")
+                )
+            parts.append(f"{self._label_for_column(col)}: " + " + ".join(bits))
+
+        return "  \n".join(f"- {p}" for p in parts) if parts else "_none_"
+
     def _update_status(self) -> None:
         extrapolating = self.rigid_frame_idx >= self.num_rigid_frames
         self.status_handle.content = (
@@ -418,13 +1066,15 @@ class SimulatorRuntime:
             f"{' (extrapolated)' if extrapolating else ''}  \n"
             f"**rigid_paused**: {self.rigid_paused}  \n"
             f"**speed_mps**: {self.bicycle.speed_mps:.2f}  \n"
-            f"**offset_xz_m**: ({self.bicycle.x_m:.2f}, {self.bicycle.z_m:.2f})"
+            f"**offset_xz_m**: ({self.bicycle.x_m:.2f}, {self.bicycle.z_m:.2f})  \n"
+            f"**scenarios**:  \n{self._scenario_summary()}"
         )
 
     def run(self) -> None:
         print("Simulator started.")
         print(
-            "Controls: w/s/a/d move, m mode, p rigid pause, r ego reset, t rigid reset, g reset all, q quit"
+            "Controls: w/s/a/d move, m cycle mode (replay/sinusoid/user), p rigid pause, "
+            "r ego reset, t rigid reset, g reset all, q quit"
         )
         target_period = 1.0 / max(self.max_fps, 1.0)
 
@@ -436,7 +1086,7 @@ class SimulatorRuntime:
                 if "q" in keys:
                     break
                 if "m" in keys:
-                    self.mode = "user" if self.mode == "replay" else "replay"
+                    self.mode = MODES[(MODES.index(self.mode) + 1) % len(MODES)]
                 if "p" in keys:
                     self.rigid_paused = not self.rigid_paused
                 if "r" in keys:
@@ -450,6 +1100,13 @@ class SimulatorRuntime:
                 if self.mode == "user":
                     self._apply_user_controls(keys)
 
+                # Asset swaps are queued by the GUI thread and applied here, so
+                # the rigid bank is only ever reallocated between renders.
+                if self._pending_bank_rebuild:
+                    self._pending_bank_rebuild = False
+                    self._rebuild_bank()
+
+                self._sync_playback_controls()
                 self.server.scene.set_background_image(self._render_frame())
                 self._update_status()
                 self._advance_indices()

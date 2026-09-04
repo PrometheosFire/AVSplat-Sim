@@ -332,7 +332,7 @@ def rigid_world_gaussians(
         raise ValueError(
             f"timestep {frame_idx} out of range for rigid poses [0, {num_frames})."
         )
-    return _rigid_world_gaussians_from_pose(
+    return rigid_world_gaussians_from_pose(
         rigid_state,
         rigid_state["poses.trans"][frame_idx],
         rigid_state["poses.quats"][frame_idx],
@@ -340,7 +340,7 @@ def rigid_world_gaussians(
     )
 
 
-def _rigid_world_gaussians_from_pose(
+def rigid_world_gaussians_from_pose(
     rigid_state: Dict[str, torch.Tensor],
     pose_trans: torch.Tensor,  # (M, 3)
     pose_quats: torch.Tensor,  # (M, 4) wxyz
@@ -351,6 +351,12 @@ def _rigid_world_gaussians_from_pose(
     Shared by the baked-frame path (:func:`rigid_world_gaussians`) and the
     bicycle-extrapolated path (:func:`rigid_world_gaussians_extrapolated`); the
     only difference between the two is where the per-instance poses come from.
+
+    Public because callers may want to supply poses of their own: the simulator
+    perturbs them (lateral shifts, sinusoidal weaves) and may hand in a
+    ``rigid_state`` whose local Gaussians have been partly replaced by an
+    external vehicle asset. Any dict carrying the same keys works -- ``gauss.*``,
+    ``point_ids``, and matching ``(M, ...)`` pose/validity shapes.
     """
     from dynamic.rigid_nodes import quat_multiply, quat_normalize, quat_to_rotmat
 
@@ -383,23 +389,39 @@ def _rigid_world_gaussians_from_pose(
     }
 
 
-def rigid_world_gaussians_extrapolated(
-    rigid_state: Dict[str, torch.Tensor], frame_idx: int
-) -> Optional[Dict[str, torch.Tensor]]:
-    """Rigid world Gaussians for any frame index, extrapolating past the baked span.
+# Kept so any existing caller of the private name keeps working.
+_rigid_world_gaussians_from_pose = rigid_world_gaussians_from_pose
 
-    For an in-range ``frame_idx`` this is exactly :func:`rigid_world_gaussians`
-    (baked optimized poses). For an out-of-range index it rolls the fitted
-    kinematic bicycle model (from the checkpoint's ``rigid_bicycle`` params) to
-    synthesize each instance's pose. Only instances that (a) have a fitted model
-    and (b) were valid at the nearest boundary frame are carried; instances
-    without a model (e.g. pedestrians) simply vanish past the observed span.
-    Returns ``None`` when nothing is active or no bicycle params are present.
+
+def rigid_poses_at_frame(
+    rigid_state: Dict[str, torch.Tensor], frame_idx: int
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Per-instance poses for any frame index, extrapolating past the baked span.
+
+    For an in-range ``frame_idx`` these are the baked optimized poses. For an
+    out-of-range index each instance's pose is synthesized by rolling the fitted
+    kinematic bicycle model (from the checkpoint's ``rigid_bicycle`` params).
+    Only instances that (a) have a fitted model and (b) were valid at the nearest
+    boundary frame are carried; instances without a model (e.g. pedestrians)
+    simply vanish past the observed span.
+
+    Split out from :func:`rigid_world_gaussians_extrapolated` so callers can
+    intervene between "where is everything" and "turn that into Gaussians" --
+    the simulator perturbs these poses (lateral shifts, sinusoidal weaves)
+    before posing.
+
+    Returns:
+        ``(trans (M, 3), quats (M, 4) wxyz, fv (M,) bool)``, or ``None`` when the
+        frame is out of range and no bicycle params are present.
     """
     fv = rigid_state["instances_fv"]  # (T, M) bool
     num_frames = fv.shape[0]
     if 0 <= frame_idx < num_frames:
-        return rigid_world_gaussians(rigid_state, frame_idx)
+        return (
+            rigid_state["poses.trans"][frame_idx],
+            rigid_state["poses.quats"][frame_idx],
+            fv[frame_idx],
+        )
 
     if rigid_state.get("bicycle") is None:
         return None
@@ -426,9 +448,22 @@ def rigid_world_gaussians_extrapolated(
         pose_quats[m] = torch.as_tensor(q_np, dtype=pose_quats.dtype, device=device)
         fv_frame[m] = True
 
-    return _rigid_world_gaussians_from_pose(
-        rigid_state, pose_trans, pose_quats, fv_frame
-    )
+    return pose_trans, pose_quats, fv_frame
+
+
+def rigid_world_gaussians_extrapolated(
+    rigid_state: Dict[str, torch.Tensor], frame_idx: int
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Rigid world Gaussians for any frame index, extrapolating past the baked span.
+
+    Thin composition of :func:`rigid_poses_at_frame` and
+    :func:`rigid_world_gaussians_from_pose`. Returns ``None`` when nothing is
+    active or no bicycle params are present past the span.
+    """
+    poses = rigid_poses_at_frame(rigid_state, frame_idx)
+    if poses is None:
+        return None
+    return rigid_world_gaussians_from_pose(rigid_state, *poses)
 
 
 @torch.no_grad()
@@ -579,6 +614,7 @@ class StandaloneRenderer:
         camera_idx: Optional[int] = None,
         rigid_frame_idx: Optional[int] = None,
         draw_boxes: bool = False,
+        rigid_gaussians: Optional[Dict[str, torch.Tensor]] = None,
     ) -> np.ndarray:
         """Render a single frame.
 
@@ -594,7 +630,14 @@ class StandaloneRenderer:
             ftheta_coeffs: F-theta camera parameters
             camera_idx: Integer camera index for PPISP (None disables per-camera effects)
             rigid_frame_idx: Global rigid-track frame index whose vehicle poses are
-                composited into the render. None -> background only.
+                composited into the render. None -> background only. Ignored when
+                ``rigid_gaussians`` is supplied.
+            rigid_gaussians: Pre-composed world-space rigid Gaussians to composite
+                verbatim, as returned by :func:`rigid_world_gaussians_from_pose`.
+                Lets a caller that has already built its own -- the simulator,
+                which perturbs poses and can swap in replacement vehicle assets --
+                bypass the checkpoint-derived path entirely. None -> derive from
+                ``rigid_frame_idx`` as usual.
 
         Returns:
             Rendered RGB image as uint8 numpy array [H, W, 3]
@@ -639,16 +682,20 @@ class StandaloneRenderer:
         # In rigid_white mode, this is the only foreground content. Frame indices
         # past the baked span are handled by rolling the fitted kinematic bicycle
         # model (on-demand extrapolation), falling back to baked poses in range.
-        if self.rigid_state is not None and rigid_frame_idx is not None:
+        # A caller that has already composed its own rigid Gaussians wins; only
+        # otherwise are they derived from the checkpoint at rigid_frame_idx, so
+        # the offline render pipeline is unaffected.
+        rigid = rigid_gaussians
+        if rigid is None and self.rigid_state is not None and rigid_frame_idx is not None:
             rigid = rigid_world_gaussians_extrapolated(
                 self.rigid_state, int(rigid_frame_idx)
             )
-            if rigid is not None:
-                means = torch.cat([means, rigid["means"]], dim=0)
-                quats = torch.cat([quats, rigid["quats"]], dim=0)
-                scales = torch.cat([scales, rigid["scales"]], dim=0)
-                opacities = torch.cat([opacities, rigid["opacities"]], dim=0)
-                colors = torch.cat([colors, rigid["colors"]], dim=0)
+        if rigid is not None:
+            means = torch.cat([means, rigid["means"]], dim=0)
+            quats = torch.cat([quats, rigid["quats"]], dim=0)
+            scales = torch.cat([scales, rigid["scales"]], dim=0)
+            opacities = torch.cat([opacities, rigid["opacities"]], dim=0)
+            colors = torch.cat([colors, rigid["colors"]], dim=0)
 
         # Debug overlay: draw per-instance 3D boxes as semi-transparent Gaussians
         # (same rasterization pass -> aligns exactly with the render). Only drawn

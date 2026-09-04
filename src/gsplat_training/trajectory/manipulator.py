@@ -8,10 +8,13 @@ Coordinate System Conventions
 -----------------------------
 Camera-to-world (c2w) matrices are 4x4 homogeneous transforms where:
 - The rotation part R (3x3) has columns representing camera axes in world coords:
-    - R[:, 0]: local X axis (forward direction)
-    - R[:, 1]: local Y axis (down direction, -Y = up)
-    - R[:, 2]: local Z axis (forward-ish / depth)
+    - R[:, 0]: local X axis (right)
+    - R[:, 1]: local Y axis (down, -Y = up)
+    - R[:, 2]: local Z axis (forward / depth)
 - The translation part t (3x1) is the camera position in world coordinates
+
+This is the standard OpenCV camera frame, and it matches the shift semantics
+documented in ``configs/rendering/render.yaml``.
 
 Sign conventions for shifts (from camera's perspective):
 - +X: right, -X: left
@@ -110,9 +113,9 @@ class TrajectoryManipulator:
             was_3x4 = False
 
         # Extract local axes from rotation part (columns of R)
-        x_axis = c2ws_4x4[:, :3, 0]  # [N, 3] - forward direction
-        y_axis = c2ws_4x4[:, :3, 1]  # [N, 3] - right direction
-        z_axis = c2ws_4x4[:, :3, 2]  # [N, 3] - up direction
+        x_axis = c2ws_4x4[:, :3, 0]  # [N, 3] - right (lateral)
+        y_axis = c2ws_4x4[:, :3, 1]  # [N, 3] - down (vertical)
+        z_axis = c2ws_4x4[:, :3, 2]  # [N, 3] - forward (longitudinal)
 
         # Apply shifts in local frame (expressed in world coordinates)
         c2ws_4x4[:, :3, 3] += (

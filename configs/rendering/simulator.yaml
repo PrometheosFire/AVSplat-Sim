@@ -1,5 +1,21 @@
 # Standalone simulator configuration (used by scripts/run_simulator.py)
 
+# --- Run discovery ---
+# Which pipeline generation's results tree to search. The simulator first tries
+# the exact config-hash directory (reproducing a specific run); when that misses
+# -- config hashes stop resolving as settings are added, and never match the v3
+# Difix-loop layout -- it falls back to the NEWEST usable run for this
+# dataset/scene, warning that it did so. It never crosses into another scene.
+#   results/extended_4dgs  v3, 07_difix_4dgs_<h>/round_NNN/train/  (current)
+#   results/4dgs           v2, 20_gsplat_dynamic_<h>/
+#   results                v1, 04_gsplat_training_<h>/  (no camera_paths -> unusable)
+results_root: results/extended_4dgs
+# Pin a specific run, skipping discovery entirely. Either a training directory
+# or a 07_difix_4dgs_<h>/ loop dir (whose last round is then used).
+run_dir: null
+# false -> hard-fail instead of falling back to the newest run.
+allow_latest_fallback: true
+
 # Camera to use as the ego source trajectory. Empty -> first available camera.
 start_camera_id: ""
 
@@ -7,8 +23,75 @@ start_camera_id: ""
 start_frame: 0
 start_rigid_frame: 0
 
-# Simulator mode: replay or user
+# Simulator mode: replay, sinusoid (= replay with the ego weave on), or user.
+# 'm' cycles them at runtime.
 mode: replay
+
+# --- Scenario editing ---
+# Shifts are [x_m, y_m, z_m] in real-world meters, same convention as
+# rendering/render.yaml:
+#   x: lateral      (+ right,   - left)
+#   y: vertical     (+ down,    - up)
+#   z: longitudinal (+ forward, - backward)
+# The sinusoid weaves along the lateral (x) axis, on top of any constant shift.
+# Pick a period that divides the frame count, or the weave snaps when replay loops.
+ego:
+  shift_m: [0.0, 0.0, 0.0]
+  sinusoid:
+    enabled: false        # true -> weave in plain 'replay' too, not just 'sinusoid' mode
+    amplitude_m: 1.0
+    period_frames: 40.0
+    phase_deg: 0.0
+    follow_yaw: true      # rotate heading to the path tangent
+
+# Per-object scenarios, keyed by ORIGINAL TRACK ID (as seen in the tracks JSON /
+# BEV viz), not by instance column. Tracking and refinement renumber tracks
+# between runs, so an ID that this run does not have is reported and skipped.
+# Object weaves only apply on frames where that object has a real trajectory:
+# never on bicycle-extrapolated frames, and phase-anchored to the frame the
+# object first appears, so it enters on its true track rather than displaced.
+# 'asset' drives that track with a different car model from the library below,
+# keeping the original trajectory. The asset keeps its TRUE metric size and is
+# seated on the tracked box's floor, so a compact car replacing a truck rests on
+# the road rather than floating at the truck's centre height.
+objects: {}
+# objects:
+#   53:
+#     shift_m: [0.0, 0.0, 0.0]
+#     sinusoid: {enabled: true, amplitude_m: 1.5, period_frames: 30}
+#   259:
+#     asset: 2024_06_04_13_44_39
+
+# --- Replacement vehicle assets (data/3DRealCar) ---
+# Raw assets carry 500-930k gaussians each against a ~2M background. Assets are
+# loaded WHOLE by default -- nothing is discarded unless a knob below asks for
+# it. There is deliberately no below-ground trim: it would remove the patch of
+# road some captures include, but it also clips the air dam and contact patches
+# of low-chassis cars, and the residue is only 0.01-0.6% of an asset.
+assets:
+  library_dir: data/3DRealCar
+  # A 3DGS car is MOSTLY low-opacity gaussians -- only ~15% exceed 0.5, and the
+  # rest still carry its appearance -- so raising this thins the car visibly.
+  # Reference counts for a 738k-gaussian car: 0.0 -> 734k, 0.05 -> 431k,
+  # 0.1 -> 337k, 0.2 -> 244k, 0.5 -> 106k. Raise it only if the frame rate
+  # bothers you; against a ~2M background one full-fidelity car is affordable.
+  opacity_threshold: 0.0
+  # Bound gaussians to the wlh box times this factor. OFF by default: this is
+  # NOT a halo trim. 99.4% of an asset already lies within 1.2x its wlh box --
+  # wlh.json under-states the true extent rather than the cloud having a halo --
+  # so cropping at 1.02 threw away ~61% of a car (roof, front, rear and sides).
+  # Enabling it ALSO trims below-ground content (the box floor is y=0), which is
+  # the lever to reach for if an asset drags a visible patch of road with it.
+  # Try ~1.25 first; anything under ~1.2 starts cutting bodywork.
+  crop_to_box_margin: null
+  max_points: 750000         # hard ceiling; most opaque kept first
+  # Zero the higher-order SH. The asset's view-dependent terms live in its own
+  # canonical frame and are not rotated into world space, so keeping them makes
+  # lighting swim as the car turns.
+  dc_only: false
+  # Asset +x is the car's front across the 3DRealCar library (verified from
+  # tail-light colour). Set true only if some asset turns out to face backwards.
+  flip_forward: false
 
 # Time / loop
 # Integration dt and render cap; effective tick is limited by rendering speed.
