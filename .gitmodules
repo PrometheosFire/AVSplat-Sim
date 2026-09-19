@@ -6,7 +6,8 @@
 	url = git@github.com:nv-tlabs/Difix3D.git
 [submodule "external/ncore"]
 	path = external/ncore
-	url = https://github.com/NVIDIA/ncore.git
+	url = git@github.com:PrometheosFire/ncore.git
+	branch = avsplat
 [submodule "external/sam3"]
 	path = external/sam3
 	url = git@github.com:facebookresearch/sam3.git
