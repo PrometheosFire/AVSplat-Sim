@@ -1,0 +1,4 @@
+# CUDA extensions for envs/env_cc3dt, compiled against the installed torch.
+# Installed after cc3dt.txt with --no-build-isolation --no-deps; needs nvcc 12.8.
+
+vis4d_cuda_ops @ git+https://github.com/SysCV/vis4d_cuda_ops.git@d2478d80045b62f85be19235981a63ea9bc8db66

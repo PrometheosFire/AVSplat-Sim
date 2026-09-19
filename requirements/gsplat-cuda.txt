@@ -1,0 +1,7 @@
+# CUDA extensions for envs/envs/env_gsplat, compiled against the installed torch.
+# Installed after gsplat.txt with --no-build-isolation --no-deps; needs nvcc 12.8.
+
+-e ./external/gsplat
+fused_bilagrid @ git+https://github.com/harry7557558/fused-bilagrid@49f0ef06c9f81810fb9b5dd9027cf1844950cc16
+fused_ssim @ git+https://github.com/rahul-goel/fused-ssim@328dc9836f513d00c4b5bc38fe30478b4435cbb5
+ppisp @ git+https://github.com/nv-tlabs/ppisp@86c2c64df7941040b3db371fb75a7d75c1f1e82b
