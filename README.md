@@ -5,7 +5,7 @@
 ### System requirements
 
 - Linux (developed on Ubuntu 24.04)
-- Python 3.12 (`python3.12` with the `venv` module)
+- Python 3.12 with the `venv` module and development headers (`Python.h`, needed to compile the CUDA extensions). On Ubuntu 24.04 these are not installed by default: `sudo apt install python3.12-venv python3.12-dev`
 - NVIDIA GPU and driver supporting CUDA 12.8
 - CUDA 12.8 toolkit (`nvcc` on `PATH`) and a matching host compiler (developed with gcc 14), used to compile gsplat and the other CUDA extensions
 - An SSH key registered on GitHub (the gsplat and ncore submodules are cloned over SSH)
@@ -53,22 +53,85 @@ To refresh a lock after changing an env: `envs/<path>/bin/python -m pip freeze -
 
 ### 3. Download model weights
 
-Weights go in `external_weights/` (gitignored):
+Weights go in `external_weights/` (gitignored).
+
+**SAM3** is gated and is **not** downloaded automatically: `configs/model/sam3.yaml` loads `external_weights/sam3/sam3.pt`, so it must exist before the first run.
+
+1. Request access at https://huggingface.co/facebook/sam3.
+2. Create a Read token at https://huggingface.co/settings/tokens and log in from the terminal. Being logged in on the website is not enough; the CLI needs its own token.
+3. Download the weights:
 
 ```bash
-# SAM3 (gated: request access at https://huggingface.co/facebook/sam3 first,
-# then `envs/env_segmentation/bin/huggingface-cli login`)
+envs/env_segmentation/bin/huggingface-cli login
+envs/env_segmentation/bin/huggingface-cli whoami    # should print your username
 envs/env_segmentation/bin/huggingface-cli download facebook/sam3 sam3.pt model.safetensors --local-dir external_weights/sam3
-
-# CC-3DT tracking models (vis4d model zoo)
-mkdir -p external_weights/cc3dt
-wget -P external_weights/cc3dt \
-    https://dl.cv.ethz.ch/vis4d/cc_3dt/cc_3dt_frcnn_r50_fpn_12e_nusc_d98509.pt \
-    https://dl.cv.ethz.ch/vis4d/cc_3dt/cc_3dt_frcnn_r101_fpn_24e_nusc_f24f84.pt
 ```
 
-Difix (`nvidia/difix_ref`) is downloaded automatically from Hugging Face on first use.
+**CC-3DT** tracking models (r50 is the default; r101 is used when the tracker backbone is `r101`). The vis4d model-zoo host these were originally downloaded from (`dl.cv.ethz.ch`) no longer resolves (checked 2026-09-20), so they are fetched from the public Hugging Face repo [RoyYang0714/cc-3dt](https://huggingface.co/RoyYang0714/cc-3dt) instead. No login is needed:
+
+```bash
+mkdir -p external_weights/cc3dt
+for f in cc_3dt_frcnn_r50_fpn_12e_nusc_d98509.pt cc_3dt_frcnn_r101_fpn_24e_nusc_f24f84.pt; do
+    wget -P external_weights/cc3dt "https://huggingface.co/RoyYang0714/cc-3dt/resolve/main/$f"
+done
+sha256sum external_weights/cc3dt/*.pt
+```
+
+Expected checksums (the first six characters also match the suffix in each filename):
+
+```
+f24f844d436d1cb9dc17e37ce79f17a14eeb2b3c1792be148d5ca15b6c54243f  cc_3dt_frcnn_r101_fpn_24e_nusc_f24f84.pt
+d9850985cc7f6981e352c40af38c958ac263ef44ce068c54aede7c323114a650  cc_3dt_frcnn_r50_fpn_12e_nusc_d98509.pt
+```
+
+**Difix** (`nvidia/difix_ref`) is downloaded automatically from Hugging Face on first use.
 
 ### 4. Data
 
-Datasets live under `data/` (gitignored), e.g. `data/wayve101`, `data/nuscenes`, `data/3DRealCar`.
+Datasets live under `data/` (gitignored). Only `wayve101` and `3DRealCar` are covered here; `data/nuscenes` is not.
+
+#### Wayve Scenes 101 -> `data/wayve101`
+
+The dataset is distributed as split zip parts (`WayveScenes101-<timestamp>-1-NNN.zip`). Each part contains per-scene zips (`WayveScenes101/scene_NNN.zip`), so it has to be unzipped twice. Put the parts in `data/`, then extract one part at a time so the intermediate copies stay small:
+
+```bash
+tmp=$(mktemp -d)
+mkdir -p data/wayve101
+for part in data/WayveScenes101-*.zip; do
+    unzip -oq "$part" -d "$tmp"
+    for scene in "$tmp"/WayveScenes101/scene_*.zip; do
+        unzip -oq "$scene" -d data/wayve101 && rm "$scene"
+    done
+done
+rm -r "$tmp"
+```
+
+Result (about 49 GB for 101 scenes; the pipeline reads `data/wayve101/<scene>`, see `configs/dataset/wayve101.yaml`):
+
+```
+data/wayve101/
+├── scene_001 ... scene_101
+│   ├── colmap_sparse/rig/     cameras.bin, images.bin, points3D.bin
+│   ├── images/<5 cameras>/
+│   └── masks/<5 cameras>/
+└── dataset_info/              scene_metadata.csv, baselines.json
+```
+
+#### 3DRealCar vehicle assets -> `data/3DRealCar`
+
+The simulator needs the reconstructed 3DGS vehicles, not the raw 3DRealCar capture data. These come from the [HUGSIM](https://huggingface.co/datasets/XDimLab/HUGSIM) dataset (public, MIT). Download only its `3DRealCar/` folder (110 vehicles, about 19 GB; the rest of the repo is about 41 GB and is not needed):
+
+```bash
+envs/env_segmentation/bin/huggingface-cli download XDimLab/HUGSIM \
+    --repo-type dataset --include "3DRealCar/*" --local-dir data
+```
+
+This produces the layout expected by `library_dir: data/3DRealCar` in `configs/rendering/simulator.yaml`:
+
+```
+data/3DRealCar/<timestamp>/
+├── gs.pth      reconstructed Gaussians (torch pickle)
+└── wlh.json    [width, length, height] in metres
+```
+
+The command also creates a small `data/.cache/huggingface/` folder with download bookkeeping, which is safe to ignore (it lets an interrupted download resume).

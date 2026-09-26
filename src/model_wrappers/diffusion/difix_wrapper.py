@@ -44,7 +44,13 @@ class DifixWrapper(BaseDiffusionModel):
         )
         
         self.pipe.enable_model_cpu_offload()
-        self.pipe.enable_xformers_memory_efficient_attention()
+        # diffusers self-tests xformers with float32 inputs, which fails on GPUs the
+        # installed xformers build has no fp32 kernel for (e.g. Blackwell, sm_120).
+        # Fall back to torch's built-in attention instead of crashing.
+        try:
+            self.pipe.enable_xformers_memory_efficient_attention()
+        except Exception as e:
+            print(f"xformers attention unavailable ({type(e).__name__}); using default attention.")
         # VAE slicing MUST stay off when a reference image is used. With a ref the
         # pipeline encodes torch.cat([image, ref_image], dim=0) as a batch of 2;
         # diffusers' slicing path encodes one sample at a time, and Difix's encoder
