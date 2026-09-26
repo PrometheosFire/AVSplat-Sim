@@ -378,6 +378,67 @@ def shift_arg(shifts: List[List[float]]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Off-trajectory metrics (KID / FID)                                           #
+# --------------------------------------------------------------------------- #
+
+
+def run_metrics(
+    round_dir: str,
+    render_dir: str,
+    real_bank_dir: str,
+    cameras: List[str],
+    ncore_json: Optional[str],
+    overrides: List[str],
+    env,
+) -> Optional[str]:
+    """Score this round's shifted renders against the real-frame bank.
+
+    Off the recorded trajectory no photograph exists, so no paired metric is
+    definable and the only measurement available is distributional: KID (primary,
+    unbiased at this sample size) and FID (reported for comparability with
+    Difix3D+, UniSim, NeuRAD and ReconDreamer). See
+    docs/06-evaluation/off-trajectory-metrics.md.
+
+    Runs on the RENDERS, not the cleaned views: the question is how good the model
+    is off-path, and the render set is ~1000 frames per shift level against ~150
+    for the cleaned bank.
+
+    **Never fails the round.** Metrics are a measurement, not an input to
+    training, so a failure here is reported and stepped over rather than losing a
+    trained round. That is the opposite of the difix step, whose output the next
+    round trains on.
+    """
+    metrics_dir = os.path.join(round_dir, "metrics")
+    out = os.path.join(metrics_dir, "offpath_metrics.json")
+    if _done(metrics_dir):
+        print(f"  [metrics] cache hit: {metrics_dir}")
+        return out
+
+    cmd = [
+        GSPLAT_PYTHON,
+        os.path.abspath("src/post_processing/offpath_metrics.py"),
+        f"hydra.run.dir={os.path.join(metrics_dir, 'hydra')}",
+        f"++metrics_task.render_dir={os.path.join(render_dir, 'full')}",
+        f"++metrics_task.real_bank_dir={real_bank_dir}",
+        f"++metrics_task.output_dir={metrics_dir}",
+        f"++metrics_task.cameras=[{','.join(cameras)}]",
+        *overrides,
+    ]
+    if ncore_json:
+        # Only used to load the per-camera ego mask, which is intersected out of
+        # the per-frame WayveScenes101 masks (those also carry moving privacy
+        # redactions -- see the module docstring).
+        cmd.append(f"++metrics_task.data_dir={ncore_json}")
+
+    try:
+        _run(cmd, env)
+    except Exception as exc:
+        print(f"  [metrics] FAILED ({type(exc).__name__}: {exc}); continuing")
+        return None
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Locating a trained round's output                                            #
 # --------------------------------------------------------------------------- #
 

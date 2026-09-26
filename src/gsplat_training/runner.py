@@ -1741,11 +1741,34 @@ class Runner:
 
             # Rigid opacity reset (OmniRe: every 3000 steps, clamp to max 0.01).
             # Forces saturated / dead Gaussians to re-compete via densification.
+            #
+            # The reset is only meaningful while densification is still running:
+            # re-competition IS the prune/grow pass, so a reset with no pass after
+            # it just leaves the whole set clamped near-transparent with nothing to
+            # cull the dead or regrow replacements -- only the opacity optimiser,
+            # for the remainder of training.
+            #
+            # Measured before this guard existed, at the shipped 30k / stop 25000 /
+            # reset 3000: the last refine tick was step 24900 and the last reset
+            # fired at 27000, i.e. 2100 steps after densification had stopped. The
+            # result was that **66% of the rigid Gaussians in the final checkpoint
+            # sat below their own rigid_prune_opacity** -- they survived only
+            # because pruning had already ended. Against 3.4% with no reset at all.
+            #
+            # Corroborated independently by the August sweep, where refine_stop
+            # varied at fixed reset: with the final reset followed by densification
+            # (stop 29000) mean rigid opacity was 0.39-0.41 and the faded fraction
+            # 0.21-0.25; orphaned (stop 25000) it was 0.11-0.13 and 0.64-0.68.
+            #
+            # `+ rigid_refine_every` rather than a bare `<` because the last reset
+            # needs at least one refine cycle after it, not merely to land before
+            # the stop iteration.
             if (
                 self.rigid_nodes is not None
                 and cfg.rigid_reset_opacity_every > 0
                 and step > 0
                 and step % cfg.rigid_reset_opacity_every == 0
+                and step + cfg.rigid_refine_every <= cfg.rigid_refine_stop_iter
             ):
                 _max_logit = torch.logit(torch.tensor(0.01))
                 self.rigid_nodes.gauss["opacities"].data.clamp_(max=_max_logit.item())

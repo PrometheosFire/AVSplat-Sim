@@ -60,6 +60,7 @@ from difix_common import (
     resolve_cameras,
     resolve_schedule,
     run_difix,
+    run_metrics,
     shift_arg,
     union_shifts,
 )
@@ -280,6 +281,21 @@ def main(cfg: DictConfig) -> None:
         )
         record["render_dir"] = render_dir
         record["durations"]["render"] = render_duration
+
+        # Score the renders off-path (KID / FID) before cleaning. Placed here
+        # rather than after difix because it only needs the renders, so the
+        # measurement survives a difix failure -- and it covers the FINAL round
+        # too, which is cleaned by nothing and would otherwise never be scored.
+        metrics_json, metrics_duration = _timed(
+            os.path.join(round_dir, "metrics"),
+            lambda: run_metrics(
+                round_dir, render_dir, real_bank_dir, cameras, ncore_json,
+                overrides, env,
+            ),
+        )
+        if metrics_json:
+            record["metrics"] = metrics_json
+            record["durations"]["metrics"] = metrics_duration
 
         if not is_final:
             manifest, difix_duration = _timed(

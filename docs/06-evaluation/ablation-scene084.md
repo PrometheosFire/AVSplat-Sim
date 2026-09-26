@@ -379,6 +379,33 @@ away from the path, which is the property that matters for simulation.
 Renders were produced from each checkpoint, featurised, and deleted per variant
 to keep peak disk at ~3.6 GB rather than ~50 GB. Total 29.6 min.
 
+> **These numbers came from an ad-hoc script that no longer exists** (2026-09-26 audit: no
+> tracked file in the repo computed KID before the stage added today). Its `subset_size`,
+> `subsets`, `seed` and whether it masked ego pixels are all unrecoverable, and **the shifted
+> renders were deleted**, so this table cannot be re-derived as it stands — only re-rendered from
+> the checkpoints, which do survive.
+>
+> **The new stage agrees with it closely**, which is the reassuring part. Comparing the nearest
+> available arms — not a strict replication, since they differ in training length:
+>
+> | | ego | −1 m | −2 m | −3 m | slope /m |
+> |---|---|---|---|---|---|
+> | ad-hoc, `abl_baseline` (30 k, no bank) | 16.14 | 17.46 | 22.19 | 28.83 | **4.28** |
+> | new stage, `c209be42` round 0 (45 k, no bank) | 16.73 | 18.57 | 24.13 | 29.71 | **4.33** |
+>
+> Ego +3.7 %, −3 m +3.1 %, and the **slope — the quantity § 6.4 actually claims — agrees to
+> 1.2 %**. So the measurement did not change; its reproducibility did.
+>
+> The residual ~3 % cannot be attributed: candidates are the 30 k/45 k difference, different
+> subset settings (the ad-hoc per-cell spread varies 0.65–1.60 against the stage's steadier
+> 0.86–1.00), ego masking, or run-to-run variance. That unattributable gap is the cost of ad-hoc
+> measurement, and it is the reason **old and new KID values must not share a table**.
+>
+> **To regenerate this column reproducibly:** re-render each variant from its surviving
+> checkpoint and score with the stage — roughly 2.5 min render + 40 s scoring per variant, so
+> ~35 min for the ten renderable ones. The four that cannot be rendered (below) stay empty either
+> way.
+
 ## Four variants could not be rendered at all
 
 This is a finding in its own right, not a harness problem. `render_standalone`

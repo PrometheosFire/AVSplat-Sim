@@ -71,6 +71,7 @@ from difix_common import (
     resolve_cameras,
     resolve_schedule,
     run_difix,
+    run_metrics,
     shift_arg,
     union_shifts,
 )
@@ -533,6 +534,19 @@ def main(cfg: DictConfig) -> None:
         )
         record["render_dir"] = render_dir
         record["durations"]["render"] = render_duration
+
+        # Off-path KID / FID on the renders. Before difix so the measurement
+        # survives a difix failure, and so the final round is scored too.
+        metrics_json, metrics_duration = _timed(
+            os.path.join(round_dir, "metrics"),
+            lambda: run_metrics(
+                round_dir, render_dir, real_bank_dir, cameras,
+                ncore_json_of(ncore_dir), overrides, env,
+            ),
+        )
+        if metrics_json:
+            record["metrics"] = metrics_json
+            record["durations"]["metrics"] = metrics_duration
 
         if not is_final:
             # The manifest must describe the renders that were just cleaned, not

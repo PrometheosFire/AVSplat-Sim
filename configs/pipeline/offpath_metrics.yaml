@@ -1,0 +1,41 @@
+# Off-trajectory distributional metrics: KID (primary) and FID.
+#
+# Scores a round's shifted renders against the real-frame bank. No paired metric
+# is definable off the recorded trajectory, so this is what Chapter 6 section 6.4
+# rests on. See docs/06-evaluation/off-trajectory-metrics.md for why KID leads.
+
+# A render MODE directory, e.g. <round>/render/full
+render_dir: ???
+# Stage 035 bank: 960x540 PNG, byte-identical to the training input, so it sits
+# in the same pixel domain as the renders. Do NOT point this at the raw
+# 1920x1080 JPEGs -- that adds both a resize and a JPEG-vs-PNG difference between
+# the two sets being compared (clean-fid, Parmar et al. CVPR 2022).
+real_bank_dir: ???
+output_dir: ???
+
+# Empty = every camera in the bank's index.json.
+cameras: []
+
+# NCore dataset, used ONLY to load the per-camera ego masks. Training excludes
+# ego pixels from the loss, so the model never learns them and renders put
+# arbitrary content there while the real frames show real bodywork -- a constant
+# offset inflating every score at every shift level if left unmasked. Leave null
+# to score unmasked; the output records which was done.
+data_dir: null
+mask_ego: true
+
+# KID subset size. MUST be strictly less than the sample count: at
+# subset_size == n every subset is the same set permuted, MMD^2 is
+# permutation-invariant, and the reported std is exactly 0 -- an error bar that
+# looks precise and is fabricated. The code clamps to n-1 and records what it
+# used. 500 of ~1000 pooled and 100 of ~200 per camera keep the same ratio.
+subset_size: 500
+subset_size_per_camera: 100
+subsets: 100
+
+# Seeded, or the same inputs give different KID on re-run.
+seed: 0
+device: cuda
+
+# Re-score even when a .success marker exists (false = resume).
+force: false

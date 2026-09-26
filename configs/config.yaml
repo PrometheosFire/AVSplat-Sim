@@ -14,6 +14,7 @@ defaults:
   - pipeline@loop4d_task: difix_4dgs      # Loads pipeline/difix_4dgs.yaml into cfg.loop4d_task
   - pipeline@track_task: run_tracking     # Loads pipeline/run_tracking.yaml into cfg.track_task
   - pipeline@refine_task: refine_tracks   # Loads pipeline/refine_tracks.yaml into cfg.refine_task
+  - pipeline@metrics_task: offpath_metrics # Loads pipeline/offpath_metrics.yaml into cfg.metrics_task
 
   - gaussian_splatting: train
   - rendering@rendering: render   # Loads rendering/render.yaml into cfg.rendering

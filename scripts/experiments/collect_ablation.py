@@ -34,6 +34,9 @@ LEVERS = [
 STEPS = ["abl_steps_45k", "abl_steps_60k", "abl_steps_75k", "abl_steps_90k"]
 ORDER = LEVERS + STEPS
 N_CAMERAS = 5
+# Below this many Gaussians an instance exists in the checkpoint but cannot
+# render as a vehicle; see rigid_detail().
+VIABLE_MIN_GAUSSIANS = 100
 
 
 def _fmt_hms(seconds: float) -> str:
@@ -124,9 +127,14 @@ def rigid_detail(variant_dir: str):
     total = int(fv.any(0).sum())
     counts = [int((pid == i).sum()) for i in range(int(fv.shape[1]))]
     alive = sorted((c for c in counts if c > 0), reverse=True)
+    # A "kept" instance owning a handful of Gaussians is not a rendered vehicle.
+    # Measured on the reset sweep: survivors with 5, 10 and 170 Gaussians, against
+    # medians in the thousands -- so counting anything > 0 flatters the harsh
+    # settings. VIABLE applies a floor; both are reported so the gap is visible.
     return {
         "n_rigid": int(rn["gauss.means"].shape[0]),
         "kept": len(alive),
+        "viable": sum(1 for c in alive if c >= VIABLE_MIN_GAUSSIANS),
         "total": total,
         "per": alive,
     }
@@ -145,10 +153,25 @@ def densifier_trace(variant_dir: str):
         r"\[RigidDensifier\] step (\d+): \+(\d+) dup, \+(\d+) split, "
         r"-(\d+) prune -> (\d+) rigid GS"
     )
+    # The launcher writes stdout to <sweep>/<variant>.stdout.log, i.e. BESIDE the
+    # variant directory rather than inside it, and a transferred sweep may nest
+    # those logs one level further. Search all three shapes.
+    name = os.path.basename(variant_dir.rstrip("/"))
+    sweep = os.path.dirname(variant_dir.rstrip("/"))
+    candidates = (
+        glob.glob(os.path.join(variant_dir, "*.log"))
+        + glob.glob(os.path.join(variant_dir, "*.out"))
+        + glob.glob(os.path.join(variant_dir, "stdout*"))
+        + glob.glob(os.path.join(sweep, f"{name}.stdout.log"))
+        + glob.glob(os.path.join(sweep, "*", f"{name}.stdout.log"))
+        # A sweep transferred from another machine often arrives as
+        # <root>/<runs_dir>/<variant> with the logs unpacked alongside in
+        # <root>/<logs_dir>/, i.e. a SIBLING of the sweep dir rather than inside
+        # it. Look one level up as well before giving up on the trace.
+        + glob.glob(os.path.join(os.path.dirname(sweep), "*", f"{name}.stdout.log"))
+    )
     rows = []
-    for f in glob.glob(os.path.join(variant_dir, "*.log")) + \
-             glob.glob(os.path.join(variant_dir, "*.out")) + \
-             glob.glob(os.path.join(variant_dir, "stdout*")):
+    for f in candidates:
         try:
             for line in open(f, errors="replace"):
                 m = pat.search(line)
@@ -237,10 +260,23 @@ def main() -> int:
     # any other variant directory, so a NEW sweep (e.g. the rigid reset study)
     # collects without having to be added to ORDER by hand.
     present = [n for n in ORDER if os.path.isdir(os.path.join(args.sweep_dir, n))]
+    def _is_variant(d: str) -> bool:
+        """A variant directory is one a training job wrote, not any subdirectory.
+
+        A sweep dir also accumulates log bundles, archived failed attempts and
+        transferred artefacts; treating those as variants produces phantom rows
+        (and a misleading "still training"). Requiring cfg.yml or stats/ keeps to
+        directories train_splats.py actually produced.
+        """
+        full = os.path.join(args.sweep_dir, d)
+        return os.path.isdir(full) and (
+            os.path.exists(os.path.join(full, "cfg.yml"))
+            or os.path.isdir(os.path.join(full, "stats"))
+        )
+
     extra = sorted(
         d for d in os.listdir(args.sweep_dir)
-        if os.path.isdir(os.path.join(args.sweep_dir, d)) and d not in ORDER
-        and not d.startswith(".")
+        if d not in ORDER and not d.startswith(".") and _is_variant(d)
     )
     names = present + extra
 
@@ -314,9 +350,11 @@ def main() -> int:
               "it by ~0.17 dB. `%cap` distinguishes a THRESHOLD-limited run "
               "(the grow cue decides) from a BUDGET-limited one (the cap "
               "decides)._\n")
+        print(f"_`viable` applies a floor of {VIABLE_MIN_GAUSSIANS} Gaussians; `kept` "
+              "counts any instance owning at least one, which flatters harsh settings._\n")
         print("| variant | reset | prune | refine | rigid #GS | cap | %cap | "
-              "limited by | kept | per-instance max/med/min | PSNR |")
-        print("|---|---|---|---|---|---|---|---|---|---|---|")
+              "limited by | kept | viable | per-instance max/med/min | PSNR |")
+        print("|---|---|---|---|---|---|---|---|---|---|---|---|")
         for name, r in rigid_rows:
             c, det = r["rcfg"], r["rdet"]
             cap = c.get("rigid_cap_max") or 0
@@ -331,6 +369,7 @@ def main() -> int:
                   f"{c.get('rigid_prune_opacity', '')} | "
                   f"{c.get('rigid_refine_every', '')} | {det['n_rigid']:,} | "
                   f"{cap:,} | {'' if pct is None else f'{pct:.0f}%'} | {limited} | {kept} | "
+                  f"{det['viable']}/{det['total']}{'' if det['viable'] == det['kept'] else ' ⚠'} | "
                   f"{spread} | {r['stats']['psnr']:.3f} |")
 
         traced = [(n, r) for n, r in rigid_rows if r["trace"]]
