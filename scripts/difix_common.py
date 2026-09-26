@@ -457,9 +457,25 @@ def run_difix(
         print(f"  [difix] cache hit: {difix_dir}")
         return manifest
 
+    # The zero shift is cleaned as a CONTROL, not as training data: real ground
+    # truth exists there, so compute_stats scores it with full-reference metrics
+    # (LPIPS is the signal) and that is the round's only go/no-go measurement.
+    # build_manifest excludes it from the bank by name, so requesting it adds a
+    # measurement without adding pseudo-views.
+    #
+    # It is requested here rather than by the callers because both render it
+    # unconditionally (``all_shifts = [[0, 0, 0]] + shifts``), so it can never
+    # be "requested but not rendered". Before this, callers passed only their
+    # round's curriculum shifts, which never contain the zero shift, so the
+    # control silently stopped being produced when per-round shift selection
+    # was added.
+    shifts_to_clean = list(shifts)
+    if not any(all(abs(v) < 1e-6 for v in s) for s in shifts_to_clean):
+        shifts_to_clean.append([0.0, 0.0, 0.0])
+
     print(
-        f"  [difix] shifts={shifts} stride={stride} phase={phase} "
-        f"dynamic={dynamic}"
+        f"  [difix] shifts={shifts_to_clean} (control included) "
+        f"stride={stride} phase={phase} dynamic={dynamic}"
     )
     _run(
         [
@@ -476,7 +492,7 @@ def run_difix(
             f"++pseudo_task.round={round_idx}",
             f"++pseudo_task.frame_stride={stride}",
             f"++pseudo_task.frame_phase={phase}",
-            f"++pseudo_task.shifts_m={shift_arg(shifts)}",
+            f"++pseudo_task.shifts_m={shift_arg(shifts_to_clean)}",
             f"++pseudo_task.dynamic={str(bool(dynamic)).lower()}",
             *overrides,
         ],

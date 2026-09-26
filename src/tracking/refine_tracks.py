@@ -2850,7 +2850,7 @@ def _run_user_refinement_loop(
     pending_commands: list[str] = []
     command_log_lines: list[str] = []
     vel_window = int(user_cfg.get("extend_velocity_window", cfg.get("extend_velocity_window", 3)))
-    default_extend = int(user_cfg.get("default_extend", 5))
+    default_extend = int(user_cfg.get("default_extend", 0))
     project_cfg = cfg.get("project", {}) or {}
     debug_variants = bool((cfg.get("bicycle_fit", {}) or {}).get("debug_bake_variants", False))
     bake_source = str(
@@ -3499,7 +3499,7 @@ def main(cfg: DictConfig) -> None:
     # track, replacing every frame's Y with the plane-predicted value.
     # Run AFTER user refinement so manual edits are respected.
     height_fit_report: dict = {}
-    if bool(cfg.refine_task.get("height_plane_fit", True)):
+    if bool(cfg.refine_task.get("height_plane_fit", False)):
         height_tracks = build_tracks(refined_results)
         height_fit_report = fit_instance_heights_ransac(
             height_tracks,

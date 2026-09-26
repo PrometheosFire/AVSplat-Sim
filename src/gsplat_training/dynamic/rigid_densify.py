@@ -69,17 +69,39 @@ class RigidDensifier:
 
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def update_state(self, rigid_nodes) -> None:
+    def update_state(self, rigid_nodes, loss_scale: float = 1.0) -> None:
         """Accumulate the local-means positional-gradient norm after backward.
 
         Must be called after ``loss.backward()`` and before the rigid optimizers
         zero their gradients. Gaussians not rendered this step have zero gradient
         and simply do not contribute (their ``count`` does not advance).
+
+        ``loss_scale`` is the per-step multiplier the caller applied to the loss
+        BEFORE ``backward()`` -- ``real_loss_scale`` (1.5) on a real step,
+        ``pseudo_lambda`` (0.3) on a pseudo step, 1.0 when there is no pseudo
+        bank. The raw gradient is that multiplier times the true gradient, so it
+        is divided out here: ``grow_grad_thresh`` is meant to be a threshold on
+        reconstruction-error saliency, and without this division it is instead a
+        threshold on saliency times the mean loss-weight of the views a Gaussian
+        happens to appear in.
+
+        That contamination could not be fixed by retuning the threshold, because
+        the inflation factor is per-Gaussian: for a Gaussian rendered in a
+        fraction ``v`` of pseudo steps it is ``(1.05 + 0.09v) / (0.7 + 0.3v)``,
+        i.e. 1.5x at ``v=0`` and 1.14x at ``v=1``. Dividing here also removes a
+        round-0-vs-later discontinuity, since round 0 has no pseudo bank and so
+        ran unscaled while every later round did not.
+
+        Note this deliberately does NOT gate on whether the step was pseudo:
+        pseudo-views should steer rigid densification, and at full per-view
+        strength rather than at 0.3/1.5 = one fifth of a real view's.
         """
         grad = rigid_nodes.gauss["means"].grad
         if grad is None:
             return
         gnorm = grad.norm(dim=-1)  # (N,)
+        if loss_scale != 1.0:
+            gnorm = gnorm / loss_scale
         if self.state["grad3d"] is None:
             self.state["grad3d"] = torch.zeros(gnorm.shape[0], device=gnorm.device)
             self.state["count"] = torch.zeros(gnorm.shape[0], device=gnorm.device)

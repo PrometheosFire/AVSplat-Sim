@@ -1,4 +1,4 @@
-"""Collect an ablation sweep into the markdown tables in docs/ablation_scene084.md.
+"""Collect an ablation sweep into the markdown tables in docs/06-evaluation/ablation-scene084.md.
 
 Reads every variant directory under a Hydra sweep dir and prints two tables:
 headline metrics as deltas against the baseline, and the per-camera PSNR
@@ -64,6 +64,99 @@ def rigid_count(variant_dir: str):
         return int(rn["gauss.means"].shape[0]) if rn else 0
     except Exception:
         return None
+
+
+RIGID_KEYS = (
+    "rigid_reset_opacity_every", "rigid_prune_opacity", "rigid_refine_every",
+    "rigid_grow_grad_thresh", "rigid_cap_max",
+)
+
+
+def rigid_cfg(variant_dir: str):
+    """The rigid densification settings this variant actually trained with.
+
+    Read from ``cfg.yml`` -- the Config dump the runner writes -- rather than
+    ``.hydra/config.yaml``, because cfg.yml is post-``adjust_steps`` and so is the
+    effective configuration rather than the requested one. A sweep table that
+    cannot name its own cells is unreadable, and several keys here have drifted
+    between stored runs and today's YAML.
+    """
+    path = os.path.join(variant_dir, "cfg.yml")
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    with open(path) as fp:
+        for line in fp:
+            k, _, v = line.partition(":")
+            k = k.strip()
+            if k in RIGID_KEYS:
+                try:
+                    out[k] = float(v) if "." in v else int(v)
+                except ValueError:
+                    pass
+    return out
+
+
+def rigid_detail(variant_dir: str):
+    """Per-instance rigid Gaussian census from the checkpoint.
+
+    ``instances_fv`` is which instances the TRACKS say exist; ``point_ids`` is
+    which ones still own Gaussians. The gap between them is the instance loss
+    that global PSNR barely registers -- a configuration that removed 5-6 whole
+    vehicles moved it by ~0.17 dB -- so it is reported explicitly.
+
+    Returns ``None`` when there is no checkpoint, and zero counts for a
+    background-only run.
+    """
+    cks = sorted(glob.glob(os.path.join(variant_dir, "ckpts", "*.pt")))
+    if not cks:
+        return None
+    try:
+        import torch
+        ck = torch.load(cks[-1], map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+    rn = ck.get("rigid_nodes")
+    if not rn:
+        return {"n_rigid": 0, "kept": 0, "total": 0, "per": []}
+    pid = rn["point_ids"]
+    fv = rn["instances_fv"]
+    total = int(fv.any(0).sum())
+    counts = [int((pid == i).sum()) for i in range(int(fv.shape[1]))]
+    alive = sorted((c for c in counts if c > 0), reverse=True)
+    return {
+        "n_rigid": int(rn["gauss.means"].shape[0]),
+        "kept": len(alive),
+        "total": total,
+        "per": alive,
+    }
+
+
+def densifier_trace(variant_dir: str):
+    """Grow/prune counts per refine tick, if the run's stdout was captured.
+
+    ``RigidDensifier`` reports through ``print()``, so these lines reach stdout
+    and NOT ``train_splats.log``, which only carries the logger. Unless the sweep
+    was piped to a file they exist only in the launching terminal, and this
+    returns None. When present they show the prune spike after each opacity
+    reset directly, rather than leaving it inferred from the final count.
+    """
+    pat = re.compile(
+        r"\[RigidDensifier\] step (\d+): \+(\d+) dup, \+(\d+) split, "
+        r"-(\d+) prune -> (\d+) rigid GS"
+    )
+    rows = []
+    for f in glob.glob(os.path.join(variant_dir, "*.log")) + \
+             glob.glob(os.path.join(variant_dir, "*.out")) + \
+             glob.glob(os.path.join(variant_dir, "stdout*")):
+        try:
+            for line in open(f, errors="replace"):
+                m = pat.search(line)
+                if m:
+                    rows.append(tuple(int(x) for x in m.groups()))
+        except OSError:
+            continue
+    return rows or None
 
 
 def train_time(variant_dir: str):
@@ -140,22 +233,46 @@ def main() -> int:
     ap.add_argument("sweep_dir", help="e.g. multirun/ablation_scene084")
     args = ap.parse_args()
 
+    # ORDER first so the scene_084 lever study keeps its curated sequence, then
+    # any other variant directory, so a NEW sweep (e.g. the rigid reset study)
+    # collects without having to be added to ORDER by hand.
+    present = [n for n in ORDER if os.path.isdir(os.path.join(args.sweep_dir, n))]
+    extra = sorted(
+        d for d in os.listdir(args.sweep_dir)
+        if os.path.isdir(os.path.join(args.sweep_dir, d)) and d not in ORDER
+        and not d.startswith(".")
+    )
+    names = present + extra
+
     rows = {}
-    for name in ORDER:
+    for name in names:
         d = os.path.join(args.sweep_dir, name)
-        if not os.path.isdir(d):
-            continue
         rows[name] = {
             "stats": load_stats(d),
             "rigid": rigid_count(d),
             "time": train_time(d),
             "cams": per_camera_psnr(d),
+            "rcfg": rigid_cfg(d),
+            "rdet": rigid_detail(d),
+            "trace": densifier_trace(d),
         }
+    # A cell still training has no val stats yet; keep it visible but out of the
+    # metric tables, so a partial sweep collects instead of failing.
+    pending = [n for n, r in rows.items() if r["stats"] is None]
+    rows = {n: r for n, r in rows.items() if r["stats"] is not None}
     if not rows:
-        print(f"No variant directories found under {args.sweep_dir}", file=sys.stderr)
+        print(f"No completed variants under {args.sweep_dir}"
+              + (f" ({len(pending)} still training: {', '.join(pending)})" if pending else ""),
+              file=sys.stderr)
         return 1
+    if pending:
+        print(f"> Still training, omitted: {', '.join(pending)}\n")
 
-    base = rows.get(ORDER[0], {}).get("stats")
+    # The first curated variant is the reference when present; otherwise the
+    # first variant alphabetically, which is named in the output so a delta is
+    # never silently measured against an arbitrary cell.
+    ref = ORDER[0] if ORDER[0] in rows else next(iter(rows))
+    base = rows.get(ref, {}).get("stats")
 
     def delta(v, key, fmt="{:+.3f}"):
         if base is None or v is None or key not in v or key not in base:
@@ -164,8 +281,8 @@ def main() -> int:
 
     def metric_row(name, r):
         s = r["stats"]
-        d_psnr = "—" if name == ORDER[0] else delta(s, "psnr")
-        d_lpips = "—" if name == ORDER[0] else delta(s, "lpips", "{:+.4f}")
+        d_psnr = "—" if name == ref else delta(s, "psnr")
+        d_lpips = "—" if name == ref else delta(s, "lpips", "{:+.4f}")
         cc = f"{s['cc_psnr']:.3f}" if "cc_psnr" in s else ""
         rigid = f"{r['rigid']:,}" if r["rigid"] is not None else ""
         return (f"| `{name}` | {s['psnr']:.3f} | {d_psnr} | {cc} | {s['ssim']:.4f} | "
@@ -175,7 +292,7 @@ def main() -> int:
     print("## Headline metrics\n")
     print("| variant | PSNR | Δ | cc-PSNR | SSIM | LPIPS | Δ LPIPS | bg #GS | rigid #GS | time |")
     print("|---|---|---|---|---|---|---|---|---|---|")
-    for name in LEVERS:
+    for name in [n for n in (LEVERS + extra) if n in rows]:
         r = rows.get(name)
         if r is None:
             print(f"| `{name}` | *not run* | | | | | | | | |")
@@ -183,6 +300,60 @@ def main() -> int:
             print(f"| `{name}` | **failed** | | | | | | | | |")
         else:
             print(metric_row(name, r))
+
+    # ---- Rigid densification ------------------------------------------- #
+    # Printed only when some variant actually carries rigid nodes, so the
+    # background-only lever study is unchanged.
+    rigid_rows = [(n, r) for n, r in rows.items()
+                  if r["rdet"] and r["rdet"]["total"] > 0]
+    if rigid_rows:
+        print("\n## Rigid densification\n")
+        print("_`kept` is instances that still own Gaussians, against the number "
+              "the tracks define. Instance loss is the readout global PSNR is "
+              "nearly blind to: a setting that removed 5-6 whole vehicles moved "
+              "it by ~0.17 dB. `%cap` distinguishes a THRESHOLD-limited run "
+              "(the grow cue decides) from a BUDGET-limited one (the cap "
+              "decides)._\n")
+        print("| variant | reset | prune | refine | rigid #GS | cap | %cap | "
+              "limited by | kept | per-instance max/med/min | PSNR |")
+        print("|---|---|---|---|---|---|---|---|---|---|---|")
+        for name, r in rigid_rows:
+            c, det = r["rcfg"], r["rdet"]
+            cap = c.get("rigid_cap_max") or 0
+            pct = 100.0 * det["n_rigid"] / cap if cap else None
+            limited = "" if pct is None else ("budget" if pct > 90 else "threshold")
+            per = det["per"]
+            med = per[len(per) // 2] if per else 0
+            spread = f"{per[0]:,} / {med:,} / {per[-1]:,}" if per else "—"
+            lost = det["total"] - det["kept"]
+            kept = f"**{det['kept']}/{det['total']}**" if lost else f"{det['kept']}/{det['total']}"
+            print(f"| `{name}` | {c.get('rigid_reset_opacity_every', '')} | "
+                  f"{c.get('rigid_prune_opacity', '')} | "
+                  f"{c.get('rigid_refine_every', '')} | {det['n_rigid']:,} | "
+                  f"{cap:,} | {'' if pct is None else f'{pct:.0f}%'} | {limited} | {kept} | "
+                  f"{spread} | {r['stats']['psnr']:.3f} |")
+
+        traced = [(n, r) for n, r in rigid_rows if r["trace"]]
+        if traced:
+            print("\n### Grow/prune trace\n")
+            print("| variant | refine ticks | total dup | total split | total prune | "
+                  "largest single prune (step) |")
+            print("|---|---|---|---|---|---|")
+            for name, r in traced:
+                t = r["trace"]
+                worst = max(t, key=lambda x: x[3])
+                print(f"| `{name}` | {len(t)} | {sum(x[1] for x in t):,} | "
+                      f"{sum(x[2] for x in t):,} | {sum(x[3] for x in t):,} | "
+                      f"{worst[3]:,} (step {worst[0]}) |")
+        else:
+            print("\n> **No grow/prune trace available.** `RigidDensifier` reports "
+                  "via `print()`, so its per-tick counts go to stdout and never "
+                  "reach `train_splats.log`. Pipe the sweep through `tee` to "
+                  "capture them; the table above is unaffected.\n")
+
+    # ---- Step-count sweep ---------------------------------------------- #
+    if not any(n in rows for n in STEPS):
+        return 0
 
     print("\n## Step-count sweep\n")
     print("_Same recipe as `abl_baseline`, trained longer. Read as a curve: a "

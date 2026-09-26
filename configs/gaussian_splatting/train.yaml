@@ -89,7 +89,47 @@ rigid_pose_quats_lr_final: 0.000005
 # Temporal smoothness (2nd-order on translation) weight + window.
 rigid_smooth_w: 0.0 #0.05
 rigid_smooth_range: 5
-# Opacity reset for rigid Gaussians every N steps (0 = off).
+# Opacity reset for rigid Gaussians every N steps (0 = off). Clamps every rigid
+# Gaussian to opacity <= 0.01 so they have to re-compete via densification.
+#
+# TODO(measured harmful as configured — needs a sweep, see options below).
+#
+# The reset target is HARD-CODED at 0.01 (runner.py, "_max_logit"), which sits BELOW
+# rigid_prune_opacity (0.02). So after every reset EVERY rigid Gaussian is a prune
+# candidate, and the ones that cannot recover opacity fast enough are culled.
+#
+# Measured on scene_099 (~32 instances, 30k steps; multirun/2026-08-13/16-45-52 and
+# the results/4dgs/wayve101/scene_099/20_gsplat_dynamic_* runs), at step 30k:
+#
+#   reset_every   instances kept   rigid Gaussians        val PSNR
+#   0 (off)       31-32            ~999,000 (hits cap)    25.11
+#   10000         28                997,474               23.83
+#   3000 (here)   24-25             208k-405k             24.94
+#
+# It costs whole vehicles, suppresses rigid densification 2.5-5x, and ~0.17 dB.
+# Judge by instance count / rigid Gaussian count, NOT PSNR: the within-setting PSNR
+# spread (up to 1.3 dB) exceeds the between-setting difference.
+#
+# The binding constraint is the RECOVERY WINDOW, not this interval. The reset fires
+# after the densifier, so the next prune pass is rigid_refine_every (100) steps
+# later, and an instance only gets gradient on steps where it is rendered:
+#   E[updates] = rigid_refine_every * (n_cameras * n_frames_of_instance / n_train)
+# On scene_084 the survival boundary is ~8 expected updates (13-frame track: 6.9,
+# died; 17-frame: 9.1, lived). That is why reset_every=10000 STILL lost 3 instances
+# -- fewer resets, but the same 100-step window after each one.
+#
+# Options (do not just set 0 -- that discards the re-competition the reset provides):
+#   A  rigid_reset_opacity_every: 0        config-only; measured best, but no re-compete
+#   B  longer interval (e.g. 10000)        config-only; MEASURED INSUFFICIENT
+#   C  rigid_prune_opacity: 0.005          config-only; UNTESTED, most promising --
+#                                          puts the threshold below the reset target,
+#                                          matching strategy.min_opacity for the bg
+#   D  raise the reset target > prune      needs a code change (it is hard-coded)
+#   E  raise rigid_refine_every            widens the window, slows densification
+#   F  skip the prune pass after a reset   needs a code change; standard 3DGS practice
+#
+# Suggested: sweep rigid_reset_opacity_every x rigid_prune_opacity.
+# See docs/03-scene-representation/rigid-gaussian-nodes.md sections 7.2.1-7.2.3.
 rigid_reset_opacity_every: 3000
 # Sharp-shape regularisation: penalise aspect ratio > ratio (OmniRe: w=1.0, every 10).
 rigid_sharp_shape_w: 1.0
@@ -157,6 +197,35 @@ bicycle_lr_center: 2.0e-4
 bicycle_wheelbase_mode: fixed_from_bbox_long_edge
 bicycle_wheelbase_alpha: 0.60
 
+
+# ----------------------------------------------------------------- #
+# Pseudo-view loop (Difix3D+)                                        #
+# ----------------------------------------------------------------- #
+# Surfaced here at their existing code defaults so every run RECORDS them.
+# They were dataclass-only before, which meant a stored run's .hydra/config.yaml
+# could not tell you the real-vs-pseudo weighting it trained with. Values are
+# unchanged; only their visibility is.
+#
+# pseudo_manifests is NOT listed: the orchestrators inject it per round with
+# ++gaussian_splatting.pseudo_manifests=... (run_difix_loop.py, run_difix_4dgs.py).
+#
+# Effective per-step weight is real 0.7*1.5 = 1.05 vs pseudo 0.3*0.3 = 0.09,
+# i.e. ~11.7:1. real_loss_scale compensates real frames for the step budget lost
+# to the pseudo stream, so pseudo supervision is additive rather than displacing.
+# Both multipliers are INACTIVE when there is no pseudo bank.
+pseudo_sample_prob: 0.3
+pseudo_lambda: 0.3
+real_loss_scale: 1.5
+
+# Ablation knob ONLY, and inert as shipped: it gates the DefaultStrategy
+# densification hook, while strategy_type below is "mcmc", whose densification
+# reads opacity and the step counter and never the gradient. Setting it false
+# under mcmc changes nothing -- that is not a bug, it is what the branch means.
+# Pseudo-views still shape the Gaussian set under mcmc, via opacity through the
+# optimizer, and no flag on the densification hook can gate that.
+# (On the DefaultStrategy branch where it IS live it drops ~30% of refine ticks
+# rather than deferring them, so it does not give a clean ablation there either.)
+pseudo_densify: true
 
 strategy:
   cap_max: 2000000        # Default cap

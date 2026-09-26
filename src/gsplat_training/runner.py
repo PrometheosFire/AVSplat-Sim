@@ -1428,17 +1428,23 @@ class Runner:
             # real_loss_scale compensates real frames for the step budget lost
             # to the pseudo stream, so pseudo supervision adds rather than
             # displaces. Inactive (both branches skipped) with no pseudo bank.
+            loss_scale = 1.0
             if pseudoloader_iter is not None:
-                loss = loss * (
+                loss_scale = (
                     cfg.pseudo_lambda if is_pseudo else cfg.real_loss_scale
                 )
+                loss = loss * loss_scale
 
             loss.backward()
 
             # Accumulate the rigid densification signal (3D positional gradient)
             # after backward and before the rigid optimizers zero their grads.
+            # loss_scale is passed so the cue is in unscaled units: the raw grad
+            # carries the per-stream multiplier applied above, which would
+            # otherwise make a fixed grow_grad_thresh mean different things on
+            # real steps, pseudo steps, and in round 0 (which has no bank).
             if self.rigid_densifier is not None:
-                self.rigid_densifier.update_state(self.rigid_nodes)
+                self.rigid_densifier.update_state(self.rigid_nodes, loss_scale)
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss and points is not None:

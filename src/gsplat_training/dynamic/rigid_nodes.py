@@ -15,7 +15,7 @@ The model holds:
 from __future__ import annotations
 
 import random
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -410,6 +410,116 @@ class RigidNodes(nn.Module):
             colors_list.append(col)
 
             s = float((scale_frac * size.min()).clamp_min(1e-3))
+            scales_list.append(torch.full((pts.shape[0], 3), s, device=device))
+
+        means = torch.cat(means_list, dim=0)
+        colors = torch.cat(colors_list, dim=0)
+        scales = torch.cat(scales_list, dim=0)
+        n = means.shape[0]
+        quats = torch.zeros(n, 4, device=device)
+        quats[:, 0] = 1.0
+        opacities = torch.full((n,), float(opacity), device=device)
+        return {
+            "means": means,
+            "quats": quats,
+            "scales": scales,
+            "opacities": opacities,
+            "colors": colors,
+        }
+
+    def get_box_solid_gaussians(
+        self,
+        frame_idx: int,
+        instance_ids: Optional[Sequence[int]] = None,
+        points_per_axis: int = 16,
+        opacity: float = 1.0,
+    ) -> Optional[Dict[str, Tensor]]:
+        """Build **opaque, filled** per-instance boxes as Gaussians, for masking.
+
+        The solid counterpart of :meth:`get_box_edge_gaussians`. Rasterising these
+        alone and thresholding the returned alpha gives a **dynamic-region mask**
+        that is correct under every camera model the pipeline uses -- fisheye,
+        f-theta, unscented-transform projection -- because it goes through the
+        same rasteriser as the render rather than re-deriving a projection. That
+        is the whole reason for building a mask out of Gaussians instead of
+        projecting eight corners with ``cv2.fisheye``: pinhole-projecting fisheye
+        points is the error class that voided the depth ablation.
+
+        The mask depends **only** on the box geometry and the camera, never on the
+        trained Gaussians. That is essential: a mask taken from the model's own
+        rigid-only alpha would shrink whenever the model failed to render a
+        vehicle, so a model that lost a car would score better on the vehicles it
+        still had. This mask cannot reward that failure.
+
+        Only the six faces are sampled, not the volume: under projection the
+        silhouette of the surface is the silhouette of the solid, so interior
+        points would be wasted. Splat scale is set from the face grid spacing so
+        adjacent splats overlap and the silhouette has no pinholes.
+
+        Args:
+            frame_idx: Frame whose poses to use.
+            instance_ids: Restrict to these instance column indices. ``None``
+                renders every instance valid at this frame, which gives the union
+                mask with inter-vehicle occlusion resolved by the rasteriser.
+                Passing a single id gives that instance's mask, which does NOT
+                account for occlusion by other vehicles -- an over-inclusion
+                documented rather than corrected.
+            points_per_axis: Face grid resolution. 16 gives 6*16^2 = 1536 splats
+                per instance, which is negligible next to the scene.
+            opacity: Left at 1.0 so a simple alpha threshold is exact.
+
+        Returns:
+            Ready-to-composite activated Gaussians (``means``, ``quats``,
+            ``scales``, ``opacities``, ``colors`` as SH), or ``None`` if no
+            requested instance is present at this frame.
+        """
+        from utils import rgb_to_sh  # local import; lives in gsplat_training
+
+        device = self.poses["trans"].device
+        fv_f = self.instances_fv[frame_idx]  # (M,) bool
+        active = fv_f.nonzero(as_tuple=True)[0].tolist()
+        if instance_ids is not None:
+            wanted = {int(i) for i in instance_ids}
+            active = [m for m in active if m in wanted]
+        if not active:
+            return None
+
+        # Unit-square grid, lifted onto each of the 6 faces of the unit cube.
+        g = torch.linspace(-1.0, 1.0, points_per_axis, device=device)
+        a, b = torch.meshgrid(g, g, indexing="ij")
+        a, b = a.reshape(-1), b.reshape(-1)
+        ones = torch.ones_like(a)
+        faces = torch.cat(
+            [
+                torch.stack([ones, a, b], dim=-1),
+                torch.stack([-ones, a, b], dim=-1),
+                torch.stack([a, ones, b], dim=-1),
+                torch.stack([a, -ones, b], dim=-1),
+                torch.stack([a, b, ones], dim=-1),
+                torch.stack([a, b, -ones], dim=-1),
+            ],
+            dim=0,
+        )  # (6 * P^2, 3) in [-1, 1]^3
+
+        palette = _instance_palette(self.num_instances, device)  # (M, 3) rgb
+        means_list, colors_list, scales_list = [], [], []
+        for m in active:
+            size = self.instances_size[m]  # (3,)
+            pts_local = faces * (size[None, :] / 2.0)
+            R = quat_to_rotmat(quat_normalize(self.poses["quats"][frame_idx][m]))
+            t = self.poses["trans"][frame_idx][m]
+            pts = (R @ pts_local.T).T + t
+            means_list.append(pts)
+
+            col = torch.zeros(pts.shape[0], self.num_sh_bases, 3, device=device)
+            col[:, 0, :] = rgb_to_sh(palette[m][None, :]).expand(pts.shape[0], 3)
+            colors_list.append(col)
+
+            # Overlap neighbours: grid spacing is size / (P - 1) per axis, so a
+            # radius of ~0.6 * the largest spacing closes the gaps without
+            # inflating the silhouette appreciably.
+            spacing = float((size.max() / max(points_per_axis - 1, 1)).item())
+            s = max(0.6 * spacing, 1e-3)
             scales_list.append(torch.full((pts.shape[0], 3), s, device=device))
 
         means = torch.cat(means_list, dim=0)
