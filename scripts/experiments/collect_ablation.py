@@ -23,6 +23,7 @@ import re
 import sys
 
 import numpy as np
+import torch
 
 # Order matters: the first entry is the reference every delta is measured against.
 LEVERS = [
@@ -127,6 +128,20 @@ def rigid_detail(variant_dir: str):
     total = int(fv.any(0).sum())
     counts = [int((pid == i).sum()) for i in range(int(fv.shape[1]))]
     alive = sorted((c for c in counts if c > 0), reverse=True)
+    # Opacity-weighted capacity: sum of sigmoid(opacity) over the set. A raw count
+    # is a poor proxy for quality and can invert the ordering -- measured on the
+    # reset sweep, 662,811 Gaussians at median opacity 0.006 carry ~9,900 of
+    # effective capacity while 499,145 at median 0.944 carry ~319,000, a 32x gap
+    # the other way. This is also the quantity that tracked dynamic-region PSNR in
+    # the August sweep (mean opacity 0.56-0.79 beat 0.11-0.41 by +0.57 dB).
+    op = torch.sigmoid(rn["gauss.opacities"].flatten())
+    eff = float(op.sum())
+    prune = None
+    try:
+        prune = rigid_cfg(variant_dir).get("rigid_prune_opacity")
+    except Exception:
+        pass
+    below = float((op < prune).float().mean()) if prune else None
     # A "kept" instance owning a handful of Gaussians is not a rendered vehicle.
     # Measured on the reset sweep: survivors with 5, 10 and 170 Gaussians, against
     # medians in the thousands -- so counting anything > 0 flatters the harsh
@@ -135,6 +150,10 @@ def rigid_detail(variant_dir: str):
         "n_rigid": int(rn["gauss.means"].shape[0]),
         "kept": len(alive),
         "viable": sum(1 for c in alive if c >= VIABLE_MIN_GAUSSIANS),
+        "effective": eff,
+        "mean_op": float(op.mean()),
+        "median_op": float(op.median()),
+        "frac_below_prune": below,
         "total": total,
         "per": alive,
     }
@@ -352,9 +371,13 @@ def main() -> int:
               "decides)._\n")
         print(f"_`viable` applies a floor of {VIABLE_MIN_GAUSSIANS} Gaussians; `kept` "
               "counts any instance owning at least one, which flatters harsh settings._\n")
-        print("| variant | reset | prune | refine | rigid #GS | cap | %cap | "
-              "limited by | kept | viable | per-instance max/med/min | PSNR |")
-        print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        print("_`effective` is the opacity-weighted capacity (sum of sigmoid(opacity)); "
+              "a raw count can invert the ordering. `<prune` is the fraction of the "
+              "final set sitting below its own `rigid_prune_opacity` -- large values "
+              "mean Gaussians survived only because densification had stopped._\n")
+        print("| variant | reset | prune | refine | rigid #GS | **effective** | med op | "
+              "<prune | cap | %cap | limited by | kept | viable | PSNR |")
+        print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for name, r in rigid_rows:
             c, det = r["rcfg"], r["rdet"]
             cap = c.get("rigid_cap_max") or 0
@@ -365,12 +388,15 @@ def main() -> int:
             spread = f"{per[0]:,} / {med:,} / {per[-1]:,}" if per else "—"
             lost = det["total"] - det["kept"]
             kept = f"**{det['kept']}/{det['total']}**" if lost else f"{det['kept']}/{det['total']}"
+            fb = det.get("frac_below_prune")
             print(f"| `{name}` | {c.get('rigid_reset_opacity_every', '')} | "
                   f"{c.get('rigid_prune_opacity', '')} | "
                   f"{c.get('rigid_refine_every', '')} | {det['n_rigid']:,} | "
+                  f"**{det['effective']:,.0f}** | {det['median_op']:.3f} | "
+                  f"{'' if fb is None else f'{100 * fb:.0f}%'} | "
                   f"{cap:,} | {'' if pct is None else f'{pct:.0f}%'} | {limited} | {kept} | "
                   f"{det['viable']}/{det['total']}{'' if det['viable'] == det['kept'] else ' ⚠'} | "
-                  f"{spread} | {r['stats']['psnr']:.3f} |")
+                  f"{r['stats']['psnr']:.3f} |")
 
         traced = [(n, r) for n, r in rigid_rows if r["trace"]]
         if traced:

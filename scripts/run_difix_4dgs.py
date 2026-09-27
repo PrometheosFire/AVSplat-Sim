@@ -27,7 +27,7 @@ deliberate price of having a single place to look when a cache misses.
 
     STEP 10   3D tracking                     10_tracking_<h>/
     STEP 15   track refinement (+ BEV viz)    15_refine_<h>/
-    STEP 03   ncore, ego masks only           03_ncore_ego_<h>/
+    STEP 03   ncore, ego + ped/moto masks    03_ncore_dynamic_<h>/
     STEP 01   SAM masks          MODE 2 ONLY  01_masks_<h>/
     STEP 02   fuse + dilate      MODE 2 ONLY  02_fused_masks_<h>/
     STEP 03b  ncore, SAM-masked  MODE 2 ONLY  03_ncore_masked_<h>/
@@ -399,15 +399,48 @@ def main(cfg: DictConfig) -> None:
     tracking_dir = ensure_tracking(cfg, base_dir, overrides, env)
     tracks_json = ensure_refine(cfg, base_dir, tracking_dir, overrides, env)
 
-    # --- Datasets. The ego-masked one leaves vehicles VISIBLE, which is what
-    #     the rigid nodes learn their appearance from. Mode 2 additionally
-    #     builds a SAM-masked one so its background-only rounds do not bake
-    #     vehicles in as ghosts.
+    # --- Datasets. Two of them, because "what must be masked" depends on what
+    #     else is modelling the scene.
+    #
+    #     Dynamic rounds model vehicles as rigid nodes, so vehicles must stay
+    #     VISIBLE -- that is what the nodes learn their appearance from -- while
+    #     pedestrians and motorcycles, which have no explicit representation, must
+    #     be masked or the model tries to reconstruct walking people as static
+    #     background. That is `ncore_dynamic`, built with `prompt_dynamic`.
+    #
+    #     final_round's background-only rounds have no representation for anything
+    #     moving, so they mask every moving class INCLUDING vehicles, or those bake
+    #     in as ghosts. That is `ncore_masked`, built with `prompt`.
+    #
+    #     Previously the dynamic rounds used an ego-mask-only dataset, so
+    #     pedestrians were never masked in `all_rounds` mode -- the shipped default
+    #     and every stored run. See TODO item 10.
     ego_masks_dir = os.path.abspath(os.path.join(dataset_cfg["base_dir"], "masks"))
-    ncore_ego = ensure_ncore_dataset(
-        base_dir, ego_masks_dir, overrides, env,
-        hash_prefix=HASH_PREFIX, dir_name="03_ncore_ego", hash_tag="ncore_ego",
-    )
+    prompt_dynamic = cfg.seg_task.get("prompt_dynamic")
+    if prompt_dynamic:
+        dyn_masks_dir = ensure_masks(
+            cfg, base_dir, overrides, env, hash_prefix=HASH_PREFIX,
+            prompt=str(prompt_dynamic),
+        )
+        dyn_fused_dir = ensure_fused_masks(
+            cfg, base_dir, dyn_masks_dir, overrides, env, hash_prefix=HASH_PREFIX
+        )
+        ncore_dynamic = ensure_ncore_dataset(
+            base_dir, dyn_fused_dir, overrides, env,
+            hash_prefix=HASH_PREFIX, dir_name="03_ncore_dynamic",
+            hash_tag="ncore_dynamic",
+        )
+    else:
+        # No prompt_dynamic configured: fall back to ego masks only, i.e. the old
+        # behaviour, so an older config still runs rather than silently masking
+        # nothing at all.
+        print("[03] seg_task.prompt_dynamic unset -> dynamic rounds use ego masks "
+              "only; pedestrians will NOT be masked")
+        ncore_dynamic = ensure_ncore_dataset(
+            base_dir, ego_masks_dir, overrides, env,
+            hash_prefix=HASH_PREFIX, dir_name="03_ncore_ego", hash_tag="ncore_ego",
+        )
+
     ncore_masked: Optional[str] = None
     if mode == "final_round":
         masks_dir = ensure_masks(cfg, base_dir, overrides, env, hash_prefix=HASH_PREFIX)
@@ -422,7 +455,7 @@ def main(cfg: DictConfig) -> None:
     def ncore_json_of(ncore_dir: str) -> str:
         return os.path.join(ncore_dir, "ncore_dataset", "staging_symlinks.json")
 
-    cameras = resolve_cameras(ncore_ego, list(loop_cfg.cameras))
+    cameras = resolve_cameras(ncore_dynamic, list(loop_cfg.cameras))
     data_factor = int(loop_cfg.data_factor)
     test_every = int(cfg.gaussian_splatting.test_every)
     print(f"Cameras: {cameras} | data_factor={data_factor} test_every={test_every}")
@@ -431,7 +464,7 @@ def main(cfg: DictConfig) -> None:
     # pixels, and frame ordering, intrinsics and test_every are identical
     # (verified: camera order matches and max |dK| is exactly 0).
     real_bank_dir = ensure_real_bank(
-        base_dir, ncore_json_of(ncore_ego), cameras, data_factor, test_every,
+        base_dir, ncore_json_of(ncore_dynamic), cameras, data_factor, test_every,
         overrides, env, hash_prefix=HASH_PREFIX,
     )
     check_frames_balanced(real_bank_dir)
@@ -461,7 +494,7 @@ def main(cfg: DictConfig) -> None:
         {
             "pipeline": HASH_PREFIX,
             "mode": mode,
-            "ncore_ego": ncore_ego,
+            "ncore_dynamic": ncore_dynamic,
             "ncore_masked": ncore_masked,
             "tracks": tracks_json,
             "scene_root": scene_root,
@@ -491,7 +524,7 @@ def main(cfg: DictConfig) -> None:
         "cameras": cameras,
         "dynamic_mode": mode,
         "tracks_json": tracks_json,
-        "ncore_ego": ncore_ego,
+        "ncore_dynamic": ncore_dynamic,
         "ncore_masked": ncore_masked,
         "durations": {"prep": prep_duration},
     }
@@ -501,7 +534,7 @@ def main(cfg: DictConfig) -> None:
         os.makedirs(round_dir, exist_ok=True)
         is_final = r == n_rounds - 1
         dynamic = round_is_dynamic(mode, r, n_rounds)
-        ncore_dir = ncore_ego if dynamic else (ncore_masked or ncore_ego)
+        ncore_dir = ncore_dynamic if dynamic else (ncore_masked or ncore_dynamic)
         print(
             f"\n{'=' * 60}\nROUND {r}/{n_rounds - 1}"
             f"{'  (FINAL)' if is_final else ''}  dynamic={dynamic}"

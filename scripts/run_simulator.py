@@ -38,6 +38,11 @@ from render_standalone import (  # noqa: E402
     rigid_poses_at_frame,
     rigid_world_gaussians_from_pose,
 )
+
+# The SAME integrator the trajectory fit uses, so the ego and the fitted vehicles
+# genuinely share one kinematic model rather than two hand-rolled variants that
+# disagree on the reference point, the slip term and the heading convention.
+from src.tracking.bicycle_kinematics import rollout as bicycle_rollout  # noqa: E402
 from run_discovery import (  # noqa: E402
     RunNotFoundError,
     find_latest_checkpoint,
@@ -232,12 +237,27 @@ class SimulatorRuntime:
 
         self.rigid_paused = bool(sim_cfg.get("rigid_paused", False))
 
+        # Control parameters are declared in METRIC units and converted to world
+        # units below, once the scene scale is known. They were previously consumed
+        # raw, i.e. as world units while named metric -- and because
+        # `world_to_normalized_scale` varies per scene (measured: 0.040, 0.018,
+        # 0.910 across three scenes, so 1 world unit = 25 m, 55 m, 1.1 m), a single
+        # `wheelbase_m: 0.5` meant a 12.5 m wheelbase on one scene, 27.3 m on
+        # another and 0.55 m on a third. The ego handled differently in every scene.
         self.wheelbase_m = float(sim_cfg.get("wheelbase_m", 2.7))
+        self.lr_ratio = float(sim_cfg.get("lr_ratio", 0.5))
         self.max_steer_rad = float(sim_cfg.get("max_steer_rad", 0.45))
         self.max_accel_mps2 = float(sim_cfg.get("max_accel_mps2", 3.0))
         self.max_brake_mps2 = float(sim_cfg.get("max_brake_mps2", 6.0))
         self.drag_per_sec = float(sim_cfg.get("drag_per_sec", 0.6))
         self.max_speed_mps = float(sim_cfg.get("max_speed_mps", 25.0))
+        # Longitudinal distance from the CoG to the CAMERA. The rendered viewpoint
+        # is a front camera, so it sits ahead of both the CoG and the rear axle;
+        # integrating it as if it were either makes steering pivot the camera about
+        # the wrong point. Partly measurable (the rig gives camera-to-body offset)
+        # and partly a modelling choice (body origin to CoG), so it is a config key
+        # rather than something derived and presented as calibrated.
+        self.cam_ahead_of_cog_m = float(sim_cfg.get("cam_ahead_of_cog_m", 1.8))
 
         self.server_port = int(sim_cfg.get("port", 8090))
 
@@ -255,6 +275,31 @@ class SimulatorRuntime:
                 f"[sim] no camera_data.json under {camera_paths_dir} -- this run "
                 f"has no camera metadata to render from."
             )
+
+        # Metric -> world units. The Gaussians live in the training frame, whose
+        # scale is scene-dependent, so every LENGTH, SPEED and ACCELERATION must be
+        # converted or the same config means a different vehicle per scene. Angles
+        # (max_steer_rad), ratios (lr_ratio) and per-second rates (drag_per_sec) are
+        # dimensionless or already 1/s and are NOT scaled.
+        #
+        # render_standalone applies this same factor to the section 4.5 lateral
+        # shifts, so after this the simulator and the offline render agree on what a
+        # metre is -- they did not before.
+        self.world_scale = self.cameras[0].world_to_normalized_scale
+        if self.world_scale is None or self.world_scale <= 0:
+            print("[sim] WARNING no world_to_normalized_scale in camera_data.json; "
+                  "control parameters will be used as RAW WORLD UNITS, so their "
+                  "metric names are not meaningful for this run")
+            self.world_scale = 1.0
+        s_ = float(self.world_scale)
+        self.wheelbase_w = self.wheelbase_m * s_
+        self.max_accel_w = self.max_accel_mps2 * s_
+        self.max_brake_w = self.max_brake_mps2 * s_
+        self.max_speed_w = self.max_speed_mps * s_
+        self.cam_ahead_of_cog_w = self.cam_ahead_of_cog_m * s_
+        print(f"[sim] world scale {s_:.6f} (1 m = {s_:.4f} world units); "
+              f"wheelbase {self.wheelbase_m:.2f} m = {self.wheelbase_w:.4f} wu, "
+              f"cam {self.cam_ahead_of_cog_m:.2f} m ahead of CoG")
 
         selected_camera_id = str(sim_cfg.get("start_camera_id", ""))
         if selected_camera_id:
@@ -954,19 +999,59 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
         if "d" in keys:
             steer += self.max_steer_rad  # steer right
 
-        self.bicycle.speed_mps += accel * self.dt
-        self.bicycle.speed_mps *= max(0.0, 1.0 - self.drag_per_sec * self.dt)
-        self.bicycle.speed_mps = float(
-            np.clip(self.bicycle.speed_mps, -self.max_speed_mps, self.max_speed_mps)
+        # Drag and the speed clamp act on the STATE, before integration, so the
+        # model below receives the speed it will actually travel at.
+        v = self.bicycle.speed_mps + accel * self.dt
+        v *= max(0.0, 1.0 - self.drag_per_sec * self.dt)
+        v = float(np.clip(v, -self.max_speed_w, self.max_speed_w))
+        self.bicycle.speed_mps = v
+
+        # Integrate the CENTRE-OF-GRAVITY bicycle model, through the very module the
+        # trajectory fit uses (`bicycle_kinematics.rollout`), so section 5.2's claim
+        # that the two share a model is literally true rather than approximate. A
+        # one-step rollout is the same code path the fit takes over K steps.
+        #
+        # The rendered viewpoint is a FRONT CAMERA, so it is neither at the CoG nor
+        # at the rear axle. Integrating the camera directly -- which is what this
+        # did before -- makes steering rotate it about ITSELF, whereas a real vehicle
+        # swings the camera on an arc about a point behind it. So the CoG is
+        # integrated and the camera is then placed rigidly ahead of it.
+        #
+        # State is a delta from the recorded camera pose in camera-local ground
+        # axes, so the camera starts at the origin and the CoG starts `d` BEHIND it;
+        # re-projecting forward by `d` returns exactly the origin at t=0, leaving
+        # the start pose untouched. That is the reverse transform: the camera pose is
+        # the given, the CoG is derived from it.
+        #
+        # Convention: this frame has theta = 0 along +z, while
+        # bicycle_kinematics uses theta = 0 along +x (heading_to_forward returns
+        # [cos, 0, sin]). The +pi/2 offset converts between them.
+        d = self.cam_ahead_of_cog_w
+        theta_cam = self.bicycle.yaw_rad
+        cog_x = self.bicycle.x_m - d * np.sin(theta_cam)
+        cog_z = self.bicycle.z_m - d * np.cos(theta_cam)
+
+        state0 = np.array(
+            [cog_x, cog_z, theta_cam + 0.5 * np.pi, v], dtype=np.float64
         )
+        states = bicycle_rollout(
+            state0,
+            np.zeros(1, dtype=np.float64),      # accel already folded into v
+            np.array([steer], dtype=np.float64),
+            self.dt,
+            max(self.wheelbase_w, 1e-6),
+            self.lr_ratio,
+        )
+        cog_x, cog_z, theta_x, _ = states[-1]
+        theta_cam = float(theta_x - 0.5 * np.pi)
 
-        if abs(self.wheelbase_m) > 1e-6:
-            self.bicycle.yaw_rad += (
-                self.bicycle.speed_mps / self.wheelbase_m * np.tan(steer) * self.dt
-            )
-
-        self.bicycle.x_m += self.bicycle.speed_mps * np.sin(self.bicycle.yaw_rad) * self.dt
-        self.bicycle.z_m += self.bicycle.speed_mps * np.cos(self.bicycle.yaw_rad) * self.dt
+        # The camera rides the body, so it points along theta (the heading), not
+        # along theta + beta (the direction of travel). Under steering it therefore
+        # looks slightly off its own velocity -- which is the physical effect that
+        # distinguishes this model from the rear-axle one.
+        self.bicycle.yaw_rad = theta_cam
+        self.bicycle.x_m = float(cog_x + d * np.sin(theta_cam))
+        self.bicycle.z_m = float(cog_z + d * np.cos(theta_cam))
 
     def _advance_indices(self) -> None:
         # 'sinusoid' is a replay variant: the baked trajectory still drives the

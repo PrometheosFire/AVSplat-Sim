@@ -114,12 +114,40 @@ extrapolate_rigid: true
 rigid_extrap_frames: 0
 
 # Bicycle model parameters
-wheelbase_m: 0.5
-max_steer_rad: 1.0
-max_accel_mps2: 0.5
-max_brake_mps2: 0.5
+# --- Ego kinematics -------------------------------------------------------- #
+# ALL lengths, speeds and accelerations here are in REAL METRIC UNITS. The
+# simulator converts them to world units using the scene's
+# `world_to_normalized_scale`, so one config describes the same vehicle on every
+# scene. They were previously consumed raw, as world units while named metric --
+# and since that scale is scene-dependent (measured 0.040, 0.018, 0.910 across
+# three scenes, i.e. 1 world unit = 25 m, 55 m, 1.1 m), `wheelbase_m: 0.5` meant a
+# 12.5 m wheelbase on one scene, 27.3 m on another and 0.55 m on a third.
+#
+# The ego integrates the CENTRE-OF-GRAVITY bicycle model through the same
+# `bicycle_kinematics.rollout` the trajectory fit uses, so turn radius about the
+# CoG is lr / sin(beta) with beta = atan(lr_ratio * tan(delta)).
+
+# Wheelbase L. 2.7 m is a typical passenger car.
+wheelbase_m: 2.7
+# CoG-to-rear-axle distance as a fraction of L. 0.5 puts the CoG at the midpoint;
+# matches the trajectory fit's default so the two models agree.
+lr_ratio: 0.5
+# Steering limit. 0.45 rad (~26 deg) is a realistic road-car lock; with L = 2.7 m
+# that gives a ~5.5 m turn radius.
+max_steer_rad: 0.45
+max_accel_mps2: 3.0
+max_brake_mps2: 6.0
+# Linear-in-v damping, 1/s -- NOT a drag model, and dimensionless so not scaled.
+# 0.6 loses ~6% of speed per 0.1 s tick (~1.7 s time constant).
 drag_per_sec: 0.6
 max_speed_mps: 25.0
+# Longitudinal offset from the CoG to the RENDERED CAMERA, which is a front
+# camera and so sits ahead of both the CoG and the rear axle. Integrating the
+# camera as if it were either makes steering pivot it about the wrong point: a
+# real vehicle swings the camera on an arc about a point behind it. Partly
+# measurable (the rig gives camera-to-body offset) and partly a modelling choice
+# (body origin to CoG), hence a config key rather than a derived constant.
+cam_ahead_of_cog_m: 1.8
 
 # Viewer
 port: 8090

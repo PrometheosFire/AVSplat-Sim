@@ -81,6 +81,218 @@ def _reconstruct_ego_path(data_root: str, reference_camera: str) -> np.ndarray |
         return None
 
 
+def _reconstruct_ego_poses(
+    data_root: str, reference_camera: str
+) -> tuple[list[int], np.ndarray] | None:
+    """Reference-camera timestamps and ground positions, sorted by timestamp.
+
+    The variant of :func:`_reconstruct_ego_path` the per-frame renderer needs: it
+    must pair each ego pose with the prediction token for the same instant, so the
+    timestamps have to come back too rather than just the path.
+    """
+    try:
+        from src.model_wrappers.trackers.wayve101_cc3dt_dataset import (
+            _extract_cam_to_world,
+            _load_colmap_scene,
+            _resolve_sparse_dir,
+        )
+
+        sparse = _resolve_sparse_dir(data_root)
+        _, images = _load_colmap_scene(sparse)
+        poses = []
+        for image in images.values():
+            if Path(image.name).parent.as_posix() != reference_camera:
+                continue
+            ts = int(Path(image.name).stem)
+            poses.append((ts, _extract_cam_to_world(image)[:3, 3]))
+        if not poses:
+            return None
+        poses.sort(key=lambda p: p[0])
+        ts = [p[0] for p in poses]
+        pts = np.array([p[1] for p in poses])[:, list(GROUND_AXES)]
+        return ts, pts
+    except Exception as exc:  # pragma: no cover - ego path is optional
+        print(f"⚠️  Ego poses unavailable: {exc}")
+        return None
+
+
+def _ego_headings(path: np.ndarray) -> np.ndarray:
+    """Per-frame heading unit vectors from the ego path's tangent.
+
+    Central differences, with one-sided differences at the ends. The COLMAP poses
+    carry an orientation, but it is the CAMERA's, which includes the rig mounting
+    rotation; the path tangent is the direction the vehicle actually travelled and
+    needs no rig calibration to interpret.
+    """
+    n = len(path)
+    if n < 2:
+        return np.tile(np.array([0.0, 1.0]), (max(n, 1), 1))
+    d = np.empty_like(path, dtype=np.float64)
+    d[1:-1] = path[2:] - path[:-2]
+    d[0] = path[1] - path[0]
+    d[-1] = path[-1] - path[-2]
+    norms = np.linalg.norm(d, axis=1, keepdims=True)
+    # A stationary frame has no tangent; carry the previous heading forward rather
+    # than emitting a zero vector that would collapse the ego frame.
+    bad = norms[:, 0] < 1e-9
+    d[bad] = np.array([0.0, 1.0])
+    norms[bad] = 1.0
+    out = d / norms
+    for i in range(1, n):
+        if bad[i]:
+            out[i] = out[i - 1]
+    return out
+
+
+def render_bev_frames(
+    results: dict,
+    output_dir: str,
+    ego_ts: list[int],
+    ego_xz: np.ndarray,
+    ids=None,
+    classes=None,
+    max_range: float = 60.0,
+    ring_step: float = 10.0,
+    trail: int = 8,
+    figsize: float = 12.0,
+    dpi: int = 130,
+    limit: int | None = None,
+) -> int:
+    """Write one ego-centred BEV per timestep, mirroring the tracker's BEV output.
+
+    The single-image renderer draws every track at every frame into one plot, which
+    for a 200-frame scene with tens of tracks is unreadable -- the trajectories
+    overlap and nothing localises to a moment. This instead answers "what was around
+    the ego at time t", which is the question the refinement is actually inspected
+    for.
+
+    Layout follows the tracker's own BEV so the two can be compared side by side:
+    ego at the centre pointing up, alternating grey range rings labelled every
+    ``ring_step`` metres, one oriented rectangle per object, a centre dot, and a
+    short dot trail of that track's recent centres.
+
+    Frames are paired to ego poses by TIMESTAMP parsed from the prediction token,
+    not by rank, so a missing or reordered frame cannot silently shift every box
+    onto the wrong ego pose.
+
+    Returns:
+        Number of frames written.
+    """
+    from matplotlib.patches import Circle, Polygon
+
+    tracks, _ = _collect_tracks(results, ids, classes)
+    if not tracks:
+        print("⚠️  No tracks to render.")
+        return 0
+
+    # token -> timestamp, and the per-frame box list.
+    tokens = sorted(results.keys())
+    def _ts_of(token: str) -> int | None:
+        tail = str(token).rsplit("_", 1)[-1]
+        return int(tail) if tail.isdigit() else None
+
+    ego_by_ts = {t: i for i, t in enumerate(ego_ts)}
+    headings = _ego_headings(np.asarray(ego_xz, dtype=np.float64))
+
+    # Per-track history of (frame_index, centre), for the dot trails.
+    # tab10, not tab20: tab20 alternates each hue with a pastel twin, and the
+    # pastels are hard to see at the few-pixel sizes distant objects occupy.
+    id_colors = colormaps["tab10"]
+    order_of = {tid: i for i, tid in enumerate(sorted(tracks.keys()))}
+    history: dict[int, list[np.ndarray]] = {tid: [] for tid in tracks}
+
+    os.makedirs(output_dir, exist_ok=True)
+    written = 0
+    for fi, token in enumerate(tokens):
+        if limit is not None and written >= limit:
+            break
+        ts = _ts_of(token)
+        if ts is None or ts not in ego_by_ts:
+            continue
+        ei = ego_by_ts[ts]
+        origin = np.asarray(ego_xz[ei], dtype=np.float64)
+        fwd = headings[ei]
+        # +x is LEFT and +z FORWARD in this frame, so the right-hand direction is
+        # (-f_z, f_x): facing forward (0,1) gives right = (-1,0).
+        right = np.array([-fwd[1], fwd[0]])
+
+        def to_ego(pt: np.ndarray) -> np.ndarray:
+            d = np.asarray(pt, dtype=np.float64) - origin
+            return np.array([float(d @ right), float(d @ fwd)])
+
+        fig, ax = plt.subplots(figsize=(figsize, figsize))
+        # Range rings, darkest at the centre, so distance reads at a glance.
+        n_rings = max(int(round(max_range / ring_step)), 1)
+        for k in range(n_rings, 0, -1):
+            r = k * ring_step
+            # Darkest at the centre, lightening outward, matching the tracker's
+            # BEV so near/far reads the same way in both. The ramp is spread over
+            # however many rings there are rather than stepped by a fixed amount:
+            # a fixed step saturated against the light end past six rings, so at
+            # 100 m every ring beyond 60 m came out the same grey and the bands
+            # stopped being readable as distance at all.
+            t = (k - 1) / max(n_rings - 1, 1)
+            shade = 0.60 + 0.30 * t
+            ax.add_patch(Circle((0, 0), r, facecolor=str(shade),
+                                edgecolor="none", zorder=0))
+            ax.annotate(f"{int(r)} m", (r, 0), fontsize=7, color="white",
+                        ha="center", va="center", zorder=6,
+                        bbox=dict(boxstyle="square,pad=0.15", fc="black", ec="none"))
+
+        # Ego: a fixed rectangle at the origin, pointing up.
+        ego_l, ego_w = 4.5, 1.9
+        ax.add_patch(Polygon(
+            [(-ego_w / 2, -ego_l / 2), (ego_w / 2, -ego_l / 2),
+             (ego_w / 2, ego_l / 2), (-ego_w / 2, ego_l / 2)],
+            closed=True, fill=False, edgecolor="black", lw=1.6, zorder=5,
+        ))
+
+        present = 0
+        beyond = 0
+        for tid, seq in tracks.items():
+            box = next((b for f, b in seq if f == fi), None)
+            if box is None:
+                continue
+            centre = to_ego(box_center_ground(box))
+            history[tid].append(centre)
+            if np.hypot(*centre) > max_range:
+                # Counted and reported: a frame can legitimately look empty while
+                # holding several vehicles just outside the ring, and silently
+                # dropping them makes that indistinguishable from "nothing here".
+                beyond += 1
+                continue
+            present += 1
+            col = id_colors(order_of[tid] % 10)
+            poly = np.array([to_ego(c) for c in box_footprint(box)])
+            ax.add_patch(Polygon(poly, closed=True, fill=False,
+                                 edgecolor=col, lw=1.3, zorder=4))
+            ax.scatter(*centre, s=14, color=col, zorder=5)
+            tr = history[tid][-trail:]
+            if len(tr) > 1:
+                t = np.array(tr)
+                ax.scatter(t[:-1, 0], t[:-1, 1], s=7, color=col, alpha=0.75, zorder=3)
+
+        lim = max_range * 1.02
+        # x_plot is already the ego-RIGHT component, so it grows rightward with no
+        # inversion. (The overview plot inverts because it draws COLMAP x directly,
+        # where +x points left; that does not apply once the points are in the ego
+        # frame.)
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-lim, lim)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_axis_off()
+        extra = f", {beyond} beyond" if beyond else ""
+        ax.set_title(f"frame {fi:03d}   t={ts}   {present} within "
+                     f"{int(max_range)} m{extra}", fontsize=9)
+        fig.savefig(os.path.join(output_dir, f"{ts}.png"), dpi=dpi,
+                    bbox_inches="tight", facecolor="white")
+        plt.close(fig)
+        written += 1
+
+    print(f"🖼️  Wrote {written} per-frame BEVs to {output_dir}")
+    return written
+
+
 def render_bev(
     results: dict,
     output_path: str,
@@ -209,11 +421,37 @@ def render_from_file(
         data = json.load(f)
     results = data.get("results", data)
 
+    ref_cam = str(viz.get("reference_camera", "front-forward"))
+
+    # Per-frame mode: one ego-centred BEV per timestep, written into a directory
+    # named after the single-image output. Needs ego poses (for the ego frame), so
+    # it falls through to the overview plot when they are unavailable rather than
+    # emitting frames in an arbitrary world orientation.
+    if bool(viz.get("per_frame", False)) and data_root:
+        poses = _reconstruct_ego_poses(data_root, ref_cam)
+        if poses is not None:
+            ego_ts, ego_xz = poses
+            out_dir = os.path.splitext(output_path)[0] + "_frames"
+            render_bev_frames(
+                results,
+                output_dir=out_dir,
+                ego_ts=ego_ts,
+                ego_xz=ego_xz,
+                ids=list(viz.get("ids", []) or []),
+                classes=list(viz.get("classes", []) or []),
+                max_range=float(viz.get("max_range", 60.0)),
+                ring_step=float(viz.get("ring_step", 10.0)),
+                trail=int(viz.get("trail", 8)),
+                figsize=float(viz.get("frame_figsize", 8.0)),
+                limit=(int(viz["frame_limit"]) if viz.get("frame_limit") else None),
+            )
+        else:
+            print("⚠️  per_frame requested but ego poses are unavailable; "
+                  "writing the overview plot only")
+
     ego = None
     if viz.get("show_ego", True) and data_root:
-        ego = _reconstruct_ego_path(
-            data_root, str(viz.get("reference_camera", "front-forward"))
-        )
+        ego = _reconstruct_ego_path(data_root, ref_cam)
     render_bev(
         results,
         output_path=output_path,

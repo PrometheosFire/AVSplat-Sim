@@ -1,3 +1,24 @@
-# This matches the prompt argument in extract_masks(self, input_dir, output_dir, prompt):
-#prompt: "car, motorcycle, pedestrian, truck, vehicle"
-prompt: "car, pedestrian"
+# Text prompts for SAM 3 mask extraction, passed as the `prompt` argument of
+# `extract_masks(self, input_dir, output_dir, prompt)`.
+#
+# These masks mark content the Gaussian model must NOT try to reconstruct, so the
+# right prompt depends on WHAT ELSE is modelling the scene. Two cases, and they
+# need opposite answers about vehicles:
+#
+#   * BACKGROUND-ONLY training (the static loop, and final_round's static rounds)
+#     has no representation for any moving object, so every moving class must be
+#     masked -- vehicles included, or they bake into the background as ghosts.
+#     -> `prompt`
+#
+#   * DYNAMIC training models vehicles explicitly, as rigid Gaussian nodes fitted
+#     to tracked 3D boxes. Masking them would hide the very pixels those nodes are
+#     supervised on, asking the model to reconstruct and ignore them at once. Only
+#     the classes with no explicit representation get masked.
+#     -> `prompt_dynamic`
+#
+
+# Background-only: mask every moving class, vehicles included.
+prompt: "car, truck, bus, pedestrian, motorcycle"
+
+# Dynamic: mask only what the rigid nodes do not model.
+prompt_dynamic: "pedestrians, motorcycle"

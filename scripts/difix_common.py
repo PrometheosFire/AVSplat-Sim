@@ -110,12 +110,38 @@ def ensure_masks(
     overrides: List[str],
     env,
     hash_prefix: str = "",
+    prompt: Optional[str] = None,
 ) -> str:
-    """STEP 01: per-frame object masks from SAM3."""
+    """STEP 01: per-frame object masks from SAM3.
+
+    ``prompt`` overrides ``cfg.seg_task.prompt``, which is how the two mask
+    variants are produced. They must be separate extraction runs, not one run
+    filtered two ways: the wrapper runs an isolated SAM pass per class but OR-s
+    the results into a single binary mask per frame, so there is no per-class
+    output to select from afterwards.
+
+    Background-only training must mask every moving class including vehicles, or
+    they bake into the background as ghosts. Dynamic training models vehicles as
+    rigid nodes and must NOT mask them, or the nodes lose the pixels they are
+    supervised on. See configs/pipeline/extract_masks.yaml.
+
+    The prompt is part of the hashed parameters, so each variant gets its own
+    ``01_masks_<h>`` directory and the two never collide or overwrite.
+    """
+    seg_task = OmegaConf.to_container(cfg.seg_task, resolve=True)
+    if prompt is not None:
+        seg_task["prompt"] = prompt
+    # Key is "seg_task", NOT "pipeline": `_prefixed` namespaces a payload by
+    # setting payload["pipeline"] = hash_prefix, so a payload that already uses
+    # "pipeline" has that entry OVERWRITTEN whenever a prefix is given. This stage
+    # was the only one affected, and the effect was that in the prefixed (4dgs)
+    # pipeline the whole seg_task -- the prompt included -- dropped out of the hash,
+    # so changing the prompt silently reused stale masks. Renaming the key here
+    # fixes it without touching any other stage's hash.
     step1_params = {
         "dataset": OmegaConf.to_container(cfg.dataset, resolve=True),
         "model": OmegaConf.to_container(cfg.segmenter, resolve=True),
-        "pipeline": OmegaConf.to_container(cfg.seg_task, resolve=True),
+        "seg_task": seg_task,
     }
     masks_dir = os.path.join(
         base_dir,
@@ -126,11 +152,18 @@ def ensure_masks(
         return masks_dir
 
     print(f"[01] extracting object masks -> {masks_dir}")
+    if prompt is not None:
+        print(f"     prompt: {prompt!r}")
     _run(
         [
             SEG_PYTHON,
             os.path.abspath("src/pre_training/extract_masks.py"),
             f"hydra.run.dir={masks_dir}",
+            # Single-quoted: the prompt contains commas, which Hydra's override
+            # grammar otherwise reads as a list separator and rejects as
+            # "Ambiguous value". The quotes are part of the value Hydra parses,
+            # not shell quoting -- argv is passed directly, without a shell.
+            *([f"++seg_task.prompt='{prompt}'"] if prompt is not None else []),
             *overrides,
         ],
         env,

@@ -368,6 +368,20 @@ viz:
   max_aspect: 4.0  # cap on figure long:short ratio (keeps elongated scenes legible)
   bounds: []       # optional [xmin, xmax, zmin, zmax] crop in COLMAP meters
 
+  # --- Per-frame BEV -------------------------------------------------------- #
+  # The overview plot above draws every track at every frame into one image, which
+  # for 200 frames and tens of tracks is unreadable and localises nothing to a
+  # moment. This writes one ego-centred BEV per timestep instead -- the same
+  # layout the tracking step emits under vis/.../BEV -- so refinement output can be
+  # compared against the tracker's frame for frame.
+  # Output goes to <viz_output_path without extension>_frames/<timestamp>.png.
+  per_frame: true
+  max_range: 60.0     # metres; rings and the cull radius
+  ring_step: 10.0     # metres between labelled range rings
+  trail: 8            # frames of dot trail behind each object
+  frame_figsize: 12.0 # inches, square
+  frame_limit: null   # cap the number of frames written (debugging)
+
 # Set by the visualization entrypoint (orchestrator passes these per render).
 viz_input_json: ""
 viz_output_path: ""

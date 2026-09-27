@@ -25,7 +25,7 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import hydra
 import imageio
@@ -467,6 +467,111 @@ def rigid_world_gaussians_extrapolated(
 
 
 @torch.no_grad()
+def rigid_box_solid_gaussians(
+    rigid_state: Dict[str, torch.Tensor],
+    frame_idx: int,
+    instance_ids: Optional[Sequence[int]] = None,
+    points_per_axis: int = 16,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """**Opaque, filled** 3D boxes as Gaussians, for dynamic-region masking.
+
+    The solid counterpart of :func:`rigid_box_edge_gaussians`, and the flattened
+    checkpoint-state counterpart of ``RigidNodes.get_box_solid_gaussians``.
+    Rasterising these in ``render_mode="rigid_white"`` and thresholding against the
+    white background yields a **vehicle-region mask** that is correct under every
+    camera model the pipeline uses -- fisheye, f-theta, unscented-transform
+    projection -- because it travels the same rasterisation path as the render
+    rather than re-deriving a projection. Pinhole-projecting fisheye points is the
+    error class that voided the depth ablation.
+
+    The mask depends only on box geometry and the camera, never on the trained
+    Gaussians. That is essential: a mask taken from the model's own rigid alpha
+    would shrink wherever the model failed to render a vehicle, so a model that
+    lost a car would score better on the cars it kept.
+
+    Only the six faces are sampled: under projection the silhouette of the surface
+    is the silhouette of the solid, so interior points are wasted. Splat scale is
+    set from the face grid spacing so adjacent splats overlap and the silhouette
+    has no pinholes.
+
+    Args:
+        rigid_state: Flattened rigid state from the checkpoint.
+        frame_idx: Frame whose poses to use.
+        instance_ids: Restrict to these instance columns. ``None`` renders every
+            instance valid at this frame, giving the union mask with
+            inter-vehicle occlusion resolved by the rasteriser. A single id gives
+            that instance's mask, which does NOT account for occlusion by other
+            vehicles -- over-inclusion that is documented rather than corrected.
+        points_per_axis: Face grid resolution; 16 gives 6*16^2 = 1536 splats per
+            instance.
+
+    Returns:
+        Activated Gaussians ready to composite, or ``None`` if no requested
+        instance is present at this frame.
+    """
+    from dynamic.rigid_nodes import _instance_palette, quat_normalize, quat_to_rotmat
+    from utils import rgb_to_sh
+
+    device = rigid_state["poses.trans"].device
+    fv = rigid_state["instances_fv"]
+    num_frames, num_inst = fv.shape
+    if not (0 <= frame_idx < num_frames):
+        raise ValueError(
+            f"frame_idx {frame_idx} out of range for rigid poses [0, {num_frames})."
+        )
+    active = fv[frame_idx].nonzero(as_tuple=True)[0].tolist()
+    if instance_ids is not None:
+        wanted = {int(i) for i in instance_ids}
+        active = [m for m in active if m in wanted]
+    if not active:
+        return None
+
+    num_sh_bases = rigid_state["gauss.sh0"].shape[1] + rigid_state["gauss.shN"].shape[1]
+    sizes = rigid_state["instances_size"]
+    trans = rigid_state["poses.trans"]
+    quats_all = rigid_state["poses.quats"]
+
+    g = torch.linspace(-1.0, 1.0, points_per_axis, device=device)
+    a, b = torch.meshgrid(g, g, indexing="ij")
+    a, b = a.reshape(-1), b.reshape(-1)
+    one = torch.ones_like(a)
+    faces = torch.cat(
+        [
+            torch.stack([one, a, b], dim=-1), torch.stack([-one, a, b], dim=-1),
+            torch.stack([a, one, b], dim=-1), torch.stack([a, -one, b], dim=-1),
+            torch.stack([a, b, one], dim=-1), torch.stack([a, b, -one], dim=-1),
+        ],
+        dim=0,
+    )
+
+    palette = _instance_palette(num_inst, device)
+    means_l, colors_l, scales_l = [], [], []
+    for m in active:
+        size = sizes[m]
+        pts_local = faces * (size[None, :] / 2.0)
+        R = quat_to_rotmat(quat_normalize(quats_all[frame_idx][m]))
+        pts = (R @ pts_local.T).T + trans[frame_idx][m]
+        means_l.append(pts)
+        col = torch.zeros(pts.shape[0], num_sh_bases, 3, device=device)
+        col[:, 0, :] = rgb_to_sh(palette[m][None, :]).expand(pts.shape[0], 3)
+        colors_l.append(col)
+        spacing = float((size.max() / max(points_per_axis - 1, 1)).item())
+        scales_l.append(torch.full((pts.shape[0], 3), max(0.6 * spacing, 1e-3),
+                                   device=device))
+
+    means = torch.cat(means_l, dim=0)
+    n = means.shape[0]
+    quats = torch.zeros(n, 4, device=device)
+    quats[:, 0] = 1.0
+    return {
+        "means": means,
+        "quats": quats,
+        "scales": torch.cat(scales_l, dim=0),
+        "opacities": torch.ones(n, device=device),
+        "colors": torch.cat(colors_l, dim=0),
+    }
+
+
 def rigid_box_edge_gaussians(
     rigid_state: Dict[str, torch.Tensor],
     frame_idx: int,

@@ -788,6 +788,7 @@ class Runner:
         exposure: Optional[Tensor] = None,
         rigid_frame_idx: Optional[int] = None,
         draw_boxes: bool = False,
+        box_gaussians: Optional[Dict[str, Tensor]] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         """Rasterize 3D Gaussians into 2D image tensors using differentiable splatting.
@@ -956,6 +957,21 @@ class Runner:
                 quats = torch.cat([quats, boxes["quats"]], dim=0)
                 scales = torch.cat([scales, boxes["scales"]], dim=0)
                 opacities = torch.cat([opacities, boxes["opacities"]], dim=0)
+
+        # Mask mode: render ONLY the supplied Gaussians, discarding background and
+        # rigid content. Placed here rather than in a separate method so the mask
+        # inherits this function's per-camera distortion resolution verbatim --
+        # fisheye, f-theta and unscented-transform projection all handled, with no
+        # second copy of that logic to drift. Used for the dynamic-region mask in
+        # eval(), where the returned ALPHA is the mask.
+        if box_gaussians is not None:
+            means = box_gaussians["means"]
+            quats = box_gaussians["quats"]
+            scales = box_gaussians["scales"]
+            opacities = box_gaussians["opacities"]
+            colors = box_gaussians["colors"]
+            kwargs["sh_degree"] = 0
+            n_background, n_rigid = 0, means.shape[0]
 
         render_colors, render_alphas, info = rasterization(
             means=means,
@@ -1478,6 +1494,36 @@ class Runner:
                     self.writer.add_scalar(f"train/l1loss_{tag}", l1loss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+                # Rigid nodes, which train/num_GS above does NOT cover -- it is
+                # background only. Without these, the only rigid numbers available
+                # come from parsing a checkpoint, i.e. one snapshot per run, and
+                # RigidDensifier's per-tick counts go to stdout and vanish whenever
+                # a run is not piped to a file.
+                #
+                # Opacity is logged alongside the count because the count alone is
+                # misleading: measured on the reset sweep, 662,811 rigid Gaussians
+                # at median opacity 0.006 carry ~10k of opacity-weighted capacity
+                # while 499,145 at median 0.944 carry ~319k -- a 32x gap in the
+                # opposite direction. frac_below_prune is what exposed the orphaned
+                # opacity reset: two thirds of the final set sat under the very
+                # threshold the config calls dead, because pruning had already
+                # stopped. A count curve hides both.
+                if self.rigid_nodes is not None:
+                    rop = torch.sigmoid(self.rigid_nodes.gauss["opacities"].flatten())
+                    self.writer.add_scalar(
+                        "train/num_rigid_GS", int(rop.numel()), step
+                    )
+                    self.writer.add_scalar(
+                        "train/rigid_opacity_mean", float(rop.mean()), step
+                    )
+                    self.writer.add_scalar(
+                        "train/rigid_capacity_effective", float(rop.sum()), step
+                    )
+                    self.writer.add_scalar(
+                        "train/rigid_frac_below_prune",
+                        float((rop < cfg.rigid_prune_opacity).float().mean()),
+                        step,
+                    )
                 # Log unicycle loss components separately for tuning.
                 if (
                     self.rigid_nodes is not None
@@ -2014,6 +2060,9 @@ class Runner:
         )
         ellipse_time = 0
         metrics = defaultdict(list)
+        # Dynamic-region accumulators: squared error pooled over PIXELS, converted
+        # to PSNR once at the end. See the mask block below for why.
+        dyn_se, dyn_px, dyn_frames = 0.0, 0, 0
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
@@ -2048,6 +2097,50 @@ class Runner:
             
             colors = torch.clamp(colors, 0.0, 1.0) # Clamp render colors to [0, 1] range for fair metric computation and visualization.
             canvas_list = [pixels_masked, colors]
+
+            # ---- Dynamic-region (vehicle) metrics --------------------------- #
+            # Global metrics are nearly blind to vehicles: they occupy ~1.5% of the
+            # pixels here, and across the rigid reset sweep global PSNR spanned
+            # 0.066 dB while this metric spanned 2.68 dB on the same checkpoints.
+            # Section 6.3 ("modelling vehicles beats masking them") is unmeasurable
+            # without it.
+            #
+            # The mask is built from the projected BOXES, never from the model's own
+            # rigid alpha: a model-derived mask shrinks wherever the model failed to
+            # render a vehicle, so losing a car would improve the score. Solid-box
+            # Gaussians are rasterised through this same pass, so fisheye, f-theta
+            # and unscented-transform projection are handled by construction --
+            # pinhole-projecting fisheye points is the error class that voided the
+            # depth ablation.
+            #
+            # Squared error is accumulated over PIXELS and converted once at the
+            # end, not averaged as per-frame PSNR: mask sizes vary hugely between
+            # frames, and averaging would weight a 200-pixel frame like a
+            # 20,000-pixel one.
+            if self.rigid_nodes is not None and rigid_idx is not None:
+                solid = self.rigid_nodes.get_box_solid_gaussians(int(rigid_idx))
+                if solid is not None:
+                    _, box_alpha, _ = self.rasterize_splats(
+                        camtoworlds=camtoworlds, Ks=Ks, width=width, height=height,
+                        sh_degree=cfg.sh_degree, near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane, masks=None, frame_idcs=None,
+                        camera_idcs=data["camera_idx"].to(device),
+                        box_gaussians=solid,
+                    )
+                    # masks (when present) excludes ego/privacy pixels -- the same
+                    # ones eval zeroes out of both sides -- so the dynamic region
+                    # never scores them. It is None when the dataset supplies no
+                    # mask, in which case the box alpha alone is the region.
+                    dyn_mask = box_alpha[..., 0] > 0.5
+                    if masks is not None:
+                        dyn_mask = dyn_mask & masks
+                    n_px = int(dyn_mask.sum())
+                    if n_px > 0:
+                        se = ((pixels_masked - colors) ** 2)[dyn_mask.unsqueeze(-1)
+                                                             .expand_as(colors)]
+                        dyn_se += float(se.sum())
+                        dyn_px += int(se.numel())
+                        dyn_frames += 1
 
             if world_rank == 0:
                 # write images
@@ -2115,6 +2208,28 @@ class Runner:
                     "num_GS": len(self.splats["means"]),
                 }
             )
+            if self.rigid_nodes is not None:
+                rop = torch.sigmoid(self.rigid_nodes.gauss["opacities"].flatten())
+                stats["num_rigid_GS"] = int(rop.numel())
+                # Opacity-weighted capacity, because a raw count inverts the
+                # ordering: 662k Gaussians at median opacity 0.006 carry ~10k of
+                # capacity against 499k at 0.944 carrying ~319k.
+                stats["rigid_capacity_effective"] = float(rop.sum())
+                stats["rigid_opacity_mean"] = float(rop.mean())
+                pid = self.rigid_nodes.point_ids
+                stats["rigid_instances_alive"] = int(len(torch.unique(pid)))
+            if dyn_px > 0:
+                mse = dyn_se / dyn_px
+                stats["dynamic_psnr"] = (
+                    float("inf") if mse == 0
+                    else 10.0 * float(np.log10(1.0 / mse))   # inputs are in [0, 1]
+                )
+                stats["dynamic_frames"] = dyn_frames
+                # dyn_px counts channel-elements (right for MSE), so the pixel
+                # fraction divides by the 3 colour channels too.
+                stats["dynamic_pixel_frac"] = (dyn_px / 3.0) / max(
+                    dyn_frames * int(np.prod(pixels.shape[1:3])), 1
+                )
             if cfg.use_color_correction_metric:
                 print(
                     f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
