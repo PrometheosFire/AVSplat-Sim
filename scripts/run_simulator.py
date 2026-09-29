@@ -35,7 +35,8 @@ from render_standalone import (  # noqa: E402
     load_rigid_state_from_checkpoint,
     load_splats_from_checkpoint,
     load_splats_from_ply,
-    rigid_poses_at_frame,
+    interp_camtoworld,
+    rigid_poses_at_frame_interp,
     rigid_world_gaussians_from_pose,
 )
 
@@ -63,6 +64,12 @@ from dynamic.asset_library import (  # noqa: E402
 )
 
 MODES = ("replay", "sinusoid", "user")
+
+# Largest slice of time a single iteration may advance the simulation. A stall --
+# a bank rebuild, a GC pause, the first iteration -- otherwise teleports the
+# timeline by however long it took. Exceeding it makes playback lag real time,
+# which is the tolerable failure; jumping the world is not.
+MAX_STEP_SEC = 0.25
 
 
 @dataclass
@@ -226,8 +233,26 @@ class SimulatorRuntime:
         render_cfg = cfg.get("rendering", {})
         sim_cfg = cfg.get("simulator", {})
 
+        # Three rates that were previously one number, because all three happen
+        # to be 10 Hz on this data: the physics step (`dt_sec`), the interval
+        # between baked frames (`frame_dt_sec`), and how often a frame is drawn
+        # (`render_fps`). Only the last is free to change, and raising it must not
+        # change how long a replay takes -- so the timeline advances by ELAPSED
+        # TIME converted to a fractional frame position, not by one index per
+        # iteration, which was real-time only because the loop was capped at the
+        # capture rate.
         self.dt = float(sim_cfg.get("dt_sec", 0.1))
-        self.max_fps = float(sim_cfg.get("max_fps", 10.0))
+        self.frame_dt = float(sim_cfg.get("frame_dt_sec", self.dt))
+        if self.frame_dt <= 0.0:
+            raise ValueError("simulator.frame_dt_sec must be positive.")
+        # `max_fps` is the old name for the same knob; honoured so stored configs
+        # and command lines keep working.
+        self.render_fps = float(sim_cfg.get("render_fps", sim_cfg.get("max_fps", 10.0)))
+        self.render_fps_max = float(sim_cfg.get("render_fps_max", 120.0))
+        self.fixed_phys_step = bool(sim_cfg.get("fixed_phys_step", False))
+        self._phys_accum = 0.0
+        self._fps_ema = 0.0
+        self._render_ms_ema = 0.0
         self.loop_trajectory = bool(sim_cfg.get("loop_trajectory", True))
         self.advance_rigid_in_replay = bool(sim_cfg.get("advance_rigid_in_replay", True))
 
@@ -317,8 +342,10 @@ class SimulatorRuntime:
         if self.num_ego_frames <= 0:
             raise ValueError("Selected camera has empty camtoworld trajectory.")
 
-        self.ego_frame_idx = max(
-            0, min(int(sim_cfg.get("start_frame", 0)), self.num_ego_frames - 1)
+        # Fractional: the integer `ego_frame_idx` is derived from it (see the
+        # property), so every existing integer-indexed use keeps working.
+        self.ego_frame_pos = float(
+            max(0, min(int(sim_cfg.get("start_frame", 0)), self.num_ego_frames - 1))
         )
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -349,12 +376,14 @@ class SimulatorRuntime:
             if self.rigid_state is not None
             else 0
         )
-        self.rigid_frame_idx = max(
-            0,
-            min(
-                int(sim_cfg.get("start_rigid_frame", self.ego_frame_idx)),
-                max(self.num_rigid_frames - 1, 0),
-            ),
+        self.rigid_frame_pos = float(
+            max(
+                0,
+                min(
+                    int(sim_cfg.get("start_rigid_frame", self.ego_frame_idx)),
+                    max(self.num_rigid_frames - 1, 0),
+                ),
+            )
         )
 
         # On-demand rigid extrapolation past the baked span via the fitted
@@ -430,6 +459,16 @@ class SimulatorRuntime:
         with gui.add_folder("Playback"):
             self.g_mode = gui.add_dropdown("mode", MODES, initial_value=self.mode)
             self.g_paused = gui.add_checkbox("rigid paused", self.rigid_paused)
+            # How often a frame is drawn, not how fast the scene plays: the
+            # timeline advances by elapsed time, so raising this refreshes vehicle
+            # and camera poses more often over the same replay duration.
+            self.g_fps = gui.add_slider(
+                "render fps",
+                1.0,
+                self.render_fps_max,
+                1.0,
+                float(min(self.render_fps, self.render_fps_max)),
+            )
             b_ego = gui.add_button("reset ego")
             b_rigid = gui.add_button("reset rigid")
             b_all = gui.add_button("reset all")
@@ -443,6 +482,11 @@ class SimulatorRuntime:
         def _(_) -> None:
             if not self._gui_syncing:
                 self.rigid_paused = bool(self.g_paused.value)
+
+        @self.g_fps.on_update
+        def _(_) -> None:
+            if not self._gui_syncing:
+                self.render_fps = float(self.g_fps.value)
 
         b_ego.on_click(lambda _: self._reset_ego())
         b_rigid.on_click(lambda _: self._reset_rigid())
@@ -897,6 +941,23 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
         """Ego weave is on in 'sinusoid' mode, or whenever configured enabled."""
         return self.ego_scn.sin_active(self.mode == "sinusoid")
 
+    @property
+    def ego_frame_idx(self) -> int:
+        """Baked frame the ego currently sits in; `ego_frame_pos` is the authority.
+
+        Floor, not round, so `pos` in [k, k+1) reports k -- the frame whose
+        per-frame quantities (`ego_step`) describe the interval being traversed.
+        """
+        return int(
+            max(0.0, min(np.floor(self.ego_frame_pos), self.num_ego_frames - 1))
+        )
+
+    @property
+    def rigid_frame_idx(self) -> int:
+        """Baked rigid frame currently being traversed; may exceed the baked span,
+        which is how the extrapolation path is selected."""
+        return int(np.floor(self.rigid_frame_pos))
+
     def _ego_scenario_active(self) -> bool:
         return self.replay_like and self.ego_scn.active(self.mode == "sinusoid")
 
@@ -914,14 +975,14 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
         if not (self._rigid_scenarios_active() or self._substitutions_active()):
             return None
         bank = self.rigid_bank if self.rigid_bank is not None else self.rigid_state
-        poses = rigid_poses_at_frame(bank, int(self.rigid_frame_idx))
+        poses = rigid_poses_at_frame_interp(bank, float(self.rigid_frame_pos))
         if poses is None:
             return None
 
-        # rigid_poses_at_frame hands back the checkpoint tensors themselves for
-        # baked frames -- clone before touching them.
+        # The interpolator hands back the checkpoint tensors themselves at integral
+        # positions -- clone before touching them.
         trans, quats, fv = poses[0].clone(), poses[1].clone(), poses[2]
-        baked = 0 <= self.rigid_frame_idx < self.num_rigid_frames
+        baked = 0 <= self.rigid_frame_pos < self.num_rigid_frames
 
         for col, scn in self.obj_scn.items():
             if col >= trans.shape[0] or not bool(fv[col]):
@@ -931,7 +992,7 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
             # object's first valid frame.
             use_sin = baked and scn.sinusoid.active
             local_frame = (
-                float(self.rigid_frame_idx - int(self.rigid_first_valid[col]))
+                float(self.rigid_frame_pos - int(self.rigid_first_valid[col]))
                 if use_sin
                 else 0.0
             )
@@ -986,12 +1047,50 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
         pose[:3, :3] = R0 @ Ry
         return pose
 
-    def _apply_user_controls(self, keys: set[str]) -> None:
+    def _step_user_physics(self, keys: set[str], dt_elapsed: float) -> None:
+        """Integrate the ego model over `dt_elapsed` seconds of simulated time.
+
+        Forward Euler is not step-size invariant -- measured 0.54 m and 3.1 deg
+        apart between a 10 Hz and a 60 Hz integration of the same 4 s of steering
+        -- so how the elapsed time is cut into steps is a real choice, and the two
+        policies here serve different needs:
+
+        - default: substeps of at most `dt_sec`, so above the capture rate the
+          control surface refreshes as often as the render and steering feels
+          continuous. The finer step is also the closer approximation, but a
+          driven path is then not comparable across render rates.
+        - `fixed_phys_step`: whole `dt_sec` chunks only, with the remainder left in
+          an accumulator, so the same key presses trace the same path at any
+          render rate.
+
+        Either way a step never exceeds `dt_sec`, so integration accuracy is never
+        worse than it was when the loop ran at the capture rate.
+        """
+        if self.fixed_phys_step:
+            self._phys_accum += dt_elapsed
+            while self._phys_accum >= self.dt:
+                self._apply_user_controls(keys, self.dt)
+                self._phys_accum -= self.dt
+            return
+
+        remaining = dt_elapsed
+        while remaining > 1e-9:
+            step = min(remaining, self.dt)
+            self._apply_user_controls(keys, step)
+            remaining -= step
+
+    def _apply_user_controls(self, keys: set[str], dt: float) -> None:
+        # Everything with a length, speed or acceleration dimension uses the
+        # *_w (world-unit) values. The metric *_m / *_mps2 attributes exist only
+        # to be converted at init -- reading one here silently scales the control
+        # by 1/world_scale, which is 25x on a scene where 1 world unit is 25 m.
+        # Angles (max_steer_rad) and per-second rates (drag_per_sec) are
+        # dimensionless and are deliberately NOT converted.
         accel = 0.0
         if "w" in keys:
-            accel += self.max_accel_mps2
+            accel += self.max_accel_w
         if "s" in keys:
-            accel -= self.max_brake_mps2
+            accel -= self.max_brake_w
 
         steer = 0.0
         if "a" in keys:
@@ -1001,8 +1100,8 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
 
         # Drag and the speed clamp act on the STATE, before integration, so the
         # model below receives the speed it will actually travel at.
-        v = self.bicycle.speed_mps + accel * self.dt
-        v *= max(0.0, 1.0 - self.drag_per_sec * self.dt)
+        v = self.bicycle.speed_mps + accel * dt
+        v *= max(0.0, 1.0 - self.drag_per_sec * dt)
         v = float(np.clip(v, -self.max_speed_w, self.max_speed_w))
         self.bicycle.speed_mps = v
 
@@ -1038,7 +1137,7 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
             state0,
             np.zeros(1, dtype=np.float64),      # accel already folded into v
             np.array([steer], dtype=np.float64),
-            self.dt,
+            dt,
             max(self.wheelbase_w, 1e-6),
             self.lr_ratio,
         )
@@ -1053,41 +1152,53 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
         self.bicycle.x_m = float(cog_x + d * np.sin(theta_cam))
         self.bicycle.z_m = float(cog_z + d * np.cos(theta_cam))
 
-    def _advance_indices(self) -> None:
+    def _advance_indices(self, dframes: float) -> None:
+        """Advance both timelines by `dframes` baked frames.
+
+        `dframes` is elapsed time divided by the capture interval, so a replay
+        takes the same wall-clock time at any render rate: at the capture rate it
+        is 1.0 per iteration, exactly the old behaviour, and at 60 Hz it is 1/6
+        six times as often.
+        """
         # 'sinusoid' is a replay variant: the baked trajectory still drives the
         # camera, it is just displaced. Testing for "replay" alone here pinned the
         # ego at its start frame, which froze both the drive-through and the weave
         # (whose phase is that very index).
         if self.replay_like:
+            pos = self.ego_frame_pos + dframes
             if self.loop_trajectory:
-                self.ego_frame_idx = (self.ego_frame_idx + 1) % self.num_ego_frames
+                self.ego_frame_pos = pos % float(self.num_ego_frames)
             else:
-                self.ego_frame_idx = min(self.ego_frame_idx + 1, self.num_ego_frames - 1)
+                self.ego_frame_pos = min(pos, float(self.num_ego_frames - 1))
 
         if self.num_rigid_frames > 0 and not self.rigid_paused:
             if not self.replay_like or self.advance_rigid_in_replay:
-                self.rigid_frame_idx = (self.rigid_frame_idx + 1) % max(
-                    self.rigid_loop_frames, 1
+                self.rigid_frame_pos = (self.rigid_frame_pos + dframes) % max(
+                    float(self.rigid_loop_frames), 1.0
                 )
 
     def _reset_ego(self) -> None:
-        self.ego_frame_idx = 0
+        self.ego_frame_pos = 0.0
         self.base_pose = self.camera.camtoworlds[0].copy()
         self.bicycle = BicycleState()
+        self._phys_accum = 0.0
 
     def _reset_rigid(self) -> None:
-        self.rigid_frame_idx = 0
+        self.rigid_frame_pos = 0.0
 
     def _current_pose(self) -> np.ndarray:
         if self.mode == "user":
             return self._build_user_pose()
 
-        pose = self.camera.camtoworlds[self.ego_frame_idx]
+        # Interpolated between recorded poses: without this the objects would move
+        # at the render rate and the camera would still step at the capture rate,
+        # which reads as the whole world juddering.
+        pose = interp_camtoworld(self.camera.camtoworlds, self.ego_frame_pos)
         if not self._ego_scenario_active():
             return pose
         return apply_ego_scenario(
             pose,
-            float(self.ego_frame_idx),
+            self.ego_frame_pos,
             self.scale,
             shift_m=self.ego_scn.shift_m,
             sinusoid=self.ego_scn.sinusoid if self.ego_sinusoid_on else None,
@@ -1096,7 +1207,7 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
         )
 
     def _render_frame(self) -> np.ndarray:
-        rigid_idx = self.rigid_frame_idx if self.num_rigid_frames > 0 else None
+        rigid_idx = self.rigid_frame_pos if self.num_rigid_frames > 0 else None
         return self.renderer.render_frame(
             rigid_gaussians=self._scenario_rigid_gaussians(),
             camtoworld=self._current_pose(),
@@ -1112,6 +1223,24 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
             rigid_frame_idx=rigid_idx,
         )
 
+    def _note_timing(self, dt_real: float, render_ms: float) -> None:
+        """Exponential moving averages of the achieved rate and the render cost.
+
+        The render cost is the more useful of the two: it is the ceiling on
+        `render_fps`, and it is what says whether a chosen rate is actually being
+        met or silently missed.
+        """
+        alpha = 0.15
+        fps = 1.0 / dt_real if dt_real > 1e-6 else 0.0
+        self._fps_ema = (
+            fps if self._fps_ema == 0.0 else (1.0 - alpha) * self._fps_ema + alpha * fps
+        )
+        self._render_ms_ema = (
+            render_ms
+            if self._render_ms_ema == 0.0
+            else (1.0 - alpha) * self._render_ms_ema + alpha * render_ms
+        )
+
     def _scenario_summary(self) -> str:
         """Which scenarios are currently shaping the render."""
         parts = []
@@ -1124,7 +1253,7 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
                 bits.append(f"sin {s.amplitude_m:g}m/{s.period_frames:g}f")
             parts.append("ego: " + " + ".join(bits))
 
-        baked = 0 <= self.rigid_frame_idx < self.num_rigid_frames
+        baked = 0 <= self.rigid_frame_pos < self.num_rigid_frames
         for col, scn in sorted(self.obj_scn.items()):
             if not (scn.active() or scn.asset):
                 continue
@@ -1143,11 +1272,15 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
         return "  \n".join(f"- {p}" for p in parts) if parts else "_none_"
 
     def _update_status(self) -> None:
-        extrapolating = self.rigid_frame_idx >= self.num_rigid_frames
+        extrapolating = self.rigid_frame_pos >= self.num_rigid_frames
+        ceiling = 1000.0 / max(self._render_ms_ema, 1e-3)
         self.status_handle.content = (
             f"**mode**: {self.mode}  \n"
-            f"**ego_frame**: {self.ego_frame_idx}/{self.num_ego_frames - 1}  \n"
-            f"**rigid_frame**: {self.rigid_frame_idx}/{max(self.rigid_loop_frames - 1, 0)}"
+            f"**fps**: {self._fps_ema:.1f} of {self.render_fps:.0f} target  \n"
+            f"**render**: {self._render_ms_ema:.1f} ms/frame (ceiling {ceiling:.0f} fps)  \n"
+            f"**ego_frame**: {self.ego_frame_pos:.2f}/{self.num_ego_frames - 1}  \n"
+            f"**rigid_frame**: {self.rigid_frame_pos:.2f}"
+            f"/{max(self.rigid_loop_frames - 1, 0)}"
             f"{' (extrapolated)' if extrapolating else ''}  \n"
             f"**rigid_paused**: {self.rigid_paused}  \n"
             f"**speed_mps**: {self.bicycle.speed_mps:.2f}  \n"
@@ -1161,11 +1294,20 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
             "Controls: w/s/a/d move, m cycle mode (replay/sinusoid/user), p rigid pause, "
             "r ego reset, t rigid reset, g reset all, q quit"
         )
-        target_period = 1.0 / max(self.max_fps, 1.0)
+        print(
+            f"Render rate: {self.render_fps:g} fps (adjustable in the Playback panel; "
+            f"playback duration is unaffected)."
+        )
 
         with TerminalKeyboard() as kb:
+            prev_t = time.perf_counter()
             while True:
-                loop_t0 = time.time()
+                loop_t0 = time.perf_counter()
+                # Elapsed real time is what drives both timelines, so the replay
+                # keeps its duration whatever rate the renderer achieves -- and if
+                # it cannot meet the target, playback slows rather than skipping.
+                dt_real = min(loop_t0 - prev_t, MAX_STEP_SEC)
+                prev_t = loop_t0
                 keys = kb.read_keys()
 
                 if "q" in keys:
@@ -1183,7 +1325,7 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
                     self._reset_rigid()
 
                 if self.mode == "user":
-                    self._apply_user_controls(keys)
+                    self._step_user_physics(keys, dt_real)
 
                 # Asset swaps are queued by the GUI thread and applied here, so
                 # the rigid bank is only ever reallocated between renders.
@@ -1192,11 +1334,16 @@ Shifts are metres: **x** lateral (+right), **y** vertical (+down),
                     self._rebuild_bank()
 
                 self._sync_playback_controls()
+                render_t0 = time.perf_counter()
                 self.server.scene.set_background_image(self._render_frame())
+                render_ms = (time.perf_counter() - render_t0) * 1e3
+                self._note_timing(dt_real, render_ms)
                 self._update_status()
-                self._advance_indices()
+                self._advance_indices(dt_real / self.frame_dt)
 
-                sleep_s = max(target_period - (time.time() - loop_t0), 0.0)
+                # Read every iteration: the slider can move mid-run.
+                target_period = 1.0 / max(self.render_fps, 1e-3)
+                sleep_s = target_period - (time.perf_counter() - loop_t0)
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 

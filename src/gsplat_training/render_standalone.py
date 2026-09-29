@@ -393,6 +393,127 @@ def rigid_world_gaussians_from_pose(
 _rigid_world_gaussians_from_pose = rigid_world_gaussians_from_pose
 
 
+def quat_slerp(q0: torch.Tensor, q1: torch.Tensor, t: float) -> torch.Tensor:
+    """Spherical linear interpolation between wxyz quaternions, batched over rows.
+
+    Lerping rotations is wrong twice over: the result leaves the unit sphere, and
+    the angular rate is not constant, so a vehicle turning at a steady yaw rate
+    would appear to speed up and slow down between recorded frames.
+
+    Each row's sign is aligned first (``q`` and ``-q`` are the same rotation, but
+    the *path* between them is the long way round), and rows whose endpoints are
+    nearly parallel fall back to normalised lerp, where slerp is numerically
+    unstable and the two agree to well under a pixel anyway.
+    """
+    q0 = torch.nn.functional.normalize(q0, dim=-1)
+    q1 = torch.nn.functional.normalize(q1, dim=-1)
+    dot = (q0 * q1).sum(dim=-1, keepdim=True)
+    q1 = torch.where(dot < 0, -q1, q1)
+    dot = dot.abs().clamp(max=1.0)
+
+    theta = torch.acos(dot)
+    sin_theta = torch.sin(theta)
+    close = sin_theta.abs() < 1e-6
+    w0 = torch.where(close, 1.0 - t, torch.sin((1.0 - t) * theta) / sin_theta)
+    w1 = torch.where(close, torch.full_like(dot, t), torch.sin(t * theta) / sin_theta)
+    return torch.nn.functional.normalize(w0 * q0 + w1 * q1, dim=-1)
+
+
+def rigid_poses_at_frame_interp(
+    rigid_state: Dict[str, torch.Tensor], frame_pos: float
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Per-instance poses at a FRACTIONAL frame position.
+
+    The baked poses are sampled at the data's native rate (10 Hz on
+    WayveScenes101), so rendering faster than that repeats each pose until the
+    next index arrives and vehicles visibly step. This interpolates between the
+    two bracketing frames instead -- linear on translation, slerp on rotation --
+    so the refresh rate of object motion is decoupled from the capture rate.
+
+    An instance is carried only when it is valid at **both** bracketing frames.
+    Interpolating from a frame where it does not exist would slide it in from a
+    meaningless pose; requiring both means it appears and disappears on a frame
+    boundary exactly as before, which is the conservative behaviour.
+
+    Integral positions and out-of-range positions delegate to
+    :func:`rigid_poses_at_frame`, so the baked and bicycle-extrapolated paths are
+    unchanged and this only ever adds behaviour between existing frames.
+    """
+    num_frames = int(rigid_state["instances_fv"].shape[0])
+    lo = int(np.floor(frame_pos))
+    frac = float(frame_pos - lo)
+
+    # Every unbracketed case is correct with `lo` itself: an exact hit is `lo`,
+    # a position below zero or at/past the last baked frame lands on the index
+    # whose behaviour (baked, or bicycle-extrapolated) is already defined.
+    if frac < 1e-9 or lo < 0 or lo + 1 >= num_frames:
+        return rigid_poses_at_frame(rigid_state, lo)
+
+    a = rigid_poses_at_frame(rigid_state, lo)
+    b = rigid_poses_at_frame(rigid_state, lo + 1)
+    if a is None or b is None:
+        return a if b is None else b
+
+    trans = torch.lerp(a[0], b[0], frac)
+    quats = quat_slerp(a[1], b[1], frac)
+    return trans, quats, a[2] & b[2]
+
+
+def interp_camtoworld(camtoworlds: np.ndarray, pos: float) -> np.ndarray:
+    """Camera pose at a fractional frame position.
+
+    Replay drives the camera from the recorded poses, which are also at the
+    capture rate, so without this the viewpoint steps at 10 Hz however fast the
+    renderer runs -- the objects would be smooth and the camera would not.
+
+    Rotation goes through slerp for the same reason as the objects; the matrix is
+    rebuilt from the interpolated quaternion rather than blending matrix entries,
+    which would not stay orthonormal.
+    """
+    n = len(camtoworlds)
+    lo = int(np.floor(pos))
+    frac = float(pos - lo)
+    if frac < 1e-9 or lo < 0 or lo + 1 >= n:
+        return camtoworlds[int(np.clip(lo, 0, n - 1))].copy()
+
+    from dynamic.rigid_nodes import quat_to_rotmat
+
+    m0, m1 = camtoworlds[lo], camtoworlds[lo + 1]
+    out = np.eye(4, dtype=m0.dtype)
+    out[:3, 3] = (1.0 - frac) * m0[:3, 3] + frac * m1[:3, 3]
+    q = quat_slerp(
+        torch.from_numpy(_rotmat_to_quat(m0[:3, :3]))[None],
+        torch.from_numpy(_rotmat_to_quat(m1[:3, :3]))[None],
+        frac,
+    )
+    out[:3, :3] = quat_to_rotmat(q[0]).numpy().astype(out.dtype)
+    return out
+
+
+def _rotmat_to_quat(r: np.ndarray) -> np.ndarray:
+    """Rotation matrix -> wxyz quaternion (Shepperd's method, branch on trace)."""
+    r = np.asarray(r, dtype=np.float64)
+    t = np.trace(r)
+    if t > 0.0:
+        s = 0.5 / np.sqrt(t + 1.0)
+        q = [0.25 / s, (r[2, 1] - r[1, 2]) * s, (r[0, 2] - r[2, 0]) * s,
+             (r[1, 0] - r[0, 1]) * s]
+    elif r[0, 0] > r[1, 1] and r[0, 0] > r[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + r[0, 0] - r[1, 1] - r[2, 2])
+        q = [(r[2, 1] - r[1, 2]) / s, 0.25 * s, (r[0, 1] + r[1, 0]) / s,
+             (r[0, 2] + r[2, 0]) / s]
+    elif r[1, 1] > r[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + r[1, 1] - r[0, 0] - r[2, 2])
+        q = [(r[0, 2] - r[2, 0]) / s, (r[0, 1] + r[1, 0]) / s, 0.25 * s,
+             (r[1, 2] + r[2, 1]) / s]
+    else:
+        s = 2.0 * np.sqrt(1.0 + r[2, 2] - r[0, 0] - r[1, 1])
+        q = [(r[1, 0] - r[0, 1]) / s, (r[0, 2] + r[2, 0]) / s,
+             (r[1, 2] + r[2, 1]) / s, 0.25 * s]
+    q = np.asarray(q, dtype=np.float32)
+    return q / np.linalg.norm(q)
+
+
 def rigid_poses_at_frame(
     rigid_state: Dict[str, torch.Tensor], frame_idx: int
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -452,15 +573,19 @@ def rigid_poses_at_frame(
 
 
 def rigid_world_gaussians_extrapolated(
-    rigid_state: Dict[str, torch.Tensor], frame_idx: int
+    rigid_state: Dict[str, torch.Tensor], frame_idx: float
 ) -> Optional[Dict[str, torch.Tensor]]:
-    """Rigid world Gaussians for any frame index, extrapolating past the baked span.
+    """Rigid world Gaussians for any frame position, extrapolating past the baked span.
 
-    Thin composition of :func:`rigid_poses_at_frame` and
+    Thin composition of :func:`rigid_poses_at_frame_interp` and
     :func:`rigid_world_gaussians_from_pose`. Returns ``None`` when nothing is
     active or no bicycle params are present past the span.
+
+    ``frame_idx`` may be fractional, for a renderer running faster than the
+    capture rate; an integral value takes the baked path unchanged, so callers
+    that pass an ``int`` (the offline render pipeline) are unaffected.
     """
-    poses = rigid_poses_at_frame(rigid_state, frame_idx)
+    poses = rigid_poses_at_frame_interp(rigid_state, float(frame_idx))
     if poses is None:
         return None
     return rigid_world_gaussians_from_pose(rigid_state, *poses)
@@ -717,7 +842,7 @@ class StandaloneRenderer:
         thin_prism_coeffs: Optional[np.ndarray] = None,
         ftheta_coeffs: Optional[FThetaCameraDistortionParameters] = None,
         camera_idx: Optional[int] = None,
-        rigid_frame_idx: Optional[int] = None,
+        rigid_frame_idx: Optional[float] = None,
         draw_boxes: bool = False,
         rigid_gaussians: Optional[Dict[str, torch.Tensor]] = None,
     ) -> np.ndarray:
@@ -734,8 +859,8 @@ class StandaloneRenderer:
             thin_prism_coeffs: Thin prism distortion coefficients
             ftheta_coeffs: F-theta camera parameters
             camera_idx: Integer camera index for PPISP (None disables per-camera effects)
-            rigid_frame_idx: Global rigid-track frame index whose vehicle poses are
-                composited into the render. None -> background only. Ignored when
+            rigid_frame_idx: Global rigid-track frame position whose vehicle poses
+                are composited into the render. None -> background only. Ignored when
                 ``rigid_gaussians`` is supplied.
             rigid_gaussians: Pre-composed world-space rigid Gaussians to composite
                 verbatim, as returned by :func:`rigid_world_gaussians_from_pose`.
@@ -793,7 +918,7 @@ class StandaloneRenderer:
         rigid = rigid_gaussians
         if rigid is None and self.rigid_state is not None and rigid_frame_idx is not None:
             rigid = rigid_world_gaussians_extrapolated(
-                self.rigid_state, int(rigid_frame_idx)
+                self.rigid_state, float(rigid_frame_idx)
             )
         if rigid is not None:
             means = torch.cat([means, rigid["means"]], dim=0)
@@ -805,6 +930,9 @@ class StandaloneRenderer:
         # Debug overlay: draw per-instance 3D boxes as semi-transparent Gaussians
         # (same rasterization pass -> aligns exactly with the render). Only drawn
         # for baked (in-range) frames; extrapolated frames have no box overlay.
+        # Boxes are taken at the floor of a fractional position rather than
+        # interpolated, so above the capture rate they step while the vehicles
+        # they bound move smoothly. They are a debug aid, not part of the render.
         if (
             draw_boxes
             and self.rigid_state is not None

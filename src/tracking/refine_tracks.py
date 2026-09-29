@@ -24,6 +24,7 @@ import shutil
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import replace as _dc_replace
+from pathlib import Path
 
 import hydra
 import numpy as np
@@ -590,6 +591,92 @@ def track_displacement(
     return float(np.linalg.norm(end - start))
 
 
+def ego_positions_xz(
+    data_root: str, reference_camera: str, n_frames: int
+) -> np.ndarray | None:
+    """Reference-camera ground positions per frame, in the COLMAP world frame.
+
+    The track boxes live in that same frame, so object-to-ego range is a plain
+    difference once both are here — no alignment step.
+
+    Poses are ordered by timestamp and indexed by rank, the convention the rest of
+    the pipeline uses to pair tracks with frames. Rank pairing is only safe while
+    the counts agree, so a mismatch returns ``None`` rather than silently indexing
+    every object against the wrong ego pose.
+
+    Returns ``None`` (with a printed reason) when the poses cannot be read or do
+    not line up; the caller decides what to do about it.
+    """
+    try:
+        from src.model_wrappers.trackers.wayve101_cc3dt_dataset import (
+            _extract_cam_to_world,
+            _load_colmap_scene,
+            _resolve_sparse_dir,
+        )
+
+        _, images = _load_colmap_scene(_resolve_sparse_dir(data_root))
+        poses = []
+        for image in images.values():
+            if Path(image.name).parent.as_posix() != reference_camera:
+                continue
+            poses.append(
+                (int(Path(image.name).stem), _extract_cam_to_world(image)[:3, 3])
+            )
+        if not poses:
+            print(f"⚠️  No {reference_camera} poses under {data_root}.")
+            return None
+        poses.sort(key=lambda p: p[0])
+        pts = np.array([p[1] for p in poses])[:, list(GROUND_AXES)]
+        if len(pts) != n_frames:
+            print(
+                f"⚠️  Ego poses ({len(pts)}) do not match track frames "
+                f"({n_frames}); cannot pair by rank."
+            )
+            return None
+        return pts
+    except Exception as exc:  # pragma: no cover - optional input
+        print(f"⚠️  Ego poses unavailable: {exc}")
+        return None
+
+
+def track_range(
+    track: dict[int, dict],
+    ego_xz: np.ndarray,
+    percentile: float,
+    mode: str = "net",
+    smooth: int = 3,
+) -> float:
+    """Representative range from the EGO to a track, mirroring track_displacement.
+
+    The relative static gate divides displacement by range, so the two have to be
+    measured the same way over the same frames or the ratio is not a ratio of
+    anything. This therefore reduces the per-frame ranges exactly as
+    :func:`track_displacement` reduces the per-frame centres:
+
+    * ``net``: the mean of the smoothed start range and the smoothed end range —
+      the range over which that net travel actually happened.
+    * ``span``: the same percentile of the per-frame ranges.
+
+    Range is computed **per frame against the moving ego**, not once against a
+    fixed point. The previous implementation used
+    ``norm(mean(centres))`` — distance from the COLMAP world ORIGIN, which is an
+    arbitrary gauge point fixed during reconstruction and tied to nothing
+    physical. On ``scene_084`` it sits 58.8 m from where the ego starts, while the
+    ego then travels 86.1 m and ends 26.2 m away from it; correlation with true
+    range was 0.59 and the worst case was 4.25x off, biased against close movers.
+    """
+    frames = sorted(track.keys())
+    centers = np.array([box_center_ground(track[f]) for f in frames])
+    if len(centers) == 0:
+        return 0.0
+    idx = np.clip(np.array(frames, dtype=int), 0, len(ego_xz) - 1)
+    ranges = np.linalg.norm(centers - ego_xz[idx], axis=1)
+    if mode == "span":
+        return float(np.percentile(ranges, percentile))
+    k = max(1, min(int(smooth), max(len(ranges) // 2, 1)))
+    return float(0.5 * (ranges[:k].mean() + ranges[-k:].mean()))
+
+
 def filter_static(
     tracks: dict[int, dict[int, dict]],
     min_displacement: float,
@@ -598,24 +685,47 @@ def filter_static(
     displacement_mode: str = "net",
     displacement_smooth: int = 3,
     min_rel_displacement: float = 0.0,
+    ego_xz: np.ndarray | None = None,
 ) -> tuple[dict[int, dict[int, dict]], list[dict]]:
     """Drop static / too-short tracks. Returns (kept, dropped_report).
 
     A track is kept only if it both travels >= ``min_displacement`` meters and,
-    when ``min_rel_displacement`` > 0, travels >= that fraction of its distance
-    from the origin (ego start). The relative gate removes far objects whose
-    apparent motion is depth-estimation jitter (which scales with range): a
-    static object 200 m away can "move" ~10 m radially yet only ~5% of its
-    range, while real movers exceed ~45%.
+    when ``min_rel_displacement`` > 0, travels >= that fraction of its **range from
+    the ego**. The relative gate removes far objects whose apparent motion is
+    depth-estimation jitter (which scales with range from the *camera*): a static
+    object 200 m away can "move" ~10 m radially yet only ~5% of its range, while
+    real movers exceed ~45%.
+
+    ``ego_xz`` is the per-frame ego ground position, indexed by frame. It is
+    **required whenever min_rel_displacement > 0** -- the gate normalises by range
+    from the observer, and without the observer's positions there is nothing to
+    normalise against. Passing None with the gate enabled raises rather than
+    falling back, because the fallback that used to stand in here (distance from
+    the COLMAP world origin) is a different quantity and produced a different set
+    of dropped tracks.
     """
+    if min_rel_displacement > 0 and ego_xz is None:
+        raise ValueError(
+            "min_rel_displacement > 0 requires ego_xz (per-frame ego positions). "
+            "The gate normalises displacement by range FROM THE EGO; the previous "
+            "implementation divided by distance from the COLMAP world origin, an "
+            "arbitrary gauge point 58.8 m from the ego start on scene_084, and is "
+            "not a valid substitute."
+        )
     kept: dict[int, dict[int, dict]] = {}
     dropped: list[dict] = []
     for tid, track in tracks.items():
         disp = track_displacement(
             track, displacement_percentile, displacement_mode, displacement_smooth
         )
-        centers = np.array([box_center_ground(b) for b in track.values()])
-        rng = float(np.linalg.norm(centers.mean(axis=0))) if len(centers) else 0.0
+        rng = (
+            track_range(
+                track, ego_xz, displacement_percentile,
+                displacement_mode, displacement_smooth,
+            )
+            if ego_xz is not None
+            else 0.0
+        )
         rel = disp / rng if rng > 1e-6 else 0.0
         if len(track) < min_track_length:
             dropped.append({"id": tid, "reason": "short", "frames": len(track), "disp": disp})
@@ -3238,6 +3348,28 @@ def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") 
     )
     n_fused = len(fused)
 
+    # Ego poses for the relative static gate, which normalises each track's
+    # displacement by its range FROM THE EGO. Only loaded when the gate is on, so a
+    # run with min_rel_displacement=0 needs no COLMAP read.
+    min_rel = float(cfg.get("min_rel_displacement", 0.0))
+    ego_xz = None
+    if min_rel > 0:
+        n_frames = 1 + max(
+            (f for track in fused.values() for f in track.keys()), default=-1
+        )
+        ego_xz = ego_positions_xz(
+            data_root,
+            str((cfg.get("viz", {}) or {}).get("reference_camera", "front-forward")),
+            n_frames,
+        )
+        if ego_xz is None:
+            raise RuntimeError(
+                f"min_rel_displacement={min_rel} needs per-frame ego poses and they "
+                f"could not be loaded from {data_root!r}. Set it to 0 to disable the "
+                "relative gate, or fix the COLMAP input -- the gate is not run "
+                "against a fallback reference point."
+            )
+
     kept, dropped = filter_static(
         fused,
         min_displacement=float(cfg.get("min_displacement", 2.5)),
@@ -3245,7 +3377,8 @@ def refine(results: dict, cfg: dict, output_dir: str = "", data_root: str = "") 
         displacement_percentile=float(cfg.get("displacement_percentile", 90.0)),
         displacement_mode=str(cfg.get("displacement_mode", "net")),
         displacement_smooth=int(cfg.get("displacement_smooth", 3)),
-        min_rel_displacement=float(cfg.get("min_rel_displacement", 0.0)),
+        min_rel_displacement=min_rel,
+        ego_xz=ego_xz,
     )
 
     # Resume shortcut. The bicycle fit is by far the most expensive stage, and a

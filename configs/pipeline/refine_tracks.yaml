@@ -79,11 +79,21 @@ fusion_pose_filter:
 #                      point-cloud diameter (jitter-inflated, keeps more).
 #   displacement_smooth: frames averaged at each end for the net metric.
 #   min_rel_displacement: also require travel >= this fraction of the object's
-#                      distance from ego. Removes far static objects whose
-#                      apparent motion is depth jitter (scales with range):
-#                      static-far ~ 0.05, real movers ~ 0.13+. Higher = more
-#                      aggressive but starts dropping genuine distant movers. 0
-#                      disables.
+#                      PER-FRAME RANGE FROM THE EGO, reduced the same way
+#                      displacement_mode reduces the centres. Removes far static
+#                      objects whose apparent motion is depth jitter (which scales
+#                      with range from the camera): static-far ~ 0.05, real movers
+#                      ~ 0.13+. Higher = more aggressive but starts dropping
+#                      genuine distant movers. 0 disables.
+#
+#                      Enabling this REQUIRES readable COLMAP poses for the
+#                      reference camera -- refinement raises rather than falling
+#                      back. Until 2026-09-28 it divided by distance from the
+#                      COLMAP world ORIGIN, a gauge point 58.8 m from the ego
+#                      start on scene_084; that quantity correlates only 0.658
+#                      with true ego range and was off by 0.16x to 7.30x, so
+#                      pre-fix runs with this enabled dropped a different set of
+#                      tracks (9 of 192 on scene_084 at 0.1).
 min_displacement: 3.0
 min_track_length: 3
 displacement_mode: "net"
