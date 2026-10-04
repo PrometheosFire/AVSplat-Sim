@@ -6,6 +6,8 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from hydra.core.hydra_config import HydraConfig
 
+from difix_common import hashable_model_cfg
+
 def generate_config_hash(config_subset: dict) -> str:
     """Generates a unique 8-character hash from a dictionary."""
     config_str = json.dumps(config_subset, sort_keys=True)
@@ -20,7 +22,7 @@ def main(cfg: DictConfig):
     
     # Resolve the config to standard dictionaries for hashing
     dataset_cfg = OmegaConf.to_container(cfg.dataset, resolve=True)
-    segmenter_cfg = OmegaConf.to_container(cfg.segmenter, resolve=True) # 👈 Updated
+    segmenter_cfg = hashable_model_cfg(cfg.segmenter)  # minus runtime-only keys
     seg_task_cfg = OmegaConf.to_container(cfg.seg_task, resolve=True)
     
     # Base directory for this specific dataset and scene
@@ -254,7 +256,7 @@ def main(cfg: DictConfig):
     # STEP 5: Diffusion Post-Processing (Difix3D+)
     # ==========================================
 
-    diffusion_cfg = OmegaConf.to_container(cfg.diffusion, resolve=True)
+    diffusion_cfg = hashable_model_cfg(cfg.diffusion)  # minus runtime-only keys
     diff_task_cfg = OmegaConf.to_container(cfg.diff_task, resolve=True)
 
     # Include render workspace in hash so diffusion re-runs when renders change

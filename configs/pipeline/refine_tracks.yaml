@@ -94,11 +94,11 @@ fusion_pose_filter:
 #                      with true ego range and was off by 0.16x to 7.30x, so
 #                      pre-fix runs with this enabled dropped a different set of
 #                      tracks (9 of 192 on scene_084 at 0.1).
-min_displacement: 3.0
+min_displacement: 4.0
 min_track_length: 3
 displacement_mode: "net"
 displacement_smooth: 3
-min_rel_displacement: 0.0
+min_rel_displacement: 0.1
 displacement_percentile: 90.0
 
 # --- Gap filling (make each kept track continuous within its lifespan) ---

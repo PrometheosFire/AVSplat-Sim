@@ -137,6 +137,10 @@ class Config:
 
     # Opacity regularization
     opacity_reg: float = 0.0
+    # Apply opacity_reg only to Gaussians visible in the current view.
+    opacity_reg_visible_only: bool = False
+    # Scale opacity_reg by the frame's mean brightness relative to 0.5.
+    opacity_reg_luma_scale: bool = False
     # Scale regularization
     scale_reg: float = 0.0
 

@@ -25,7 +25,7 @@ if str(difix_submodule_path) not in sys.path:
 from pipeline_difix import DifixPipeline
 
 class DifixWrapper(BaseDiffusionModel):
-    def __init__(self, model_id: str = "nvidia/difix", name: str = "difix", torch_dtype=torch.float16, default_timestep: int = 199, max_width: int = 1280, max_height: int = 720, use_ref: bool = False, enable_vae_slicing: bool = True):
+    def __init__(self, model_id: str = "nvidia/difix", name: str = "difix", torch_dtype=torch.float16, default_timestep: int = 199, max_width: int = 1280, max_height: int = 720, use_ref: bool = False, enable_vae_slicing: bool = True, cpu_offload: bool = False):
         """
         Initializes the Difix3D+ model once when the class is instantiated.
         """
@@ -43,7 +43,13 @@ class DifixWrapper(BaseDiffusionModel):
             torch_dtype=torch_dtype
         )
         
-        self.pipe.enable_model_cpu_offload()
+        # Offload moves each sub-model to the GPU and back on every frame: needed
+        # on 8 GB cards, and the dominant cost (~1.6 s/frame on an RTX 5070)
+        # wherever the whole pipeline fits in VRAM.
+        if cpu_offload:
+            self.pipe.enable_model_cpu_offload()
+        else:
+            self.pipe.to("cuda")
         # diffusers self-tests xformers with float32 inputs, which fails on GPUs the
         # installed xformers build has no fp32 kernel for (e.g. Blackwell, sm_120).
         # Fall back to torch's built-in attention instead of crashing.

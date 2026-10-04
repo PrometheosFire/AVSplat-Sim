@@ -50,6 +50,24 @@ def generate_config_hash(config_subset: dict) -> str:
     return hashlib.md5(config_str.encode("utf-8")).hexdigest()[:8]
 
 
+# Model-config keys that change only where the work runs (CPU offload), never
+# the output. Kept out of every cache-dir hash so toggling them for a different
+# GPU reuses results computed with the other setting.
+RUNTIME_ONLY_KEYS = ("offload_to_cpu", "cpu_offload")
+
+
+def hashable_model_cfg(node) -> dict:
+    """A model config as a plain dict, minus :data:`RUNTIME_ONLY_KEYS`.
+
+    Dropping a key that is absent is a no-op, so hashes of configs that never
+    had these keys are unchanged.
+    """
+    cfg = OmegaConf.to_container(node, resolve=True)
+    for key in RUNTIME_ONLY_KEYS:
+        cfg.pop(key, None)
+    return cfg
+
+
 def _prefixed(payload: dict, hash_prefix: str) -> dict:
     """Namespace a hash payload, leaving it untouched when no prefix is given.
 
@@ -140,7 +158,7 @@ def ensure_masks(
     # fixes it without touching any other stage's hash.
     step1_params = {
         "dataset": OmegaConf.to_container(cfg.dataset, resolve=True),
-        "model": OmegaConf.to_container(cfg.segmenter, resolve=True),
+        "model": hashable_model_cfg(cfg.segmenter),
         "seg_task": seg_task,
     }
     masks_dir = os.path.join(

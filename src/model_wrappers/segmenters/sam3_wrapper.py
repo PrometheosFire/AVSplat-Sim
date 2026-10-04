@@ -15,15 +15,21 @@ from src.model_wrappers.base import BaseSegmenter
 
 
 class SAM3Wrapper(BaseSegmenter):
-    def __init__(self, checkpoint_path: str, chunk_size: int = 2, name: str = "sam3"):
+    def __init__(self, checkpoint_path: str, chunk_size: int = 2, name: str = "sam3",
+                 offload_to_cpu: bool = False):
         """
         Initializes the SAM 3 model once when the class is instantiated.
         This prevents reloading the heavy weights into the 8GB VRAM 
         for every new camera feed.
+
+        ``offload_to_cpu`` keeps the session's video frames and tracking state
+        in host memory: needed on 8 GB cards, ~9x slower where VRAM allows
+        without it. Runtime-only, so it is kept out of the masks cache hash.
         """
         self.checkpoint_path = checkpoint_path
         self.chunk_size = chunk_size
         self.name = name
+        self.offload_to_cpu = offload_to_cpu
         print(f"Initializing SAM 3 Wrapper from {self.checkpoint_path}...")
 
         # Limit to the single RTX 4060 Max-Q
@@ -86,8 +92,8 @@ class SAM3Wrapper(BaseSegmenter):
                     request=dict(
                         type="start_session",
                         resource_path=temp_dir,
-                        offload_video_to_cpu=True, 
-                        offload_state_to_cpu=True, 
+                        offload_video_to_cpu=self.offload_to_cpu,
+                        offload_state_to_cpu=self.offload_to_cpu,
                     )
                 )
                 session_id = response["session_id"]

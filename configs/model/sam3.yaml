@@ -3,5 +3,9 @@ _target_: src.model_wrappers.segmenters.sam3_wrapper.SAM3Wrapper
 name: "sam3"
 
 checkpoint_path: "external_weights/sam3/sam3.pt"
-chunk_size: 2
+chunk_size: 10
 
+# Keep SAM's video frames and tracking state in host memory. Only needed on
+# 8 GB cards; ~9x slower otherwise. Runtime-only: excluded from the masks cache
+# hash (difix_common.RUNTIME_ONLY_KEYS), so toggling it reuses stored masks.
+offload_to_cpu: false

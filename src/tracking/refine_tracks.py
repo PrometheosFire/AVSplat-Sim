@@ -1913,6 +1913,8 @@ def _write_user_iteration(
     bicycle_alpha: float = 0.6,
     debug_variants: bool = False,
     bake_source: str = "rollout",
+    viz_cfg: dict | None = None,
+    ego_path: np.ndarray | None = None,
 ) -> str:
     """Write one numbered user-refinement snapshot and return its directory.
 
@@ -1920,6 +1922,10 @@ def _write_user_iteration(
     copy that downstream stages read is written once, at the end of refinement
     (see ``main``) — i.e. after the final ``done`` and after the bicycle fit —
     not on every ``apply``.
+
+    When ``viz_cfg`` is given, the snapshot also gets ``bev_refined.png``: the
+    single whole-scene BEV (not the per-frame ones), so each edit's effect on
+    which objects remain and on their trajectories can be checked at a glance.
     """
     it_dir = os.path.join(root_dir, f"{iteration_idx:03d}")
     os.makedirs(it_dir, exist_ok=True)
@@ -1937,6 +1943,28 @@ def _write_user_iteration(
     }
     with open(os.path.join(it_dir, "refine_report_user.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
+
+    if viz_cfg is not None:
+        # A failed plot must not abort an interactive session mid-curation.
+        try:
+            from src.tracking.visualize_tracks import render_bev
+
+            render_bev(
+                out["results"],
+                output_path=os.path.join(it_dir, "bev_refined.png"),
+                ids=list(viz_cfg.get("ids", []) or []),
+                classes=list(viz_cfg.get("classes", []) or []),
+                color_by=str(viz_cfg.get("color_by", "time")),
+                show_ego=bool(viz_cfg.get("show_ego", True)),
+                ego_path=ego_path,
+                title=f"iter {iteration_idx:03d} | {command[:90]} | {len(tracks)} tracks",
+                figsize=float(viz_cfg.get("figsize", 14.0)),
+                bounds=list(viz_cfg.get("bounds", []) or []) or None,
+                margin=float(viz_cfg.get("margin", 5.0)),
+                max_aspect=float(viz_cfg.get("max_aspect", 4.0)),
+            )
+        except Exception as exc:
+            print(f"⚠️ bev_refined.png for iteration {iteration_idx:03d} failed: {exc}")
 
     # Persist the fitted bicycle-model params for this iteration (reflecting any
     # manual edits) into the numbered snapshot so resume can restore them. The
@@ -2967,6 +2995,17 @@ def _run_user_refinement_loop(
         (cfg.get("bicycle_fit", {}) or {}).get("bake_source", "rollout")
     ).strip().lower()
 
+    # Whole-scene BEV per snapshot (see _write_user_iteration). The ego path is
+    # the same for every snapshot, so reconstruct it once per session.
+    viz_cfg = (cfg.get("viz", {}) or {}) if bool((cfg.get("visualize", {}) or {}).get("refined", True)) else None
+    ego_path = None
+    if viz_cfg is not None and bool(viz_cfg.get("show_ego", True)) and data_root:
+        from src.tracking.visualize_tracks import _reconstruct_ego_path
+
+        ego_path = _reconstruct_ego_path(
+            to_absolute_path(data_root), str(viz_cfg.get("reference_camera", "front-forward"))
+        )
+
     root_dir = output_dir
     #root_dir = os.path.join(output_dir, str(user_cfg.get("output_dir", "user_refinement_what?")))
     os.makedirs(root_dir, exist_ok=True)
@@ -3029,6 +3068,8 @@ def _run_user_refinement_loop(
         bicycle_alpha=bike_alpha,
         debug_variants=debug_variants,
         bake_source=bake_source,
+        viz_cfg=viz_cfg,
+        ego_path=ego_path,
     )
 
     print("\n🧭 Interactive user refinement enabled.")
@@ -3099,6 +3140,8 @@ def _run_user_refinement_loop(
                     bicycle_alpha=bike_alpha,
                     debug_variants=debug_variants,
                     bake_source=bake_source,
+                    viz_cfg=viz_cfg,
+                    ego_path=ego_path,
                 )
                 command_log_lines.append(f"iter {iter_idx:03d} | undo")
                 print(f"↩️ Undo applied. Snapshot: {out_dir}")
@@ -3146,6 +3189,8 @@ def _run_user_refinement_loop(
                     bicycle_alpha=bike_alpha,
                     debug_variants=debug_variants,
                     bake_source=bake_source,
+                    viz_cfg=viz_cfg,
+                    ego_path=ego_path,
                 )
                 command_log_lines.append(
                     f"iter {iter_idx:03d} | apply | " + " ; ".join(applied_batch)

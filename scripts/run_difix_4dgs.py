@@ -363,6 +363,27 @@ def run_render(
 # --------------------------------------------------------------------------- #
 
 
+def count_rigid_instances(tracks_json: str, cfg: DictConfig) -> int:
+    """Track instances the trainer would turn into rigid nodes.
+
+    Mirrors ``load_rigid_tracks``' class and score filter, so a zero here is
+    exactly the case where dynamic training would raise "No rigid instances".
+    """
+    from src.gsplat_training.dynamic.rigid_tracks import DEFAULT_RIGID_CLASSES
+
+    classes = set(cfg.gaussian_splatting.dynamic_rigid_classes or DEFAULT_RIGID_CLASSES)
+    min_score = float(cfg.gaussian_splatting.dynamic_min_track_score)
+    with open(tracks_json) as fp:
+        results = json.load(fp)["results"]
+    return len({
+        int(box["tracking_id"])
+        for boxes in results.values()
+        for box in boxes
+        if box["tracking_name"] in classes
+        and float(box.get("tracking_score", 1.0)) >= min_score
+    })
+
+
 def round_is_dynamic(mode: str, round_idx: int, n_rounds: int) -> bool:
     """Whether round ``round_idx`` models vehicles, per the configured mode."""
     if mode == "all_rounds":
@@ -490,23 +511,36 @@ def main(cfg: DictConfig) -> None:
     )
     stride = int(loop_cfg.frame_stride)
 
-    loop_hash = generate_config_hash(
-        {
-            "pipeline": HASH_PREFIX,
-            "mode": mode,
-            "ncore_dynamic": ncore_dynamic,
-            "ncore_masked": ncore_masked,
-            "tracks": tracks_json,
-            "scene_root": scene_root,
-            "cameras": cameras,
-            "schedule": schedule,
-            "steps": steps_per_round,
-            "phases": phases[: n_rounds - 1],
-            "stride": stride,
-            "data_factor": data_factor,
-            "gsplat": OmegaConf.to_yaml(cfg.gaussian_splatting),
-        }
-    )
+    # A scene whose curated tracks keep no vehicle (all parked, so all filtered)
+    # has nothing to model as a rigid node, and dynamic training would refuse to
+    # start. Run every round static instead, on the same data: parked cars stay
+    # in as background and pedestrians stay masked, exactly as in the dynamic
+    # scenes.
+    vehicle_free = count_rigid_instances(tracks_json, cfg) == 0
+    if vehicle_free:
+        print(f"[07] no vehicle tracks in {tracks_json}: every round runs STATIC")
+
+    loop_hash_payload = {
+        "pipeline": HASH_PREFIX,
+        "mode": mode,
+        "ncore_dynamic": ncore_dynamic,
+        "ncore_masked": ncore_masked,
+        "tracks": tracks_json,
+        "scene_root": scene_root,
+        "cameras": cameras,
+        "schedule": schedule,
+        "steps": steps_per_round,
+        "phases": phases[: n_rounds - 1],
+        "stride": stride,
+        "data_factor": data_factor,
+        "gsplat": OmegaConf.to_yaml(cfg.gaussian_splatting),
+    }
+    # Only when set, so every existing loop dir keeps its hash. Keyed because the
+    # tracks enter the hash by PATH: re-curating a scene to add vehicles back
+    # must not reuse its static rounds.
+    if vehicle_free:
+        loop_hash_payload["vehicle_free"] = True
+    loop_hash = generate_config_hash(loop_hash_payload)
     full_shifts = union_shifts(schedule)
 
     loop_dir = os.path.join(base_dir, f"07_difix_4dgs_{loop_hash}")
@@ -526,6 +560,7 @@ def main(cfg: DictConfig) -> None:
         "tracks_json": tracks_json,
         "ncore_dynamic": ncore_dynamic,
         "ncore_masked": ncore_masked,
+        "vehicle_free": vehicle_free,
         "durations": {"prep": prep_duration},
     }
 
@@ -533,8 +568,12 @@ def main(cfg: DictConfig) -> None:
         round_dir = os.path.join(loop_dir, f"round_{r:03d}")
         os.makedirs(round_dir, exist_ok=True)
         is_final = r == n_rounds - 1
-        dynamic = round_is_dynamic(mode, r, n_rounds)
-        ncore_dir = ncore_dynamic if dynamic else (ncore_masked or ncore_dynamic)
+        dynamic = round_is_dynamic(mode, r, n_rounds) and not vehicle_free
+        # Vehicle-free static rounds keep the pedestrian-only masks: parked cars
+        # are background there, not something to cut out as in ncore_masked.
+        ncore_dir = (
+            ncore_dynamic if (dynamic or vehicle_free) else (ncore_masked or ncore_dynamic)
+        )
         print(
             f"\n{'=' * 60}\nROUND {r}/{n_rounds - 1}"
             f"{'  (FINAL)' if is_final else ''}  dynamic={dynamic}"

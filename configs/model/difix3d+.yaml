@@ -11,3 +11,9 @@ default_timestep: 199
 # Dimensions are snapped to the nearest multiple of 8 (VAE requirement).
 max_width: 1280
 max_height: 720
+
+# Move sub-models between CPU and GPU per frame. Only needed when VRAM is tight
+# (8 GB cards); much slower otherwise. The loop never trains and cleans at the
+# same time, so Difix has the GPU to itself. Runtime-only: excluded from cache
+# hashes (difix_common.RUNTIME_ONLY_KEYS).
+cpu_offload: false

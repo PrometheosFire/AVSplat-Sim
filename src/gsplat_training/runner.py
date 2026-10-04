@@ -209,7 +209,9 @@ def create_splats_with_optimizers(
             eps=1e-15 / math.sqrt(BS),
             # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
             betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-            fused=True,
+            # Only torch's Adam takes `fused`; SelectiveAdam's constructor
+            # rejects it, which made visible_adam=true crash at startup.
+            **({"fused": True} if optimizer_class is torch.optim.Adam else {}),
         )
         for name, _, lr in params
     }
@@ -1427,7 +1429,27 @@ class Runner:
 
             # regularizations
             if cfg.opacity_reg > 0.0: # penalizes Gaussians that stay too opaque
-                loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
+                opac = torch.sigmoid(self.splats["opacities"])
+                reg_w = cfg.opacity_reg
+                if cfg.opacity_reg_visible_only:
+                    # Same per-Gaussian weight as the plain mean, but nothing for
+                    # Gaussians this view does not see. Adam rescales the tiny
+                    # 1/N gradient into a full-size step, so without this an
+                    # unseen Gaussian is driven transparent at the full opacity
+                    # learning rate on every step it is out of view -- which, at
+                    # driving speed, is most of them, most of the time.
+                    n_bg = opac.shape[0]
+                    seen = (info["radii"] > 0).all(-1).any(0)[:n_bg]
+                    opac_term = opac[seen].sum() / n_bg
+                else:
+                    opac_term = opac.mean()
+                if cfg.opacity_reg_luma_scale:
+                    # A dark Gaussian over a dark frame barely changes the render,
+                    # so its photometric opacity gradient is tiny and a constant
+                    # penalty wins. Scale the penalty with frame brightness
+                    # (1.0 at a mid-grey frame).
+                    reg_w = reg_w * float(pixels.mean()) / 0.5
+                loss += reg_w * opac_term
             if cfg.scale_reg > 0.0: # penalizes Gaussians that grow too large
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
@@ -1713,6 +1735,10 @@ class Runner:
                     visibility_mask.scatter_(0, info["gaussian_ids"], 1)
                 else:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
+                # Rigid Gaussians are appended after the background ones for the
+                # shared rasterization pass; these optimizers hold only the
+                # background, so keep its slice of the mask.
+                visibility_mask = visibility_mask[:gaussian_cnt]
 
             # optimize
             for optimizer in self.optimizers.values():
